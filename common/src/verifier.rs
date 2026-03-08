@@ -16,6 +16,7 @@ use caliptra_drivers::*;
 use caliptra_image_types::*;
 use caliptra_image_verify::ImageVerificationEnv;
 use core::ops::Range;
+#[cfg(not(feature = "no-mldsa"))]
 use zerocopy::{FromBytes, IntoBytes};
 
 use caliptra_drivers::memory_layout::ICCM_RANGE;
@@ -27,6 +28,7 @@ pub struct FirmwareImageVerificationEnv<'a, 'b> {
     pub sha2_512_384_acc: &'a mut Sha2_512_384Acc,
     pub soc_ifc: &'a mut SocIfc,
     pub ecc384: &'a mut Ecc384,
+    #[cfg(not(feature = "no-mldsa"))]
     pub mldsa87: &'a mut Mldsa87,
     pub data_vault: &'a DataVault,
     pub pcr_bank: &'a mut PcrBank,
@@ -139,6 +141,7 @@ impl ImageVerificationEnv for &mut FirmwareImageVerificationEnv<'_, '_> {
         Lms::default().verify_lms_signature_cfi(self.sha256, &message, pub_key, sig)
     }
 
+    #[cfg(not(feature = "no-mldsa"))]
     fn mldsa87_verify(
         &mut self,
         msg: &[u8],
@@ -166,6 +169,16 @@ impl ImageVerificationEnv for &mut FirmwareImageVerificationEnv<'_, '_> {
         ))?;
 
         self.mldsa87.verify_var(&pub_key, msg, &sig)
+    }
+
+    #[cfg(feature = "no-mldsa")]
+    fn mldsa87_verify(
+        &mut self,
+        _msg: &[u8],
+        _pub_key: &ImageMldsaPubKey,
+        _sig: &ImageMldsaSignature,
+    ) -> CaliptraResult<Mldsa87Result> {
+        Err(CaliptraError::IMAGE_VERIFIER_ERR_MLDSA_TYPE_CONVERSION_FAILED)
     }
 
     /// Retrieve Vendor Public Key Info Digest

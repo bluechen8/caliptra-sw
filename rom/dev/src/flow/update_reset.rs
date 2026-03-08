@@ -69,6 +69,7 @@ impl UpdateResetFlow {
                 sha2_512_384_acc: &mut env.sha2_512_384_acc,
                 soc_ifc: &mut env.soc_ifc,
                 ecc384: &mut env.ecc384,
+                #[cfg(not(feature = "no-mldsa"))]
                 mldsa87: &mut env.mldsa87,
                 data_vault: &env.persistent_data.get().data_vault,
                 pcr_bank: &mut env.pcr_bank,
@@ -159,6 +160,7 @@ impl UpdateResetFlow {
             soc_ifc: env.soc_ifc,
             data_vault: env.data_vault,
             ecc384: env.ecc384,
+            #[cfg(not(feature = "no-mldsa"))]
             mldsa87: env.mldsa87,
             image: env.image,
             dma: env.dma,

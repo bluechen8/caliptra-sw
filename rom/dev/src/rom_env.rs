@@ -16,16 +16,20 @@ Abstract:
 --*/
 
 use caliptra_drivers::{
-    Aes, DeobfuscationEngine, Dma, Ecc384, Hmac, KeyVault, Lms, Mailbox, Mldsa87, PcrBank,
+    Aes, DeobfuscationEngine, Dma, Ecc384, Hmac, KeyVault, Lms, Mailbox, PcrBank,
     PersistentDataAccessor, Sha1, Sha256, Sha2_512_384, Sha2_512_384Acc, SocIfc, Trng,
 };
+#[cfg(not(feature = "no-mldsa"))]
+use caliptra_drivers::Mldsa87;
 use caliptra_error::CaliptraResult;
 use caliptra_registers::{
     aes::AesReg, aes_clp::AesClpReg, csrng::CsrngReg, doe::DoeReg, ecc::EccReg,
-    entropy_src::EntropySrcReg, hmac::HmacReg, kv::KvReg, mbox::MboxCsr, mldsa::MldsaReg,
+    entropy_src::EntropySrcReg, hmac::HmacReg, kv::KvReg, mbox::MboxCsr,
     pv::PvReg, sha256::Sha256Reg, sha512::Sha512Reg, sha512_acc::Sha512AccCsr, soc_ifc::SocIfcReg,
     soc_ifc_trng::SocIfcTrngReg,
 };
+#[cfg(not(feature = "no-mldsa"))]
+use caliptra_registers::mldsa::MldsaReg;
 
 /// Rom Context
 pub struct RomEnv {
@@ -72,6 +76,7 @@ pub struct RomEnv {
     pub persistent_data: PersistentDataAccessor,
 
     /// Mldsa87 Engine
+    #[cfg(not(feature = "no-mldsa"))]
     pub mldsa87: Mldsa87,
 
     /// Dma engine
@@ -105,6 +110,7 @@ impl RomEnv {
             pcr_bank: PcrBank::new(PvReg::new()),
             trng,
             persistent_data: PersistentDataAccessor::new(),
+            #[cfg(not(feature = "no-mldsa"))]
             mldsa87: Mldsa87::new(MldsaReg::new()),
             dma: Dma::default(),
             aes: Aes::new(AesReg::new(), AesClpReg::new()),

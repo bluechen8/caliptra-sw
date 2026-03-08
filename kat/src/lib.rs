@@ -26,6 +26,7 @@ mod hkdf_kat;
 mod hmac_kdf_kat;
 mod kats_env;
 mod lms_kat;
+#[cfg(not(feature = "no-mldsa"))]
 mod mldsa87_kat;
 mod sha1_kat;
 mod sha256_kat;
@@ -46,6 +47,7 @@ pub use hkdf_kat::{Hkdf384Kat, Hkdf512Kat};
 pub use hmac_kdf_kat::{Hmac384KdfKat, Hmac512KdfKat};
 pub use kats_env::KatsEnv;
 pub use lms_kat::LmsKat;
+#[cfg(not(feature = "no-mldsa"))]
 pub use mldsa87_kat::Mldsa87Kat;
 pub use sha1_kat::Sha1Kat;
 pub use sha256_kat::Sha256Kat;
@@ -102,8 +104,11 @@ pub fn execute_kat(env: &mut KatsEnv) -> CaliptraResult<()> {
     cprintln!("[kat] LMS");
     LmsKat::default().execute(env.sha256, env.lms)?;
 
-    cprintln!("[kat] MLDSA87");
-    Mldsa87Kat::default().execute(env.mldsa87, env.trng)?;
+    #[cfg(not(feature = "no-mldsa"))]
+    {
+        cprintln!("[kat] MLDSA87");
+        Mldsa87Kat::default().execute(env.mldsa87, env.trng)?;
+    }
 
     cprintln!("[kat] AES-256-ECB");
     Aes256EcbKat::default().execute(env.aes)?;

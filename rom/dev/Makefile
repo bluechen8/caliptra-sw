@@ -20,6 +20,16 @@ EXTRA_CARGO_CONFIG = target.'cfg(all())'.rustflags = [\"-Dwarnings\"]
 PQC_KEY_TYPE ?= 1
 # Device lifecycle state: unprovisioned, manufacturing, production
 DEVICE_LIFECYCLE ?= production
+# Set to 1 to disable MLDSA in the ROM DICE chain (ECC-only mode).
+# When enabled, PQC_KEY_TYPE is forced to 3 (LMS) for firmware image signing
+# since MLDSA firmware signatures would still be checked by the image verifier.
+NO_MLDSA ?= 0
+MLDSA_FEATURE = $(if $(filter 1,$(NO_MLDSA)),no-mldsa,)
+ifeq ($(NO_MLDSA),1)
+  override PQC_KEY_TYPE = 3
+endif
+
+comma := ,
 
 default: build
 
@@ -30,7 +40,7 @@ build:
 		--profile firmware \
 		--target=riscv32imc-unknown-none-elf \
 		--no-default-features \
-		--features "emu"
+		--features "emu$(if $(MLDSA_FEATURE),$(comma)$(MLDSA_FEATURE),)"
 
 build-emu:
 	cargo \
@@ -39,7 +49,24 @@ build-emu:
 		--profile firmware \
 		--target=riscv32imc-unknown-none-elf \
 		--no-default-features \
-		--features "emu"
+		--features "emu$(if $(MLDSA_FEATURE),$(comma)$(MLDSA_FEATURE),)"
+
+build-asm:
+	cargo build \
+		--profile firmware \
+		--target=riscv32imc-unknown-none-elf \
+		--no-default-features \
+		--features "emu" \
+		--bin asm_tests
+
+run-asm: build-asm
+	rust-objcopy -O binary \
+		$(TARGET_DIR)/asm_tests \
+		$(TARGET_DIR)/asm_tests.bin
+	truncate -s 96K $(TARGET_DIR)/asm_tests.bin
+	cargo run -p caliptra-emu -- \
+		--rom $(TARGET_DIR)/asm_tests.bin \
+		--pqc-key-type 1
 
 build-fmc:
 	cargo \
@@ -154,12 +181,46 @@ objdump:
 		--no-print-imm-hex \
 		--disassembler-options=no-aliases \
 
+build-fake-rom:
+ifeq ($(NO_MLDSA),1)
+	cargo \
+		"--config=$(EXTRA_CARGO_CONFIG)" \
+		run -p caliptra-builder -- \
+		--fake-rom-no-mldsa $(TARGET_DIR)/caliptra-rom.bin \
+		--fw /dev/null
+else
+	cargo \
+		"--config=$(EXTRA_CARGO_CONFIG)" \
+		run -p caliptra-builder -- \
+		--fake-rom $(TARGET_DIR)/caliptra-rom.bin \
+		--fw /dev/null
+endif
+
+run-fake: build-fw-test-image build-fake-rom
+	cargo \
+		"--config=$(EXTRA_CARGO_CONFIG)" \
+		run \
+		-p caliptra-emu \
+		-- \
+		--rom $(TARGET_DIR)/caliptra-rom.bin \
+		--recovery-image-fw $(TARGET_DIR)/caliptra-rom-test-fw \
+		--device-lifecycle $(DEVICE_LIFECYCLE) \
+		--pqc-key-type $(PQC_KEY_TYPE)
+
 build-rom:
+ifeq ($(NO_MLDSA),1)
+	cargo \
+		"--config=$(EXTRA_CARGO_CONFIG)" \
+		run -p caliptra-builder -- \
+		--rom-with-log-no-mldsa $(TARGET_DIR)/caliptra-rom.bin \
+		--fw /dev/null
+else
 	cargo \
 		"--config=$(EXTRA_CARGO_CONFIG)" \
 		run -p caliptra-builder -- \
 		--rom-with-log $(TARGET_DIR)/caliptra-rom.bin \
 		--fw /dev/null
+endif
 
 run: build-emu build-fw-test-image build-rom
 	cargo \

@@ -31,6 +31,8 @@ use caliptra_common::{
     x509,
     RomBootStatus::*,
 };
+#[cfg(feature = "no-mldsa")]
+use caliptra_drivers::Mldsa87PubKey;
 use caliptra_drivers::*;
 use caliptra_x509::*;
 use core::mem::offset_of;
@@ -83,25 +85,41 @@ impl InitDevIdLayer {
         Self::derive_cdi(env, KEY_ID_UDS, KEY_ID_ROM_FMC_CDI)?;
 
         // Derive DICE ECC and MLDSA Key Pairs from CDI
+        #[cfg(not(feature = "no-mldsa"))]
         let (ecc_key_pair, mldsa_key_pair) = Self::derive_key_pair(
             env,
             KEY_ID_ROM_FMC_CDI,
             KEY_ID_IDEVID_ECDSA_PRIV_KEY,
             KEY_ID_IDEVID_MLDSA_KEYPAIR_SEED,
         )?;
+        #[cfg(feature = "no-mldsa")]
+        let (ecc_key_pair, mldsa_key_pair) = {
+            let ecc = Self::derive_ecc_key_pair(env, KEY_ID_ROM_FMC_CDI, KEY_ID_IDEVID_ECDSA_PRIV_KEY)?;
+            let mldsa = MlDsaKeyPair {
+                key_pair_seed: KEY_ID_IDEVID_MLDSA_KEYPAIR_SEED,
+                pub_key: Mldsa87PubKey::default(),
+            };
+            (ecc, mldsa)
+        };
 
         // Generate the Subject Serial Number and Subject Key Identifier for ECC.
         // This information will be used by next DICE Layer while generating
         // certificates
         let ecc_subj_sn = x509::subj_sn(&mut env.sha256, &PubKey::Ecc(&ecc_key_pair.pub_key))?;
+        #[cfg(not(feature = "no-mldsa"))]
         let mldsa_subj_sn =
             x509::subj_sn(&mut env.sha256, &PubKey::Mldsa(&mldsa_key_pair.pub_key))?;
+        #[cfg(feature = "no-mldsa")]
+        let mldsa_subj_sn = [0u8; 64];
         report_boot_status(IDevIdSubjIdSnGenerationComplete.into());
 
         let ecc_subj_key_id =
             cold_reset::x509::idev_subj_key_id(env, &PubKey::Ecc(&ecc_key_pair.pub_key))?;
+        #[cfg(not(feature = "no-mldsa"))]
         let mldsa_subj_key_id =
             cold_reset::x509::idev_subj_key_id(env, &PubKey::Mldsa(&mldsa_key_pair.pub_key))?;
+        #[cfg(feature = "no-mldsa")]
+        let mldsa_subj_key_id = [0u8; 20];
         report_boot_status(IDevIdSubjKeyIdGenerationComplete.into());
 
         // Generate the output for next layer
@@ -115,7 +133,10 @@ impl InitDevIdLayer {
         };
 
         // Generate the Initial DevID Certificate Signing Request (CSR)
+        #[cfg(not(feature = "no-mldsa"))]
         Self::generate_csrs(env, &output)?;
+        #[cfg(feature = "no-mldsa")]
+        Self::generate_ecc_csr_only(env, &output)?;
 
         // Indicate (if not already done) to SOC that it can start uploading the firmware image to the mailbox.
         if !env.soc_ifc.flow_status_ready_for_mb_processing() {
@@ -127,7 +148,10 @@ impl InitDevIdLayer {
             output.ecc_subj_key_pair.pub_key;
 
         // Copy the MLDSA public key to Persistent Data.
-        env.persistent_data.get_mut().idevid_mldsa_pub_key = output.mldsa_subj_key_pair.pub_key;
+        #[cfg(not(feature = "no-mldsa"))]
+        {
+            env.persistent_data.get_mut().idevid_mldsa_pub_key = output.mldsa_subj_key_pair.pub_key;
+        }
 
         cprintln!("[idev] --");
         report_boot_status(IDevIdDerivationComplete.into());
@@ -207,6 +231,44 @@ impl InitDevIdLayer {
         Ok(())
     }
 
+    /// ECC-only key pair derivation (used when no-mldsa feature is enabled)
+    #[cfg(feature = "no-mldsa")]
+    fn derive_ecc_key_pair(
+        env: &mut RomEnv,
+        cdi: KeyId,
+        ecc_priv_key: KeyId,
+    ) -> CaliptraResult<Ecc384KeyPair> {
+        let result = Crypto::ecc384_key_gen(
+            &mut env.ecc384,
+            &mut env.hmac,
+            &mut env.trng,
+            &mut env.key_vault,
+            cdi,
+            b"idevid_ecc_key",
+            ecc_priv_key,
+        );
+        if cfi_launder(result.is_ok()) {
+            cfi_assert!(result.is_ok());
+        } else {
+            cfi_assert!(result.is_err());
+        }
+        let ecc_keypair = result?;
+        report_boot_status(IDevIdKeyPairDerivationComplete.into());
+        Ok(ecc_keypair)
+    }
+
+    /// ECC-only CSR generation (used when no-mldsa feature is enabled)
+    #[cfg(feature = "no-mldsa")]
+    #[inline(always)]
+    fn generate_ecc_csr_only(env: &mut RomEnv, output: &DiceOutput) -> CaliptraResult<()> {
+        if !env.soc_ifc.mfg_flag_gen_idev_id_csr() {
+            Self::reset_persistent_storage_csrs(env)?;
+            return Ok(());
+        }
+        Self::make_ecc_csr(env, output)?;
+        Ok(())
+    }
+
     /// Derive Dice Layer ECC and MLDSA Key Pairs
     ///
     /// # Arguments
@@ -219,6 +281,7 @@ impl InitDevIdLayer {
     /// # Returns
     ///
     /// * `(Ecc384KeyPair, MlDsaKeyPair)` - DICE Layer ECC and MLDSA Key Pairs
+    #[cfg(not(feature = "no-mldsa"))]
     #[cfg_attr(not(feature = "no-cfi"), cfi_impl_fn)]
     fn derive_key_pair(
         env: &mut RomEnv,
@@ -295,6 +358,7 @@ impl InitDevIdLayer {
         Self::make_ecc_csr(env, output)?;
 
         // Generate MLDSA CSR.
+        #[cfg(not(feature = "no-mldsa"))]
         Self::make_mldsa_csr(env, output)?;
 
         // Create a HMAC tag for the CSR Envelop.
@@ -396,6 +460,7 @@ impl InitDevIdLayer {
         Ok(())
     }
 
+    #[cfg(not(feature = "no-mldsa"))]
     fn make_mldsa_csr(env: &mut RomEnv, output: &DiceOutput) -> CaliptraResult<()> {
         let key_pair = &output.mldsa_subj_key_pair;
 

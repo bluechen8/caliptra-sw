@@ -98,6 +98,7 @@ impl FirmwareProcessor {
             lms: &mut env.lms,
 
             // Mldsa87 Engine
+            #[cfg(not(feature = "no-mldsa"))]
             mldsa87: &mut env.mldsa87,
 
             // Ecc384 Engine
@@ -136,6 +137,7 @@ impl FirmwareProcessor {
             sha2_512_384_acc: &mut env.sha2_512_384_acc,
             soc_ifc: &mut env.soc_ifc,
             ecc384: &mut env.ecc384,
+            #[cfg(not(feature = "no-mldsa"))]
             mldsa87: &mut env.mldsa87,
             data_vault: &env.persistent_data.get().data_vault,
             pcr_bank: &mut env.pcr_bank,
@@ -238,6 +240,7 @@ impl FirmwareProcessor {
         Ok(())
     }
 
+    #[cfg(not(feature = "no-mldsa"))]
     fn mldsa_verify(
         txn: &mut ManuallyDrop<MailboxRecvTxn<'_>>,
         mldsa87: &mut Mldsa87,
@@ -429,6 +432,7 @@ impl FirmwareProcessor {
                     CommandId::ECDSA384_SIGNATURE_VERIFY => {
                         Self::ecdsa_verify(&mut txn, env.ecc384)?
                     }
+                    #[cfg(not(feature = "no-mldsa"))]
                     CommandId::MLDSA87_SIGNATURE_VERIFY => {
                         Self::mldsa_verify(&mut txn, env.mldsa87)?
                     }
@@ -483,6 +487,7 @@ impl FirmwareProcessor {
                         resp.populate_chksum();
                         txn.send_response(resp.as_bytes_partial()?)?;
                     }
+                    #[cfg(not(feature = "no-mldsa"))]
                     CommandId::GET_IDEV_MLDSA87_CSR => {
                         let mut request = MailboxReqHeader::default();
                         Self::copy_req_verify_chksum(&mut txn, request.as_mut_bytes(), false)?;
@@ -691,6 +696,7 @@ impl FirmwareProcessor {
             soc_ifc: venv.soc_ifc,
             data_vault: venv.data_vault,
             ecc384: venv.ecc384,
+            #[cfg(not(feature = "no-mldsa"))]
             mldsa87: venv.mldsa87,
             image: venv.image,
             dma: venv.dma,

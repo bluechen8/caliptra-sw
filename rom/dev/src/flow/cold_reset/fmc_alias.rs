@@ -23,6 +23,8 @@ use crate::rom_env::RomEnv;
 use caliptra_cfi_derive::cfi_impl_fn;
 use caliptra_cfi_lib::{cfi_assert, cfi_assert_bool, cfi_launder};
 use caliptra_common::cfi_check;
+#[cfg(feature = "no-mldsa")]
+use caliptra_drivers::Mldsa87PubKey;
 use caliptra_common::crypto::{Crypto, Ecc384KeyPair, MlDsaKeyPair, PubKey};
 use caliptra_common::keyids::{
     KEY_ID_FMC_ECDSA_PRIV_KEY, KEY_ID_FMC_MLDSA_KEYPAIR_SEED, KEY_ID_ROM_FMC_CDI,
@@ -35,10 +37,9 @@ use caliptra_drivers::{
     okmutref, report_boot_status, sha2_512_384::Sha2DigestOpTrait, Array4x12, CaliptraResult,
     HmacMode, KeyId,
 };
-use caliptra_x509::{
-    FmcAliasCertTbsEcc384, FmcAliasCertTbsEcc384Params, FmcAliasCertTbsMlDsa87,
-    FmcAliasCertTbsMlDsa87Params,
-};
+use caliptra_x509::{FmcAliasCertTbsEcc384, FmcAliasCertTbsEcc384Params};
+#[cfg(not(feature = "no-mldsa"))]
+use caliptra_x509::{FmcAliasCertTbsMlDsa87, FmcAliasCertTbsMlDsa87Params};
 use zeroize::Zeroize;
 
 #[derive(Default)]
@@ -79,26 +80,42 @@ impl FmcAliasLayer {
         result?;
 
         // Derive DICE ECC and MLDSA Key Pairs from CDI
+        #[cfg(not(feature = "no-mldsa"))]
         let (ecc_key_pair, mldsa_key_pair) = Self::derive_key_pair(
             env,
             KEY_ID_ROM_FMC_CDI,
             KEY_ID_FMC_ECDSA_PRIV_KEY,
             KEY_ID_FMC_MLDSA_KEYPAIR_SEED,
         )?;
+        #[cfg(feature = "no-mldsa")]
+        let (ecc_key_pair, mldsa_key_pair) = {
+            let ecc = Self::derive_ecc_key_pair(env, KEY_ID_ROM_FMC_CDI, KEY_ID_FMC_ECDSA_PRIV_KEY)?;
+            let mldsa = MlDsaKeyPair {
+                key_pair_seed: KEY_ID_FMC_MLDSA_KEYPAIR_SEED,
+                pub_key: Mldsa87PubKey::default(),
+            };
+            (ecc, mldsa)
+        };
 
         // Generate the Subject Serial Number and Subject Key Identifier.
         //
         // This information will be used by next DICE Layer while generating
         // certificates
         let ecc_subj_sn = x509::subj_sn(&mut env.sha256, &PubKey::Ecc(&ecc_key_pair.pub_key))?;
+        #[cfg(not(feature = "no-mldsa"))]
         let mldsa_subj_sn =
             x509::subj_sn(&mut env.sha256, &PubKey::Mldsa(&mldsa_key_pair.pub_key))?;
+        #[cfg(feature = "no-mldsa")]
+        let mldsa_subj_sn = [0u8; 64];
         report_boot_status(FmcAliasSubjIdSnGenerationComplete.into());
 
         let ecc_subj_key_id =
             x509::subj_key_id(&mut env.sha256, &PubKey::Ecc(&ecc_key_pair.pub_key))?;
+        #[cfg(not(feature = "no-mldsa"))]
         let mldsa_subj_key_id =
             x509::subj_key_id(&mut env.sha256, &PubKey::Mldsa(&mldsa_key_pair.pub_key))?;
+        #[cfg(feature = "no-mldsa")]
+        let mldsa_subj_key_id = [0u8; 20];
         report_boot_status(FmcAliasSubjKeyIdGenerationComplete.into());
 
         // Generate the output for next layer
@@ -112,9 +129,15 @@ impl FmcAliasLayer {
         };
 
         // Generate FMC Alias Certificate
+        #[cfg(not(feature = "no-mldsa"))]
         let result: CaliptraResult<()> = (|| {
             Self::generate_cert_sig_ecc(env, input, &output, fw_proc_info)?;
             Self::generate_cert_sig_mldsa(env, input, &output, fw_proc_info)?;
+            Ok(())
+        })();
+        #[cfg(feature = "no-mldsa")]
+        let result: CaliptraResult<()> = (|| {
+            Self::generate_cert_sig_ecc(env, input, &output, fw_proc_info)?;
             Ok(())
         })();
         output.zeroize();
@@ -156,6 +179,28 @@ impl FmcAliasLayer {
         Ok(())
     }
 
+    /// ECC-only key pair derivation (used when no-mldsa feature is enabled)
+    #[cfg(feature = "no-mldsa")]
+    fn derive_ecc_key_pair(
+        env: &mut RomEnv,
+        cdi: KeyId,
+        ecc_priv_key: KeyId,
+    ) -> CaliptraResult<Ecc384KeyPair> {
+        let result = Crypto::ecc384_key_gen(
+            &mut env.ecc384,
+            &mut env.hmac,
+            &mut env.trng,
+            &mut env.key_vault,
+            cdi,
+            b"alias_fmc_ecc_key",
+            ecc_priv_key,
+        );
+        cfi_check!(result);
+        let ecc_keypair = result?;
+        report_boot_status(FmcAliasKeyPairDerivationComplete.into());
+        Ok(ecc_keypair)
+    }
+
     /// Derive Dice Layer Key Pair
     ///
     /// # Arguments
@@ -168,6 +213,7 @@ impl FmcAliasLayer {
     /// # Returns
     ///
     /// * `Ecc384KeyPair` - Derive DICE Layer Key Pair
+    #[cfg(not(feature = "no-mldsa"))]
     #[cfg_attr(not(feature = "no-cfi"), cfi_impl_fn)]
     fn derive_key_pair(
         env: &mut RomEnv,
@@ -317,6 +363,7 @@ impl FmcAliasLayer {
     /// * `env`    - ROM Environment
     /// * `input`  - DICE Input
     /// * `output` - DICE Output
+    #[cfg(not(feature = "no-mldsa"))]
     fn generate_cert_sig_mldsa(
         env: &mut RomEnv,
         input: &DiceInput,

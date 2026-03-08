@@ -200,12 +200,24 @@ fn handle_auth_debug_unlock_token(
     FirmwareProcessor::copy_req_verify_chksum(&mut txn, token.as_mut_bytes(), false)?;
 
     // Use common validation function
+    #[cfg(not(feature = "no-mldsa"))]
     let result = debug_unlock::validate_debug_unlock_token(
         &env.soc_ifc,
         &mut env.sha2_512_384,
         &mut env.sha2_512_384_acc,
         &mut env.ecc384,
         &mut env.mldsa87,
+        &mut env.dma,
+        request,
+        challenge,
+        &token,
+    );
+    #[cfg(feature = "no-mldsa")]
+    let result = debug_unlock::validate_debug_unlock_token(
+        &env.soc_ifc,
+        &mut env.sha2_512_384,
+        &mut env.sha2_512_384_acc,
+        &mut env.ecc384,
         &mut env.dma,
         request,
         challenge,

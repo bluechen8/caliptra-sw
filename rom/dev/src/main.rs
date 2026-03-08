@@ -15,6 +15,7 @@ Abstract:
 #![cfg_attr(not(feature = "std"), no_main)]
 #![cfg_attr(feature = "fake-rom", allow(unused_imports))]
 #![cfg_attr(feature = "fips-test-hooks", allow(dead_code))]
+#![cfg_attr(feature = "no-mldsa", allow(dead_code))]
 
 use crate::{lock::lock_registers, print::HexBytes};
 use caliptra_cfi_lib::{cfi_assert_eq, CfiCounter};
@@ -177,6 +178,7 @@ pub extern "C" fn rom_entry() -> ! {
             lms: &mut env.lms,
 
             // MLDSA87 Engine
+            #[cfg(not(feature = "no-mldsa"))]
             mldsa87: &mut env.mldsa87,
 
             // Ecc384 Engine

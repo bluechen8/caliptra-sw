@@ -196,6 +196,7 @@ pub(crate) struct FakeRomImageVerificationEnv<'a, 'b> {
     pub(crate) soc_ifc: &'a mut SocIfc,
     pub(crate) data_vault: &'a DataVault,
     pub(crate) ecc384: &'a mut Ecc384,
+    #[cfg(not(feature = "no-mldsa"))]
     pub(crate) mldsa87: &'a mut Mldsa87,
     pub image: &'b [u8],
     pub(crate) dma: &'a Dma,
@@ -317,19 +318,19 @@ impl ImageVerificationEnv for &mut FakeRomImageVerificationEnv<'_, '_> {
 
     fn mldsa87_verify(
         &mut self,
-        msg: &[u8],
-        pub_key: &ImageMldsaPubKey,
-        sig: &ImageMldsaSignature,
+        _msg: &[u8],
+        _pub_key: &ImageMldsaPubKey,
+        _sig: &ImageMldsaSignature,
     ) -> CaliptraResult<Mldsa87Result> {
+        #[cfg(not(feature = "no-mldsa"))]
         if self.soc_ifc.verify_in_fake_mode() {
-            let pub_key = Mldsa87PubKey::from(pub_key.0);
-            let sig = Mldsa87Signature::from(sig.0);
+            let pub_key = Mldsa87PubKey::from(_pub_key.0);
+            let sig = Mldsa87Signature::from(_sig.0);
 
-            self.mldsa87.verify_var(&pub_key, &msg, &sig)
-        } else {
-            // Mock verify, just always return success
-            Ok(Mldsa87Result::Success)
+            return self.mldsa87.verify_var(&pub_key, &_msg, &sig);
         }
+        // Mock verify or no-mldsa: always return success
+        Ok(Mldsa87Result::Success)
     }
 
     /// Retrieve Vendor Public Key Digest

@@ -1,4 +1,4 @@
-/*++
+ /*++
 
 Licensed under the Apache-2.0 license.
 
@@ -31,8 +31,11 @@ use caliptra_common::{
     x509,
     RomBootStatus::*,
 };
+#[cfg(feature = "no-mldsa")]
+use caliptra_drivers::Mldsa87PubKey;
 use caliptra_drivers::*;
 use caliptra_x509::*;
+#[cfg(not(feature = "no-mldsa"))]
 use zerocopy::IntoBytes;
 use zeroize::Zeroize;
 
@@ -80,26 +83,42 @@ impl LocalDevIdLayer {
         Self::derive_stable_identity_root_ldev(env, KEY_ID_ROM_FMC_CDI, KEY_ID_STABLE_LDEV)?;
 
         // Derive DICE ECC and MLDSA Key Pairs from CDI
+        #[cfg(not(feature = "no-mldsa"))]
         let (ecc_key_pair, mldsa_key_pair) = Self::derive_key_pair(
             env,
             KEY_ID_ROM_FMC_CDI,
             KEY_ID_LDEVID_ECDSA_PRIV_KEY,
             KEY_ID_LDEVID_MLDSA_KEYPAIR_SEED,
         )?;
+        #[cfg(feature = "no-mldsa")]
+        let (ecc_key_pair, mldsa_key_pair) = {
+            let ecc = Self::derive_ecc_key_pair(env, KEY_ID_ROM_FMC_CDI, KEY_ID_LDEVID_ECDSA_PRIV_KEY)?;
+            let mldsa = MlDsaKeyPair {
+                key_pair_seed: KEY_ID_LDEVID_MLDSA_KEYPAIR_SEED,
+                pub_key: Mldsa87PubKey::default(),
+            };
+            (ecc, mldsa)
+        };
 
         // Generate the Subject Serial Number and Subject Key Identifier.
         //
         // This information will be used by the next DICE Layer while generating
         // certificates
         let ecc_subj_sn = x509::subj_sn(&mut env.sha256, &PubKey::Ecc(&ecc_key_pair.pub_key))?;
+        #[cfg(not(feature = "no-mldsa"))]
         let mldsa_subj_sn =
             x509::subj_sn(&mut env.sha256, &PubKey::Mldsa(&mldsa_key_pair.pub_key))?;
+        #[cfg(feature = "no-mldsa")]
+        let mldsa_subj_sn = [0u8; 64];
         report_boot_status(LDevIdSubjIdSnGenerationComplete.into());
 
         let ecc_subj_key_id =
             x509::subj_key_id(&mut env.sha256, &PubKey::Ecc(&ecc_key_pair.pub_key))?;
+        #[cfg(not(feature = "no-mldsa"))]
         let mldsa_subj_key_id =
             x509::subj_key_id(&mut env.sha256, &PubKey::Mldsa(&mldsa_key_pair.pub_key))?;
+        #[cfg(feature = "no-mldsa")]
+        let mldsa_subj_key_id = [0u8; 20];
         report_boot_status(LDevIdSubjKeyIdGenerationComplete.into());
 
         // Generate the output for next layer
@@ -114,6 +133,7 @@ impl LocalDevIdLayer {
 
         // Generate Local Device ID Certificate
         Self::generate_cert_sig_ecc(env, input, &output)?;
+        #[cfg(not(feature = "no-mldsa"))]
         Self::generate_cert_sig_mldsa(env, input, &output)?;
 
         cprintln!("[ldev] --");
@@ -219,6 +239,32 @@ impl LocalDevIdLayer {
         Ok(())
     }
 
+    /// ECC-only key pair derivation (used when no-mldsa feature is enabled)
+    #[cfg(feature = "no-mldsa")]
+    fn derive_ecc_key_pair(
+        env: &mut RomEnv,
+        cdi: KeyId,
+        ecc_priv_key: KeyId,
+    ) -> CaliptraResult<Ecc384KeyPair> {
+        let result = Crypto::ecc384_key_gen(
+            &mut env.ecc384,
+            &mut env.hmac,
+            &mut env.trng,
+            &mut env.key_vault,
+            cdi,
+            b"ldevid_ecc_key",
+            ecc_priv_key,
+        );
+        if cfi_launder(result.is_ok()) {
+            cfi_assert!(result.is_ok());
+        } else {
+            cfi_assert!(result.is_err());
+        }
+        let ecc_keypair = result?;
+        report_boot_status(LDevIdKeyPairDerivationComplete.into());
+        Ok(ecc_keypair)
+    }
+
     /// Derive Dice Layer Key Pair
     ///
     /// # Arguments
@@ -231,6 +277,7 @@ impl LocalDevIdLayer {
     /// # Returns
     ///
     /// * `(Ecc384KeyPair, MlDsaKeyPair)` - DICE Layer ECC and MLDSA Key Pairs
+    #[cfg(not(feature = "no-mldsa"))]
     #[cfg_attr(not(feature = "no-cfi"), cfi_impl_fn)]
     fn derive_key_pair(
         env: &mut RomEnv,
@@ -362,6 +409,7 @@ impl LocalDevIdLayer {
     /// * `env`    - ROM Environment
     /// * `input`  - DICE Input
     /// * `output` - DICE Output
+    #[cfg(not(feature = "no-mldsa"))]
     fn generate_cert_sig_mldsa(
         env: &mut RomEnv,
         input: &DiceInput,
