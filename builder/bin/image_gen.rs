@@ -35,7 +35,12 @@ fn main() {
             arg!(--"all_elfs" [DIR] "Build all firmware elf files")
                 .value_parser(value_parser!(PathBuf)),
         )
+        .arg(
+            arg!(--"rom-with-log-no-mldsa" [FILE] "ROM binary image (with logging, no MLDSA)")
+                .value_parser(value_parser!(PathBuf)),
+        )
         .arg(arg!(--"fake-rom" [FILE] "Fake ROM").value_parser(value_parser!(PathBuf)))
+        .arg(arg!(--"fake-rom-no-mldsa" [FILE] "Fake ROM (no MLDSA)").value_parser(value_parser!(PathBuf)))
         .arg(arg!(--"fake-fw" [FILE] "Fake FW bundle image").value_parser(value_parser!(PathBuf)))
         .arg(
             arg!(--"hashes" [FILE] "File path for output JSON file containing image bundle header hashes for external signing tools")
@@ -65,8 +70,22 @@ fn main() {
         valid_cmd = true;
         std::fs::write(path, rom).unwrap();
     }
+    if let Some(path) = args.get_one::<PathBuf>("rom-with-log-no-mldsa") {
+        let rom =
+            caliptra_builder::build_firmware_rom(&firmware::ROM_WITH_UART_NO_MLDSA).unwrap();
+        valid_cmd = true;
+        std::fs::write(path, rom).unwrap();
+    }
+
     if let Some(path) = args.get_one::<PathBuf>("fake-rom") {
         let rom = caliptra_builder::build_firmware_rom(&firmware::ROM_FAKE_WITH_UART).unwrap();
+        valid_cmd = true;
+        std::fs::write(path, rom).unwrap();
+    }
+
+    if let Some(path) = args.get_one::<PathBuf>("fake-rom-no-mldsa") {
+        let rom =
+            caliptra_builder::build_firmware_rom(&firmware::ROM_FAKE_WITH_UART_NO_MLDSA).unwrap();
         valid_cmd = true;
         std::fs::write(path, rom).unwrap();
     }

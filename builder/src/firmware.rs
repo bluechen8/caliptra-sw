@@ -57,10 +57,22 @@ pub const ROM_WITH_UART: FwId = FwId {
     features: &["emu"],
 };
 
+pub const ROM_WITH_UART_NO_MLDSA: FwId = FwId {
+    crate_name: "caliptra-rom",
+    bin_name: "caliptra-rom",
+    features: &["emu", "no-mldsa"],
+};
+
 pub const ROM_FAKE_WITH_UART: FwId = FwId {
     crate_name: "caliptra-rom",
     bin_name: "caliptra-rom",
     features: &["emu", "fake-rom"],
+};
+
+pub const ROM_FAKE_WITH_UART_NO_MLDSA: FwId = FwId {
+    crate_name: "caliptra-rom",
+    bin_name: "caliptra-rom",
+    features: &["emu", "fake-rom", "no-mldsa"],
 };
 
 pub const ROM_FAKE_WITH_UART_FPGA: FwId = FwId {
@@ -509,7 +521,9 @@ pub const REGISTERED_FW: &[&FwId] = &[
     &ROM,
     &ROM_FPGA,
     &ROM_WITH_UART,
+    &ROM_WITH_UART_NO_MLDSA,
     &ROM_FAKE_WITH_UART,
+    &ROM_FAKE_WITH_UART_NO_MLDSA,
     &ROM_FAKE_WITH_UART_FPGA,
     &ROM_WITH_FIPS_TEST_HOOKS,
     &ROM_WITH_FIPS_TEST_HOOKS_FPGA,
