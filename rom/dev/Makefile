@@ -28,6 +28,9 @@ MLDSA_FEATURE = $(if $(filter 1,$(NO_MLDSA)),no-mldsa,)
 ifeq ($(NO_MLDSA),1)
   override PQC_KEY_TYPE = 3
 endif
+# Set to 1 to build test-fmc in minimal-demo mode (print banner + jump to RT)
+MINIMAL_DEMO ?= 0
+MINIMAL_DEMO_FEATURE = $(if $(filter 1,$(MINIMAL_DEMO)),minimal-demo,)
 
 comma := ,
 
@@ -87,7 +90,7 @@ build-test-fmc:
 		--manifest-path tools/test-fmc/Cargo.toml \
 		--target=riscv32imc-unknown-none-elf \
 		--no-default-features \
-		--features emu
+		--features "emu$(if $(MINIMAL_DEMO_FEATURE),$(comma)$(MINIMAL_DEMO_FEATURE),)"
 
 build-rt:
 	cargo \
@@ -212,8 +215,7 @@ ifeq ($(NO_MLDSA),1)
 	cargo \
 		"--config=$(EXTRA_CARGO_CONFIG)" \
 		run -p caliptra-builder -- \
-		--rom-with-log-no-mldsa $(TARGET_DIR)/caliptra-rom.bin \
-		--fw /dev/null
+		--rom-with-log-no-mldsa $(TARGET_DIR)/caliptra-rom.bin
 else
 	cargo \
 		"--config=$(EXTRA_CARGO_CONFIG)" \

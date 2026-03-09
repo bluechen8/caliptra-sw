@@ -39,11 +39,49 @@ This sets `--features no-mldsa` and forces `PQC_KEY_TYPE=3` (LMS only).
 - [x] `src/flow/cold_reset/fmc_alias.rs`: Gated `derive_key_pair` and `generate_cert_sig_mldsa` function definitions
 - [x] `src/flow/cold_reset/fw_processor.rs`: Gated `mldsa87` fields in KatsEnv, FirmwareImageVerificationEnv, FakeRomImageVerificationEnv constructions; gated `mldsa_verify` function definition
 
+## Linker Script Adjustments
+
+Rust/linker files use **default 256KB ICCM/DCCM** values (upstream defaults).
+ICCM/DCCM shrinking is tested via both RTL simulation and SW emulator by caliptra-sw.
+
+Use `gen_memory_layout.py` to regenerate for reduced SRAM sizes when needed:
+```
+python3 rom/dev/tools/scripts/gen_memory_layout.py \
+    --iccm-kb 32 --dccm-kb 256 \
+    --fmc-kb 8 --rt-kb 24 \
+    --total-stack-kb 40 --rom-stack-kb 40 --fmc-rt-stack-kb 14 \
+    --lib-fmc-kb 8 --lib-rt-kb 24
+```
+
+Files affected by gen_memory_layout.py:
+- `drivers/src/memory_layout.rs`
+- `rom/dev/src/rom.ld`
+- `rom/dev/tools/test-fmc/src/fmc.ld`
+- `rom/dev/tools/test-rt/src/rt.ld`
+- `common/src/lib.rs`
+
+### Key constraint: DCCM cannot be reduced below 256K
+- `PersistentData` struct is ~110K (manifests 34K, datavault 15K, MLDSA keys/certs 20K, cert buffers, DPE, auth manifest metadata, CSR envelopes)
+- ROM DICE chain requires ~40K stack for crypto operations (ECC, SHA, certificate generation)
+- At 128K DCCM: only ~14K available for stack → stack overflow corrupts PersistentData.dot_owner_pk_hash → fatal error `0x000B005E` (DOT owner public key digest mismatch)
+- Future optimization: gate MLDSA fields in PersistentData with `no-mldsa` feature (~20K savings)
+
+## Feature Flag: `minimal-demo`
+Enables a minimal test-fmc that prints a banner and jumps directly to RT (skipping mailbox command processing).
+
+Build with: `make MINIMAL_DEMO=1` (see rom/dev/Makefile)
+
+### Changes
+- [x] `rom/dev/Makefile`: Added `MINIMAL_DEMO` variable, passes `minimal-demo` feature to test-fmc build; removed `--fw /dev/null` from no-mldsa builder invocation
+- [x] `rom/dev/tools/test-fmc/Cargo.toml`: Added `minimal-demo` feature
+- [x] `rom/dev/tools/test-fmc/src/main.rs`: Added `minimal-demo` gated path that reads RT entry point from DataVault and jumps via inline `transfer_control` asm
+
 ## TODO
-- [ ] Test ROM build with `NO_MLDSA=1` and verify it compiles cleanly
+- [x] Test ROM build with `NO_MLDSA=1` and verify it compiles cleanly
+- [x] Adjust linker scripts for reduced ICCM (32K) — tested via RTL sim and SW emulator, rolled back to defaults in source
 - [ ] Measure ROM binary size with and without MLDSA to determine IMEM savings
-- [ ] Adjust linker scripts if memory map changes for reduced SRAMs
-- [ ] Verify firmware runs correctly with reduced SRAMs (Part 2 of area optimization)
+- [ ] Verify firmware runs correctly with reduced ICCM (Part 2 of area optimization)
+- [ ] (future) Gate MLDSA fields in PersistentData to enable DCCM reduction
 
 ## Related
 - RTL changes tracked in: `/scratch/boru/chipyard/generators/caliptra-wrapper/src/main/resources/caliptra/vsrc/caliptra/CLAUDE.md`

@@ -13,6 +13,7 @@ Abstract:
 --*/
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(not(feature = "std"), no_main)]
+#![cfg_attr(feature = "minimal-demo", allow(unused_imports, dead_code))]
 
 use caliptra_common::pcr::PCR_ID_STASH_MEASUREMENT;
 use caliptra_common::PcrLogEntry;
@@ -42,18 +43,44 @@ const BANNER: &str = r#"
 Running Caliptra FMC ...
 "#;
 
+// transfer_control assembly for minimal-demo RT handoff (mirrors fmc/src/transfer_control.S)
+#[cfg(all(not(feature = "std"), feature = "minimal-demo"))]
+core::arch::global_asm!(
+    ".section .init.text, \"ax\"",
+    ".align 2",
+    ".global transfer_control",
+    "transfer_control:",
+    "  jr a0",
+    "  j transfer_control",
+);
+
 #[no_mangle]
 pub extern "C" fn fmc_entry() -> ! {
     cprintln!("{}", BANNER);
 
-    if cfg!(not(feature = "fake-fmc")) {
+    #[cfg(feature = "minimal-demo")]
+    {
+        // Minimal demo: jump directly to RT entry point (like real FMC's HandOff::to_rt)
         let persistent_data = unsafe { PersistentDataAccessor::new() };
-        assert!(persistent_data.get().fht.is_valid());
+        let rt_entry_point = persistent_data.get().data_vault.rt_entry_point();
+        cprintln!("[fmc] Jumping to RT at 0x{:08X}", rt_entry_point);
+        extern "C" {
+            fn transfer_control(entry: u32) -> !;
+        }
+        unsafe { transfer_control(rt_entry_point) }
     }
 
-    process_mailbox_commands();
+    #[cfg(not(feature = "minimal-demo"))]
+    {
+        if cfg!(not(feature = "fake-fmc")) {
+            let persistent_data = unsafe { PersistentDataAccessor::new() };
+            assert!(persistent_data.get().fht.is_valid());
+        }
 
-    caliptra_drivers::ExitCtrl::exit(0)
+        process_mailbox_commands();
+
+        caliptra_drivers::ExitCtrl::exit(0)
+    }
 }
 
 #[no_mangle]
