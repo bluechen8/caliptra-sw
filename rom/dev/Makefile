@@ -71,6 +71,23 @@ run-asm: build-asm
 		--rom $(TARGET_DIR)/asm_tests.bin \
 		--pqc-key-type 1
 
+build-jtag:
+	cargo build \
+		--profile firmware \
+		--target=riscv32imc-unknown-none-elf \
+		--no-default-features \
+		--features "emu" \
+		--bin jtag_tests
+
+run-jtag: build-jtag
+	rust-objcopy -O binary \
+		$(TARGET_DIR)/jtag_tests \
+		$(TARGET_DIR)/jtag_tests.bin
+	truncate -s 96K $(TARGET_DIR)/jtag_tests.bin
+	cargo run -p caliptra-emu -- \
+		--rom $(TARGET_DIR)/jtag_tests.bin \
+		--pqc-key-type 1
+
 build-fmc:
 	cargo \
 		"--config=$(EXTRA_CARGO_CONFIG)" \
