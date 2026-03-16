@@ -21,7 +21,7 @@ use caliptra_drivers::cprintln;
 use caliptra_drivers::ExitCtrl;
 
 /// SOC IFC registers (VeeR-side addresses)
-const CPTRA_FLOW_STATUS: *mut u32 = 0x3003_003c as *mut u32;
+
 const FLOW_READY_FOR_MB_PROCESSING: u32 = 1 << 28;
 
 /// DCCM test area — 4 words at DCCM base + 0x100 (well away from stack)
