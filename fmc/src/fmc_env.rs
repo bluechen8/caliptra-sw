@@ -16,14 +16,18 @@ Abstract:
 --*/
 
 use caliptra_drivers::{
-    CaliptraResult, Ecc384, Hmac, KeyVault, Mailbox, Mldsa87, PcrBank, PersistentDataAccessor,
+    CaliptraResult, Ecc384, Hmac, KeyVault, Mailbox, PcrBank, PersistentDataAccessor,
     Sha1, Sha256, Sha2_512_384, Sha2_512_384Acc, SocIfc, Trng,
 };
+#[cfg(not(feature = "no-mldsa"))]
+use caliptra_drivers::Mldsa87;
 use caliptra_registers::{
     csrng::CsrngReg, ecc::EccReg, entropy_src::EntropySrcReg, hmac::HmacReg, kv::KvReg,
-    mbox::MboxCsr, mldsa::MldsaReg, pv::PvReg, sha256::Sha256Reg, sha512::Sha512Reg,
+    mbox::MboxCsr, pv::PvReg, sha256::Sha256Reg, sha512::Sha512Reg,
     sha512_acc::Sha512AccCsr, soc_ifc::SocIfcReg, soc_ifc_trng::SocIfcTrngReg,
 };
+#[cfg(not(feature = "no-mldsa"))]
+use caliptra_registers::mldsa::MldsaReg;
 
 /// Hardware Context
 pub struct FmcEnv {
@@ -64,6 +68,7 @@ pub struct FmcEnv {
     pub persistent_data: PersistentDataAccessor,
 
     /// Mldsa87 Engine
+    #[cfg(not(feature = "no-mldsa"))]
     pub mldsa: Mldsa87,
 }
 
@@ -96,6 +101,7 @@ impl FmcEnv {
             pcr_bank: PcrBank::new(PvReg::new()),
             trng,
             persistent_data: PersistentDataAccessor::new(),
+            #[cfg(not(feature = "no-mldsa"))]
             mldsa: Mldsa87::new(MldsaReg::new()),
         })
     }

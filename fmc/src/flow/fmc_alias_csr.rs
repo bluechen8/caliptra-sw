@@ -4,17 +4,21 @@ use crate::flow::dice::DiceOutput;
 use crate::fmc_env::FmcEnv;
 use crate::HandOff;
 use caliptra_common::{
-    crypto::{Crypto, Ecc384KeyPair, MlDsaKeyPair, PubKey},
+    crypto::{Crypto, Ecc384KeyPair, PubKey},
     dice, x509,
 };
+#[cfg(not(feature = "no-mldsa"))]
+use caliptra_common::crypto::MlDsaKeyPair;
 use caliptra_drivers::{
     okmutref, sha2_512_384::Sha2DigestOpTrait, Array4x12, CaliptraError, CaliptraResult,
     Ecc384Signature,
 };
 use caliptra_x509::{
     Ecdsa384CsrBuilder, Ecdsa384Signature, FmcAliasCsrTbs, FmcAliasCsrTbsParams,
-    FmcAliasTbsMlDsa87, FmcAliasTbsMlDsa87Params, MlDsa87CsrBuilder,
 };
+#[cfg(not(feature = "no-mldsa"))]
+use caliptra_x509::{FmcAliasTbsMlDsa87, FmcAliasTbsMlDsa87Params, MlDsa87CsrBuilder};
+#[cfg(not(feature = "no-mldsa"))]
 use zerocopy::IntoBytes;
 use zeroize::Zeroize;
 
@@ -42,6 +46,7 @@ impl Ecdsa384SignatureAdapter for Ecc384Signature {
 /// # Returns
 ///
 /// * `DiceInput` - DICE Layer Input
+#[cfg(not(feature = "no-mldsa"))]
 fn dice_output_from_hand_off(env: &mut FmcEnv) -> CaliptraResult<DiceOutput> {
     let ecc_auth_pub = HandOff::fmc_ecc_pub_key(env);
     let ecc_subj_sn = x509::subj_sn(&mut env.sha256, &PubKey::Ecc(&ecc_auth_pub))?;
@@ -51,7 +56,6 @@ fn dice_output_from_hand_off(env: &mut FmcEnv) -> CaliptraResult<DiceOutput> {
     let mldsa_subj_sn = x509::subj_sn(&mut env.sha256, &PubKey::Mldsa(&mldsa_auth_pub))?;
     let mldsa_subj_key_id = x509::subj_key_id(&mut env.sha256, &PubKey::Mldsa(&mldsa_auth_pub))?;
 
-    // Create initial output
     let output = DiceOutput {
         cdi: HandOff::fmc_cdi(env),
         ecc_subj_key_pair: Ecc384KeyPair {
@@ -71,22 +75,38 @@ fn dice_output_from_hand_off(env: &mut FmcEnv) -> CaliptraResult<DiceOutput> {
     Ok(output)
 }
 
+#[cfg(feature = "no-mldsa")]
+fn dice_output_from_hand_off(env: &mut FmcEnv) -> CaliptraResult<DiceOutput> {
+    let ecc_auth_pub = HandOff::fmc_ecc_pub_key(env);
+    let ecc_subj_sn = x509::subj_sn(&mut env.sha256, &PubKey::Ecc(&ecc_auth_pub))?;
+    let ecc_subj_key_id = x509::subj_key_id(&mut env.sha256, &PubKey::Ecc(&ecc_auth_pub))?;
+
+    let output = DiceOutput {
+        cdi: HandOff::fmc_cdi(env),
+        ecc_subj_key_pair: Ecc384KeyPair {
+            priv_key: HandOff::fmc_ecc_priv_key(env),
+            pub_key: ecc_auth_pub,
+        },
+        ecc_subj_sn,
+        ecc_subj_key_id,
+    };
+
+    Ok(output)
+}
+
 #[inline(always)]
 pub fn generate_csr(env: &mut FmcEnv) -> CaliptraResult<()> {
     dice_output_from_hand_off(env).and_then(|output| make_csr(env, &output))
 }
 
-/// Generate FMC Alias ECC and MLDSA CSRs
-///
-/// # Arguments
-///
-/// * `env`    - FMC Environment
-/// * `output` - DICE Output
+/// Generate FMC Alias CSRs (ECC, and MLDSA when available)
 // Inlined to reduce FMC size
 #[inline(always)]
 pub fn make_csr(env: &mut FmcEnv, output: &DiceOutput) -> CaliptraResult<()> {
     make_ecc_csr(env, output)?;
-    make_mldsa_csr(env, output)
+    #[cfg(not(feature = "no-mldsa"))]
+    make_mldsa_csr(env, output)?;
+    Ok(())
 }
 
 pub struct FmcAliasCsrTbsCommonParams {
@@ -192,6 +212,7 @@ fn make_ecc_csr(env: &mut FmcEnv, output: &DiceOutput) -> CaliptraResult<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "no-mldsa"))]
 fn make_mldsa_csr(env: &mut FmcEnv, output: &DiceOutput) -> CaliptraResult<()> {
     let key_pair = &output.mldsa_subj_key_pair;
 

@@ -126,6 +126,8 @@ pub(crate) fn run_cmd(args: &ArgMatches) -> anyhow::Result<()> {
 
     let print_hashes = args.get_flag("print-hashes");
 
+    let pl0_pauser: Option<u32> = args.get_one::<u32>("pl0-pauser").copied();
+
     //YYYYMMDDHHMMSS - Zulu Time
     let mut own_from_date: [u8; 15] = [0u8; 15];
     let mut own_to_date: [u8; 15] = [0u8; 15];
@@ -185,6 +187,7 @@ pub(crate) fn run_cmd(args: &ArgMatches) -> anyhow::Result<()> {
             *pqc_key_idx,
             mfg_from_date,
             mfg_to_date,
+            pl0_pauser,
         )?,
         owner_config: owner_config(
             pqc_key_type,
@@ -229,6 +232,7 @@ fn vendor_config(
     pqc_key_idx: u32,
     from_date: [u8; 15],
     to_date: [u8; 15],
+    pl0_pauser: Option<u32>,
 ) -> anyhow::Result<ImageGeneratorVendorConfig> {
     let mut gen_config = ImageGeneratorVendorConfig::default();
 
@@ -327,6 +331,7 @@ fn vendor_config(
     gen_config.ecc_key_count = ecc_key_count;
     gen_config.lms_key_count = lms_key_count;
     gen_config.mldsa_key_count = mldsa_key_count;
+    gen_config.pl0_pauser = pl0_pauser;
 
     Ok(gen_config)
 }

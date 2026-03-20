@@ -89,6 +89,7 @@ impl ProductionDebugUnlock {
     }
 
     /// Handle the production debug unlock token verification
+    #[cfg(not(feature = "no-mldsa"))]
     #[allow(clippy::too_many_arguments)]
     pub fn handle_token(
         &mut self,
@@ -100,6 +101,57 @@ impl ProductionDebugUnlock {
         dma: &mut caliptra_drivers::Dma,
         cmd_bytes: &[u8],
     ) -> CaliptraResult<usize> {
+        self.handle_token_inner(soc_ifc, sha2_512_384, sha2_512_384_acc, ecc384, dma, cmd_bytes,
+            |soc_ifc, sha2, sha2_acc, ecc, dma, request, challenge, token| {
+                caliptra_common::debug_unlock::validate_debug_unlock_token(
+                    soc_ifc, sha2, sha2_acc, ecc, mldsa87, dma, request, challenge, token,
+                )
+            })
+    }
+
+    /// Handle the production debug unlock token verification (no-mldsa variant)
+    #[cfg(feature = "no-mldsa")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_token(
+        &mut self,
+        soc_ifc: &mut caliptra_drivers::SocIfc,
+        sha2_512_384: &mut caliptra_drivers::Sha2_512_384,
+        sha2_512_384_acc: &mut caliptra_drivers::Sha2_512_384Acc,
+        ecc384: &mut caliptra_drivers::Ecc384,
+        dma: &mut caliptra_drivers::Dma,
+        cmd_bytes: &[u8],
+    ) -> CaliptraResult<usize> {
+        self.handle_token_inner(soc_ifc, sha2_512_384, sha2_512_384_acc, ecc384, dma, cmd_bytes,
+            |soc_ifc, sha2, sha2_acc, ecc, dma, request, challenge, token| {
+                caliptra_common::debug_unlock::validate_debug_unlock_token(
+                    soc_ifc, sha2, sha2_acc, ecc, dma, request, challenge, token,
+                )
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_token_inner<F>(
+        &mut self,
+        soc_ifc: &mut caliptra_drivers::SocIfc,
+        sha2_512_384: &mut caliptra_drivers::Sha2_512_384,
+        sha2_512_384_acc: &mut caliptra_drivers::Sha2_512_384Acc,
+        ecc384: &mut caliptra_drivers::Ecc384,
+        dma: &mut caliptra_drivers::Dma,
+        cmd_bytes: &[u8],
+        validate_fn: F,
+    ) -> CaliptraResult<usize>
+    where
+        F: FnOnce(
+            &caliptra_drivers::SocIfc,
+            &mut caliptra_drivers::Sha2_512_384,
+            &mut caliptra_drivers::Sha2_512_384Acc,
+            &mut caliptra_drivers::Ecc384,
+            &mut caliptra_drivers::Dma,
+            &ProductionAuthDebugUnlockReq,
+            &ProductionAuthDebugUnlockChallenge,
+            &ProductionAuthDebugUnlockToken,
+        ) -> CaliptraResult<()>,
+    {
         // Parse the token
         let token = ProductionAuthDebugUnlockToken::read_from_bytes(cmd_bytes)
             .map_err(|_| CaliptraError::RUNTIME_MAILBOX_API_REQUEST_DATA_LEN_TOO_LARGE)?;
@@ -130,12 +182,11 @@ impl ProductionDebugUnlock {
         soc_ifc.set_ss_dbg_unlock_in_progress(true);
 
         // Use the common validation logic
-        let result = caliptra_common::debug_unlock::validate_debug_unlock_token(
+        let result = validate_fn(
             soc_ifc,
             sha2_512_384,
             sha2_512_384_acc,
             ecc384,
-            mldsa87,
             dma,
             &request,
             &challenge,

@@ -450,12 +450,22 @@ fn handle_command(drivers: &mut Drivers) -> CaliptraResult<MboxStatusE> {
             cmd_bytes,
             resp,
         ),
+        #[cfg(not(feature = "no-mldsa"))]
         CommandId::PRODUCTION_AUTH_DEBUG_UNLOCK_TOKEN => drivers.debug_unlock.handle_token(
             &mut drivers.soc_ifc,
             &mut drivers.sha2_512_384,
             &mut drivers.sha2_512_384_acc,
             &mut drivers.ecc384,
             &mut drivers.mldsa87,
+            &mut drivers.dma,
+            cmd_bytes,
+        ),
+        #[cfg(feature = "no-mldsa")]
+        CommandId::PRODUCTION_AUTH_DEBUG_UNLOCK_TOKEN => drivers.debug_unlock.handle_token(
+            &mut drivers.soc_ifc,
+            &mut drivers.sha2_512_384,
+            &mut drivers.sha2_512_384_acc,
+            &mut drivers.ecc384,
             &mut drivers.dma,
             cmd_bytes,
         ),

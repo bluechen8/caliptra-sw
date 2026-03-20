@@ -18,9 +18,13 @@ use caliptra_cfi_derive::cfi_impl_fn;
 use caliptra_common::{handle_fatal_error, DataStore::*};
 use caliptra_common::{DataStore, FirmwareHandoffTable, HandOffDataHandle, Vault};
 use caliptra_drivers::{
-    cprintln, memory_layout, Array4x12, Ecc384Signature, KeyId, Mldsa87Signature,
+    cprintln, memory_layout, Array4x12, Ecc384Signature, KeyId,
 };
-use caliptra_drivers::{Ecc384PubKey, Mldsa87PubKey};
+#[cfg(not(feature = "no-mldsa"))]
+use caliptra_drivers::Mldsa87Signature;
+use caliptra_drivers::Ecc384PubKey;
+#[cfg(not(feature = "no-mldsa"))]
+use caliptra_drivers::Mldsa87PubKey;
 use caliptra_error::{CaliptraError, CaliptraResult};
 
 #[cfg(feature = "riscv")]
@@ -69,10 +73,7 @@ impl HandOff {
     }
 
     /// Get the fmc MLDSA public key.
-    ///
-    /// # Returns
-    /// * fmc MLDSA public key
-    ///
+    #[cfg(not(feature = "no-mldsa"))]
     pub fn fmc_mldsa_pub_key(env: &FmcEnv) -> Mldsa87PubKey {
         env.persistent_data.get().data_vault.fmc_mldsa_pub_key()
     }
@@ -100,6 +101,7 @@ impl HandOff {
     }
 
     /// Retrieve FMC Alias MLDSA KeyPair Seed KV Slot
+    #[cfg(not(feature = "no-mldsa"))]
     pub fn fmc_mldsa_keypair_seed_key(env: &FmcEnv) -> KeyId {
         let ds: DataStore = Self::fht(env)
             .fmc_mldsa_keypair_seed_kv_hdl
@@ -164,12 +166,13 @@ impl HandOff {
     }
 
     /// Store runtime Dice MLDSA Signature
+    #[cfg(not(feature = "no-mldsa"))]
     #[cfg_attr(not(feature = "no-cfi"), cfi_impl_fn)]
     pub fn set_rt_dice_mldsa_signature(env: &mut FmcEnv, sig: &Mldsa87Signature) {
-        // Self::fht_mut(env).rt_dice_mldsa_sign = *sig;
         env.persistent_data.get_mut().rt_dice_mldsa_sign = *sig;
     }
 
+    #[cfg(not(feature = "no-mldsa"))]
     #[cfg_attr(not(feature = "no-cfi"), cfi_impl_fn)]
     pub fn set_rtalias_mldsa_tbs_size(env: &mut FmcEnv, rtalias_tbs_size: usize) {
         env.persistent_data.get_mut().rtalias_mldsa_tbs_size = rtalias_tbs_size as u16;

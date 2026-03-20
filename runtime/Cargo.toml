@@ -83,6 +83,7 @@ x509-cert.workspace = true
 default = ["std"]
 emu = ["caliptra_common/emu", "caliptra-drivers/emu"]
 itrng = ["caliptra-drivers/itrng", "caliptra-hw-model/itrng"]
+no-mldsa = ["caliptra_common/no-mldsa", "caliptra-kat/no-mldsa"]
 riscv = ["caliptra-cpu/riscv"]
 std = ["ufmt/std", "caliptra_common/std"]
 slow_tests = []

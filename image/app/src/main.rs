@@ -104,6 +104,11 @@ fn main() {
         .arg(
             arg!(--"print-hashes" "Print vendor and owner hashes").action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            arg!(--"pl0-pauser" <U32> "PL0 PAUSER value (AXI user ID granted PL0 privilege)")
+                .required(false)
+                .value_parser(value_parser!(u32)),
+        )
         ];
 
     let cmd = Command::new("caliptra-image-app")

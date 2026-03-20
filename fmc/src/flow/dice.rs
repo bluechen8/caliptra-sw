@@ -15,7 +15,9 @@ Abstract:
 
 use caliptra_drivers::KeyId;
 
-use caliptra_common::crypto::{Ecc384KeyPair, MlDsaKeyPair};
+use caliptra_common::crypto::Ecc384KeyPair;
+#[cfg(not(feature = "no-mldsa"))]
+use caliptra_common::crypto::MlDsaKeyPair;
 
 /// DICE Layer Input
 #[derive(Debug)]
@@ -37,12 +39,15 @@ pub struct DiceInput {
     pub ecc_auth_key_id: [u8; 20],
 
     /// MLDSA Authority Key Pair
+    #[cfg(not(feature = "no-mldsa"))]
     pub mldsa_auth_key_pair: MlDsaKeyPair,
 
     /// MLDSA Authority Serial Number
+    #[cfg(not(feature = "no-mldsa"))]
     pub mldsa_auth_sn: [u8; 64],
 
     /// MLDSA Authority Key Identifier
+    #[cfg(not(feature = "no-mldsa"))]
     pub mldsa_auth_key_id: [u8; 20],
 }
 
@@ -62,11 +67,14 @@ pub struct DiceOutput {
     pub ecc_subj_key_id: [u8; 20],
 
     /// MLDSA Subject key pair for this layer
+    #[cfg(not(feature = "no-mldsa"))]
     pub mldsa_subj_key_pair: MlDsaKeyPair,
 
     /// MLDSA Subject Serial Number
+    #[cfg(not(feature = "no-mldsa"))]
     pub mldsa_subj_sn: [u8; 64],
 
     /// MLDSA Subject Key Identifier
+    #[cfg(not(feature = "no-mldsa"))]
     pub mldsa_subj_key_id: [u8; 20],
 }

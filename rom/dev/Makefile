@@ -96,7 +96,7 @@ build-fmc:
 		--manifest-path ../../fmc/Cargo.toml \
 		--target=riscv32imc-unknown-none-elf \
 		--no-default-features \
-		--features emu,riscv \
+		--features "emu,riscv$(if $(MLDSA_FEATURE),$(comma)$(MLDSA_FEATURE),)" \
 		--bin caliptra-fmc
 
 build-test-fmc:
@@ -117,7 +117,7 @@ build-rt:
 		--manifest-path ../../runtime/Cargo.toml \
 		--target=riscv32imc-unknown-none-elf \
 		--no-default-features \
-		--features emu,riscv \
+		--features "emu,riscv$(if $(MLDSA_FEATURE),$(comma)$(MLDSA_FEATURE),)" \
 		--bin caliptra-runtime
 
 build-test-rt:
@@ -173,8 +173,55 @@ build-fw-image: gen-certs build-fmc build-rt
 		--rt-version 0 \
 		--rt-rev $(GIT_REV) \
 		--fw-svn 0 \
+		--pl0-pauser 0 \
 		--out $(TARGET_DIR)/caliptra-fw \
 		--print-hashes
+
+build-fake-fmc:
+	cargo \
+		"--config=$(EXTRA_CARGO_CONFIG)" \
+		build \
+		--profile firmware \
+		--manifest-path ../../fmc/Cargo.toml \
+		--target=riscv32imc-unknown-none-elf \
+		--no-default-features \
+		--features "emu,riscv,fake-fmc$(if $(MLDSA_FEATURE),$(comma)$(MLDSA_FEATURE),)" \
+		--bin caliptra-fmc
+
+build-fw-quick-image: gen-certs build-fake-fmc build-rt
+	cargo \
+		"--config=$(EXTRA_CARGO_CONFIG)" \
+		run \
+		--manifest-path ../../image/app/Cargo.toml \
+		-- \
+		create \
+		--pqc-key-type $(PQC_KEY_TYPE) \
+		--key-config $(TARGET_DIR)/keys.toml \
+		--ecc-pk-idx 1 \
+		--pqc-pk-idx 0 \
+		--fmc $(TARGET_DIR)/caliptra-fmc \
+		--fmc-version 0 \
+		--fmc-rev $(GIT_REV) \
+		--rt $(TARGET_DIR)/caliptra-runtime \
+		--rt-version 0 \
+		--rt-rev $(GIT_REV) \
+		--fw-svn 0 \
+		--pl0-pauser 0 \
+		--out $(TARGET_DIR)/caliptra-quick-fw \
+		--print-hashes
+
+run-quick: build-fw-quick-image build-fake-rom
+	cargo \
+		"--config=$(EXTRA_CARGO_CONFIG)" \
+		run \
+		-p caliptra-emu \
+		-- \
+		--rom $(TARGET_DIR)/caliptra-fake-rom.bin \
+		--recovery-image-fw $(TARGET_DIR)/caliptra-quick-fw \
+		--device-lifecycle manufacturing \
+		--pqc-key-type $(PQC_KEY_TYPE) \
+		--mfg-pk-hash \
+			$$(dd if=$(TARGET_DIR)/caliptra-quick-fw bs=1 skip=12 count=1736 status=none | sha384sum | cut -d' ' -f1)
 
 bloat: build
 	 cargo \
@@ -206,13 +253,13 @@ ifeq ($(NO_MLDSA),1)
 	cargo \
 		"--config=$(EXTRA_CARGO_CONFIG)" \
 		run -p caliptra-builder -- \
-		--fake-rom-no-mldsa $(TARGET_DIR)/caliptra-rom.bin \
+		--fake-rom-no-mldsa $(TARGET_DIR)/caliptra-fake-rom.bin \
 		--fw /dev/null
 else
 	cargo \
 		"--config=$(EXTRA_CARGO_CONFIG)" \
 		run -p caliptra-builder -- \
-		--fake-rom $(TARGET_DIR)/caliptra-rom.bin \
+		--fake-rom $(TARGET_DIR)/caliptra-fake-rom.bin \
 		--fw /dev/null
 endif
 
@@ -222,10 +269,12 @@ run-fake: build-fw-test-image build-fake-rom
 		run \
 		-p caliptra-emu \
 		-- \
-		--rom $(TARGET_DIR)/caliptra-rom.bin \
+		--rom $(TARGET_DIR)/caliptra-fake-rom.bin \
 		--recovery-image-fw $(TARGET_DIR)/caliptra-rom-test-fw \
-		--device-lifecycle $(DEVICE_LIFECYCLE) \
-		--pqc-key-type $(PQC_KEY_TYPE)
+		--device-lifecycle manufacturing \
+		--pqc-key-type $(PQC_KEY_TYPE) \
+		--mfg-pk-hash \
+			$$(dd if=$(TARGET_DIR)/caliptra-rom-test-fw bs=1 skip=12 count=1736 status=none | sha384sum | cut -d' ' -f1)
 
 build-rom:
 ifeq ($(NO_MLDSA),1)
@@ -256,6 +305,22 @@ run: build-emu build-fw-test-image build-rom
 		$(if $(filter production manufacturing,$(DEVICE_LIFECYCLE)),--mfg-pk-hash \
 			$$(dd if=$(TARGET_DIR)/caliptra-rom-test-fw bs=1 skip=12 count=1736 status=none | sha384sum | cut -d' ' -f1),)
 # See image/types/src/lib.rs ImageManifest for offsets and lenghts of vendor_pub_key_info
+
+# Run with full runtime firmware (no subsystem mode) — for attestation/crypto demos
+run-full-runtime: build-emu build-fw-image build-rom
+	cargo \
+		"--config=$(EXTRA_CARGO_CONFIG)" \
+		run \
+		-p caliptra-emu \
+		-- \
+		--req-idevid-csr \
+		--idevid-key-id-algo sha1 \
+		--rom $(TARGET_DIR)/caliptra-rom.bin \
+		--recovery-image-fw $(TARGET_DIR)/caliptra-fw \
+		--device-lifecycle $(DEVICE_LIFECYCLE) \
+		--pqc-key-type $(PQC_KEY_TYPE) \
+		$(if $(filter production manufacturing,$(DEVICE_LIFECYCLE)),--mfg-pk-hash \
+			$$(dd if=$(TARGET_DIR)/caliptra-fw bs=1 skip=12 count=1736 status=none | sha384sum | cut -d' ' -f1),)
 
 run-active: build-emu build-fw-image build-rom
 	cargo \

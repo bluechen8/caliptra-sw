@@ -38,6 +38,7 @@ impl FirmwareVerifyCmd {
             sha2_512_384_acc: &mut drivers.sha2_512_384_acc,
             soc_ifc: &mut drivers.soc_ifc,
             ecc384: &mut drivers.ecc384,
+            #[cfg(not(feature = "no-mldsa"))]
             mldsa87: &mut drivers.mldsa87,
             data_vault: &drivers.persistent_data.get().data_vault,
             pcr_bank: &mut drivers.pcr_bank,
