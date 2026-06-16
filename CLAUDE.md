@@ -73,6 +73,11 @@ Build with: `make MINIMAL_DEMO=1` (see rom/dev/Makefile)
 
 ### Changes
 - [x] `rom/dev/Makefile`: Added `MINIMAL_DEMO` variable, passes `minimal-demo` feature to test-fmc build; removed `--fw /dev/null` from no-mldsa builder invocation
+
+## Build-only JTAG target
+- [x] `rom/dev/Makefile`: Added `build-jtag-bin` target — same objcopy/truncate as
+  `run-jtag` but stops before `cargo run -p caliptra-emu` (which hangs). Used by the host
+  one-shot build (`software/build.sh`) to fetch `jtag_tests.bin` without running the emulator.
 - [x] `rom/dev/tools/test-fmc/Cargo.toml`: Added `minimal-demo` feature
 - [x] `rom/dev/tools/test-fmc/src/main.rs`: Added `minimal-demo` gated path that reads RT entry point from DataVault and jumps via inline `transfer_control` asm
 

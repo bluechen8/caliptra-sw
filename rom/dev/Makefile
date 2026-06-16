@@ -88,6 +88,15 @@ run-jtag: build-jtag
 		--rom $(TARGET_DIR)/jtag_tests.bin \
 		--pqc-key-type 1
 
+# Like run-jtag but stops after producing jtag_tests.bin (no emulator run).
+# Used by the host one-shot build (software/build.sh) to fetch the JTAG ROM
+# binary without launching the hanging emulator.
+build-jtag-bin: build-jtag
+	rust-objcopy -O binary \
+		$(TARGET_DIR)/jtag_tests \
+		$(TARGET_DIR)/jtag_tests.bin
+	truncate -s 96K $(TARGET_DIR)/jtag_tests.bin
+
 build-fmc:
 	cargo \
 		"--config=$(EXTRA_CARGO_CONFIG)" \
