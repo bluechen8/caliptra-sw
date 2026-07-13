@@ -2261,6 +2261,32 @@ impl CaliptraError {
             0xa005_5025,
             "Crypto Mailbox Error: Unsupported hash algorithm"
         ),
+        // FHE (CKKS) accelerator runtime service errors.
+        (
+            RUNTIME_FHE_ABSENT,
+            0x000e_0100,
+            "Runtime Error: FHE accelerator not present / identity mismatch"
+        ),
+        (
+            RUNTIME_FHE_KEYGEN_FAILED,
+            0x000e_0101,
+            "Runtime Error: FHE KEYGEN reported an error or timed out"
+        ),
+        (
+            RUNTIME_FHE_ENCRYPT_FAILED,
+            0x000e_0102,
+            "Runtime Error: FHE ENCRYPT reported an error or timed out"
+        ),
+        (
+            RUNTIME_FHE_DECRYPT_FAILED,
+            0x000e_0103,
+            "Runtime Error: FHE DECRYPT reported an error or timed out"
+        ),
+        (
+            RUNTIME_FHE_RESEED_TIMEOUT,
+            0x000e_0104,
+            "Runtime Error: FHE encrypt stalled awaiting reseed and never released"
+        ),
     ];
 }
 

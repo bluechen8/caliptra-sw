@@ -25,6 +25,8 @@ mod dpe_crypto;
 mod dpe_platform;
 mod drivers;
 mod fe_programming;
+#[cfg(feature = "fhe")]
+mod fhe;
 pub mod fips;
 mod firmware_verify;
 mod get_fmc_alias_csr;
@@ -470,6 +472,12 @@ fn handle_command(drivers: &mut Drivers) -> CaliptraResult<MboxStatusE> {
             cmd_bytes,
         ),
         CommandId::FE_PROG => FeProgrammingCmd::execute(drivers, cmd_bytes),
+        #[cfg(feature = "fhe")]
+        CommandId::FHE_KEYGEN => fhe::FheCmd::keygen(drivers, cmd_bytes, resp),
+        #[cfg(feature = "fhe")]
+        CommandId::FHE_ENCRYPT => fhe::FheCmd::encrypt(drivers, cmd_bytes, resp),
+        #[cfg(feature = "fhe")]
+        CommandId::FHE_DECRYPT => fhe::FheCmd::decrypt(drivers, cmd_bytes, resp),
         CommandId::REALLOCATE_DPE_CONTEXT_LIMITS => {
             ReallocateDpeContextLimitsCmd::execute(drivers, cmd_bytes, resp)
         }

@@ -89,6 +89,7 @@ std = ["ufmt/std", "caliptra_common/std"]
 slow_tests = []
 verilator = ["caliptra-hw-model/verilator"]
 fips_self_test = []
+fhe = []
 no-cfi = [
     "caliptra-image-verify/no-cfi",
     "caliptra-drivers/no-cfi",

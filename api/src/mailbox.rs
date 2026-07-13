@@ -179,6 +179,12 @@ impl CommandId {
     pub const CM_ECDSA_VERIFY: Self = Self(0x434D_4556); // "CMEV"
     pub const CM_DERIVE_STABLE_KEY: Self = Self(0x494D_4453); // "CMDS"
     pub const REALLOCATE_DPE_CONTEXT_LIMITS: Self = Self(0x5243_5458); // "RCTX"
+
+    // FHE (CKKS) accelerator commands. Handled by the runtime `fhe` feature; the
+    // handler drives the internal-AHB FHE block at 0x1005_0000.
+    pub const FHE_KEYGEN: Self = Self(0x4648_4B47); // "FHKG"
+    pub const FHE_ENCRYPT: Self = Self(0x4648_454E); // "FHEN"
+    pub const FHE_DECRYPT: Self = Self(0x4648_4445); // "FHDE"
 }
 
 impl From<u32> for CommandId {
@@ -1239,6 +1245,76 @@ pub struct StashMeasurementResp {
     pub dpe_result: u32,
 }
 impl Response for StashMeasurementResp {}
+
+// FHE_KEYGEN
+// Materializes the resident CKKS secret key. `kg_seed_{lo,hi}` is the plaintext
+// keygen root seed (used when `kv_en == 0`); when `kv_en != 0` the keygen seed
+// is read from KeyVault entry `kv_entry` instead and `kg_seed` is ignored.
+#[repr(C)]
+#[derive(Debug, Default, IntoBytes, FromBytes, Immutable, KnownLayout, PartialEq, Eq)]
+pub struct FheKeygenReq {
+    pub hdr: MailboxReqHeader,
+    pub kg_seed_lo: u32,
+    pub kg_seed_hi: u32,
+    pub kg_scale: u32,
+    pub enc_scale: u32,
+    pub i2f_scale: u32,
+    pub target_level: u32,
+    pub param_set_id: u32,
+    pub kv_en: u32,
+    pub kv_entry: u32,
+}
+impl Request for FheKeygenReq {
+    const ID: CommandId = CommandId::FHE_KEYGEN;
+    type Resp = FheStatusResp;
+}
+
+// FHE_ENCRYPT
+// Encrypts the plaintext polynomial at `src` (DRAM byte address) into the
+// ciphertext pair (`c0`, `c1`) via the FHE DMA.
+#[repr(C)]
+#[derive(Debug, Default, IntoBytes, FromBytes, Immutable, KnownLayout, PartialEq, Eq)]
+pub struct FheEncryptReq {
+    pub hdr: MailboxReqHeader,
+    pub src_lo: u32,
+    pub src_hi: u32,
+    pub c0_lo: u32,
+    pub c0_hi: u32,
+    pub c1_lo: u32,
+    pub c1_hi: u32,
+}
+impl Request for FheEncryptReq {
+    const ID: CommandId = CommandId::FHE_ENCRYPT;
+    type Resp = FheStatusResp;
+}
+
+// FHE_DECRYPT
+// Decrypts the ciphertext pair (`c0`, `c1`) into the recovered slots at `out`
+// (DRAM byte addresses).
+#[repr(C)]
+#[derive(Debug, Default, IntoBytes, FromBytes, Immutable, KnownLayout, PartialEq, Eq)]
+pub struct FheDecryptReq {
+    pub hdr: MailboxReqHeader,
+    pub c0_lo: u32,
+    pub c0_hi: u32,
+    pub c1_lo: u32,
+    pub c1_hi: u32,
+    pub out_lo: u32,
+    pub out_hi: u32,
+}
+impl Request for FheDecryptReq {
+    const ID: CommandId = CommandId::FHE_DECRYPT;
+    type Resp = FheStatusResp;
+}
+
+// Common FHE response: the final STATUS register word after the op completed.
+#[repr(C)]
+#[derive(Debug, Default, IntoBytes, FromBytes, Immutable, KnownLayout, PartialEq, Eq)]
+pub struct FheStatusResp {
+    pub hdr: MailboxRespHeader,
+    pub status: u32,
+}
+impl Response for FheStatusResp {}
 
 // DISABLE_ATTESTATION
 // No command-specific input args

@@ -32,6 +32,12 @@ endif
 MINIMAL_DEMO ?= 0
 MINIMAL_DEMO_FEATURE = $(if $(filter 1,$(MINIMAL_DEMO)),minimal-demo,)
 
+# Set to 1 to compile the runtime FHE (CKKS) mailbox service (Track B). Gated so
+# existing runtime builds are unchanged when off. Enables the `fhe` cargo feature
+# on caliptra-runtime (build-rt below).
+FHE ?= 0
+FHE_FEATURE = $(if $(filter 1,$(FHE)),fhe,)
+
 comma := ,
 
 default: build
@@ -126,7 +132,7 @@ build-rt:
 		--manifest-path ../../runtime/Cargo.toml \
 		--target=riscv32imc-unknown-none-elf \
 		--no-default-features \
-		--features "emu,riscv$(if $(MLDSA_FEATURE),$(comma)$(MLDSA_FEATURE),)" \
+		--features "emu,riscv$(if $(MLDSA_FEATURE),$(comma)$(MLDSA_FEATURE),)$(if $(FHE_FEATURE),$(comma)$(FHE_FEATURE),)" \
 		--bin caliptra-runtime
 
 build-test-rt:
