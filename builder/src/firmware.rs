@@ -416,6 +416,12 @@ pub mod driver_tests {
         features: &["emu", "fpga_subsystem"],
         ..BASE_FWID
     };
+
+    /// DMA smoke test against plain SoC DRAM (FHE offload plan §6/WP2).
+    pub const DMA_DRAM: FwId = FwId {
+        bin_name: "dma_dram",
+        ..BASE_FWID
+    };
 }
 
 pub mod rom_tests {
@@ -584,6 +590,7 @@ pub const REGISTERED_FW: &[&FwId] = &[
     &driver_tests::PERSISTENT,
     &driver_tests::DMA_SHA384,
     &driver_tests::DMA_SHA384_FPGA,
+    &driver_tests::DMA_DRAM,
     &rom_tests::ASM_TESTS,
     &rom_tests::TEST_FMC_WITH_UART,
     &rom_tests::FAKE_TEST_FMC_WITH_UART,

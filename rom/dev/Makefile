@@ -103,6 +103,25 @@ build-jtag-bin: build-jtag
 		$(TARGET_DIR)/jtag_tests.bin
 	truncate -s 96K $(TARGET_DIR)/jtag_tests.bin
 
+# DMA smoke-test ROM (FHE offload plan §6/WP2).  Built from this crate's
+# test-fw, not drivers/test-fw, because it must run on RTL: only rom/dev's
+# start.S zeroes ICCM/DCCM to initialize their ECC, and without that the first
+# DCCM read raises CPTRA_HW_ERROR_FATAL.dccm_ecc_unc.  Like build-jtag-bin this
+# stops at the .bin: the Chipyard host test loads it into IMEM itself.
+build-dma-dram-bin:
+	cargo \
+		"--config=$(EXTRA_CARGO_CONFIG)" \
+		build \
+		--profile firmware \
+		--target=riscv32imc-unknown-none-elf \
+		--no-default-features \
+		--features "emu" \
+		--bin dma_dram_rom
+	rust-objcopy -O binary \
+		$(TARGET_DIR)/dma_dram_rom \
+		$(TARGET_DIR)/dma_dram.bin
+	truncate -s 96K $(TARGET_DIR)/dma_dram.bin
+
 build-fmc:
 	cargo \
 		"--config=$(EXTRA_CARGO_CONFIG)" \

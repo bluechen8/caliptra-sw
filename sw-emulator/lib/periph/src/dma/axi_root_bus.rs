@@ -19,7 +19,7 @@ use crate::{dma::otp_fc::FuseController, mci::Mci, Sha512Accelerator};
 use caliptra_emu_bus::{
     Bus,
     BusError::{self, LoadAccessFault, StoreAccessFault},
-    Device, Event, EventData, ReadWriteMemory, Register,
+    Device, Event, EventData, Ram, ReadWriteMemory, Register,
 };
 use caliptra_emu_types::{RvAddr, RvData, RvSize};
 use const_random::const_random;
@@ -32,6 +32,11 @@ pub type AxiAddr = u64;
 const TEST_SRAM_SIZE: usize = 4 * 1024;
 const EXTERNAL_TEST_SRAM_SIZE: usize = 1024 * 1024;
 const MCU_SRAM_SIZE: usize = 384 * 1024;
+/// Size of the plain-RAM DRAM window modelled at `DRAM_OFFSET`.
+///
+/// Large enough for the FHE pointer-mode transfers that drove this: a P-L-eq
+/// ciphertext is 256 KiB and a command touches at most a few of them.
+const DRAM_SIZE: usize = 8 * 1024 * 1024;
 
 pub struct AxiRootBus {
     pub reg: u32,
@@ -43,6 +48,16 @@ pub struct AxiRootBus {
     pub mci: Mci,
     sha512_acc: Sha512Accelerator,
     pub test_sram: Option<ReadWriteMemory<TEST_SRAM_SIZE>>,
+    /// Plain RAM standing in for the SoC's DRAM at `DRAM_OFFSET`.
+    ///
+    /// The `EXTERNAL_TEST_SRAM` window at the same base is *event*-routed to an
+    /// MCU emulator, so in a plain (non-subsystem) run nothing answers a DMA
+    /// there and the transfer stalls.  When the MCU recovery interface is not in
+    /// use there is no such responder by construction, so we model the window as
+    /// ordinary memory instead -- which is what an SoC DMA target actually looks
+    /// like to Caliptra, and what pointer-mode mailbox commands need to be
+    /// testable on the emulator at all.
+    pub dram: Option<Ram>,
     pub mcu_sram: ReadWriteMemory<MCU_SRAM_SIZE>,
     pub indirect_fifo_status: u32,
     pub use_mcu_recovery_interface: bool,
@@ -99,6 +114,17 @@ impl AxiRootBus {
     pub const EXTERNAL_TEST_SRAM_END: AxiAddr =
         Self::EXTERNAL_TEST_SRAM_OFFSET + EXTERNAL_TEST_SRAM_SIZE as u64;
 
+    /// Base of the plain-RAM DRAM window; same base as the external test SRAM,
+    /// matching the SoC memory map Caliptra sees in the Chipyard integration.
+    pub const DRAM_OFFSET: AxiAddr = 0x00000000_80000000;
+    /// Last byte of the DRAM window.
+    pub const DRAM_END: AxiAddr = Self::DRAM_OFFSET + DRAM_SIZE as u64 - 1;
+
+    /// True when this address is served by the local DRAM model.
+    fn in_dram(&self, addr: AxiAddr) -> bool {
+        self.dram.is_some() && (Self::DRAM_OFFSET..=Self::DRAM_END).contains(&addr)
+    }
+
     pub fn new(
         soc_reg: SocRegistersInternal,
         sha512_acc: Sha512Accelerator,
@@ -117,6 +143,13 @@ impl AxiRootBus {
             None
         };
         let mcu_sram = ReadWriteMemory::new();
+        // Only when nothing else can answer for the window: with the MCU
+        // recovery interface in use, those accesses belong to the MCU emulator.
+        let dram = if use_mcu_recovery_interface {
+            None
+        } else {
+            Some(Ram::new(vec![0u8; DRAM_SIZE]))
+        };
         Self {
             reg: 0xaabbccdd,
             recovery: RecoveryRegisterInterface::new(),
@@ -126,6 +159,7 @@ impl AxiRootBus {
             event_sender: None,
             dma_result: None,
             test_sram,
+            dram,
             mcu_sram,
             indirect_fifo_status: 0,
             use_mcu_recovery_interface,
@@ -133,6 +167,10 @@ impl AxiRootBus {
     }
 
     pub fn must_schedule(&mut self, addr: AxiAddr) -> bool {
+        // Local DRAM is answered synchronously, like any other plain memory.
+        if self.in_dram(addr) {
+            return false;
+        }
         if self.use_mcu_recovery_interface {
             (addr >= Self::mcu_sram_offset() && addr <= Self::mcu_sram_end())
                 || matches!(
@@ -268,6 +306,11 @@ impl AxiRootBus {
             _ => {}
         };
 
+        if self.in_dram(addr) {
+            let off = (addr - Self::DRAM_OFFSET) as RvAddr;
+            return Bus::read(self.dram.as_mut().unwrap(), size, off);
+        }
+
         if (Self::mcu_sram_offset()..=Self::mcu_sram_end()).contains(&addr) {
             let addr = (addr - Self::mcu_sram_offset()) as RvAddr;
             return Bus::read(&mut self.mcu_sram, size, addr);
@@ -324,6 +367,10 @@ impl AxiRootBus {
             }
             _ => {}
         };
+        if self.in_dram(addr) {
+            let off = (addr - Self::DRAM_OFFSET) as RvAddr;
+            return Bus::write(self.dram.as_mut().unwrap(), size, off, val);
+        }
         if (Self::mcu_sram_offset()..=Self::mcu_sram_end()).contains(&addr) {
             if let Some(sender) = self.event_sender.as_mut() {
                 sender

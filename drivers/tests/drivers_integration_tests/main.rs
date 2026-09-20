@@ -45,6 +45,16 @@ fn start_driver_test(test_rom: &'static FwId) -> Result<DefaultHwModel, Box<dyn 
     )
 }
 
+/// DMA smoke test against plain SoC DRAM (FHE offload plan §6/WP2).
+///
+/// The emulator's AXI root bus models the DRAM window at 0x8000_0000 as plain
+/// memory, so this exercises the same `Dma::write_dword` / `Dma::read_buffer`
+/// AHB-FIFO route that pointer-mode mailbox commands will use.
+#[test]
+fn test_dma_dram() {
+    run_driver_test(&firmware::driver_tests::DMA_DRAM);
+}
+
 fn run_driver_test(test_rom: &'static FwId) {
     let mut model = start_driver_test(test_rom).unwrap();
     // Wrap in a line-writer so output from different test threads doesn't multiplex within a line.
