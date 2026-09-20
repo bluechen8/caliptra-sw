@@ -46,6 +46,7 @@ members = [
   "drivers",
   "drivers/test-fw",
   "drivers/test-fw/scripts/vector_gen",
+  "fhe-core",
   "fmc",
   "hw/latest/registers",
   "hw/verilated",
