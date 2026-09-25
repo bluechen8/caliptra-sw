@@ -98,5 +98,9 @@ name = "jtag_tests"
 path = "test-fw/jtag_tests.rs"
 
 [[bin]]
+name = "dma_dram_rom"
+path = "test-fw/dma_dram_tests.rs"
+
+[[bin]]
 name = "pmp_tests"
 path = "test-fw/pmp_tests.rs"
