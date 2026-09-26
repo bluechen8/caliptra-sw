@@ -122,6 +122,20 @@ build-dma-dram-bin:
 		$(TARGET_DIR)/dma_dram.bin
 	truncate -s 96K $(TARGET_DIR)/dma_dram.bin
 
+build-peak-stress-bin:
+	cargo \
+		"--config=$(EXTRA_CARGO_CONFIG)" \
+		build \
+		--profile firmware \
+		--target=riscv32imc-unknown-none-elf \
+		--no-default-features \
+		--features "emu" \
+		--bin peak_stress_rom
+	rust-objcopy -O binary \
+		$(TARGET_DIR)/peak_stress_rom \
+		$(TARGET_DIR)/peak_stress.bin
+	python3 -c 'from pathlib import Path; p=Path("$(TARGET_DIR)/peak_stress.bin"); b=p.read_bytes(); assert len(b)<=96*1024; p.write_bytes(b + bytes((-len(b)) % 8))'
+
 build-fmc:
 	cargo \
 		"--config=$(EXTRA_CARGO_CONFIG)" \

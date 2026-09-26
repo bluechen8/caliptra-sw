@@ -33,7 +33,8 @@ core::arch::global_asm!(include_str!("../src/start.S"));
 mod exception;
 
 use caliptra_drivers::cprintln;
-use caliptra_drivers::{AxiAddr, Dma, ExitCtrl};
+use caliptra_drivers::{AxiAddr, Dma, DmaReadTarget, DmaReadTransaction, ExitCtrl};
+use caliptra_registers::mbox::MboxCsr;
 
 const FLOW_READY_FOR_MB_PROCESSING: u32 = 1 << 28;
 const FLOW_STATUS: *mut u32 = 0x3003_003C as *mut u32;
@@ -164,6 +165,191 @@ fn run_dma_checks(dma: &Dma) -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// WP10.0 -- transport benchmark (plan §6/WP10.0, go/no-go for WP10)
+//
+// Measures DRAM -> mailbox-SRAM cost three ways, with the mailbox lock held by
+// VeeR.  Holding the lock is the whole point: `uc_has_lock` is what opens the
+// DMA's direct-to-mailbox route (mbox.sv:546), and it is false while a SoC
+// command is executing -- so variant 1 is exactly the route that synchronous
+// pointer mode CANNOT use and that a uC-initiated job CAN.  A test ROM is
+// uC-initiated by nature, so it can time both today, with no RTL change and no
+// commitment to WP10.
+//
+//   v1  DMA direct into mailbox SRAM      (DmaReadTarget::Mbox)
+//   v2  DMA -> AHB FIFO, VeeR drains word by word, polling fifo_depth per word
+//       (what Dma::read_buffer does today, i.e. what pointer mode costs)
+//   v3  as v2, but the fifo_depth poll is hoisted out of the per-word loop --
+//       isolates register-poll overhead from irreducible per-word cost
+//
+// Each variant is checksummed against the expected pattern, because a route
+// that is fast and wrong is worthless (see the WP2 AXI-width bug).
+// ---------------------------------------------------------------------------
+
+/// Bench source buffer, clear of the smoke test's buffers above.
+const BENCH_SRC_OFFSET: u64 = 0x10_0000;
+/// Results block the SoC polls and prints.
+const BENCH_RES_OFFSET: u64 = 0x12_0000;
+/// 256 B, 4 KiB, 64 KiB -- the three sizes plan §6/WP10.0 names.
+const BENCH_SIZES_WORDS: [usize; 3] = [64, 1024, 16384];
+/// Dwords drained per fifo_depth poll in v3.  The engine's FIFO is 512 B = 128
+/// dwords (axi_dma_ctrl.sv), so 64 stays comfortably inside it.
+const BENCH_HOIST_CHUNK: usize = 64;
+/// Written last, so the SoC cannot read a half-filled results block.
+const BENCH_MAGIC: u32 = 0x5A17_B001;
+/// Results-block layout, mirrored as #defines in caliptra-dma-test.c.
+/// [0] magic (last written) · [1] mcycle sanity · then one slot per
+/// (size, variant) pair: [cycles, ok].
+const BENCH_SANITY_OFF: u32 = 4;
+const BENCH_SLOTS_OFF: u32 = 8;
+const BENCH_SLOT_STRIDE: u32 = 8;
+const BENCH_NUM_VARIANTS: usize = 3;
+
+/// Mailbox SRAM as seen by VeeR (memory_layout.rs::MBOX_ORG).  Direct access
+/// needs `uc_has_lock | MBOX_EXECUTE_UC` (mbox.sv:550-552); we hold the lock.
+const MBOX_SRAM: *mut u32 = 0x3004_0000 as *mut u32;
+
+/// VeeR's own cycle counter.  Rocket's `rdcycle` traps in these configs
+/// (haveBasicCounters = false), which is why timing lives on this side.
+#[inline(always)]
+fn rdmcycle() -> u32 {
+    let v: u32;
+    unsafe { core::arch::asm!("csrr {0}, mcycle", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+/// Is `mcycle` actually counting?  If it is not, every number below would be a
+/// convincing-looking zero, so publish the answer rather than assume it.
+fn mcycle_sanity() -> u32 {
+    let t0 = rdmcycle();
+    for _ in 0..64 {
+        unsafe { core::arch::asm!("nop", options(nomem, nostack)) };
+    }
+    rdmcycle().wrapping_sub(t0)
+}
+
+fn setup_read(dma: &Dma, src: AxiAddr, words: usize, target: DmaReadTarget) {
+    dma.flush();
+    dma.setup_dma_read(
+        DmaReadTransaction {
+            read_addr: src,
+            fixed_addr: false,
+            length: (words * 4) as u32,
+            target,
+        },
+        0,
+    );
+}
+
+fn bench_direct(dma: &Dma, src: AxiAddr, words: usize) -> u32 {
+    let t0 = rdmcycle();
+    setup_read(dma, src, words, DmaReadTarget::Mbox(0));
+    dma.with_dma(|d| while d.status0().read().busy() {});
+    rdmcycle().wrapping_sub(t0)
+}
+
+fn bench_fifo_perword(dma: &Dma, src: AxiAddr, words: usize) -> u32 {
+    let t0 = rdmcycle();
+    setup_read(dma, src, words, DmaReadTarget::AhbFifo);
+    dma.with_dma(|d| {
+        for i in 0..words {
+            while d.status0().read().fifo_depth() == 0 {}
+            let w = d.read_data().read();
+            unsafe { MBOX_SRAM.add(i).write_volatile(w) };
+        }
+        while d.status0().read().busy() {}
+    });
+    rdmcycle().wrapping_sub(t0)
+}
+
+fn bench_fifo_hoisted(dma: &Dma, src: AxiAddr, words: usize) -> u32 {
+    let t0 = rdmcycle();
+    setup_read(dma, src, words, DmaReadTarget::AhbFifo);
+    dma.with_dma(|d| {
+        let mut done = 0usize;
+        while done < words {
+            let chunk = core::cmp::min(BENCH_HOIST_CHUNK, words - done);
+            while (d.status0().read().fifo_depth() as usize) < chunk {}
+            for i in 0..chunk {
+                let w = d.read_data().read();
+                unsafe { MBOX_SRAM.add(done + i).write_volatile(w) };
+            }
+            done += chunk;
+        }
+        while d.status0().read().busy() {}
+    });
+    rdmcycle().wrapping_sub(t0)
+}
+
+/// Running hash over `words` values drawn from `get`.  Both callers are
+/// outside the timed region -- folding this into the drain loops would inflate
+/// the very cycle counts WP10.0 exists to measure.
+fn checksum(words: usize, get: impl Fn(usize) -> u32) -> u32 {
+    let mut s = 0u32;
+    for i in 0..words {
+        s = s.wrapping_mul(31).wrapping_add(get(i));
+    }
+    s
+}
+
+fn mbox_checksum(words: usize) -> u32 {
+    checksum(words, |i| unsafe { MBOX_SRAM.add(i).read_volatile() })
+}
+
+/// Scrub the mailbox window so a variant cannot pass on the previous one's data.
+fn mbox_scrub(words: usize) {
+    for i in 0..words {
+        unsafe { MBOX_SRAM.add(i).write_volatile(0xDEAD_BEEF) };
+    }
+}
+
+fn run_transport_bench(dma: &Dma) {
+    let res = AxiAddr::from(DRAM_BASE + BENCH_RES_OFFSET);
+    let src = AxiAddr::from(DRAM_BASE + BENCH_SRC_OFFSET);
+
+    // Take the mailbox lock.  This is what sets `uc_has_lock`
+    // (mbox.sv: uc_has_lock_nxt = ~req_data_soc_req & lock.swmod), which the
+    // direct route in variant 1 requires.  Same idiom as
+    // Mailbox::recovery_recv_txn(), which takes the lock for the same reason.
+    let mut mbox = unsafe { MboxCsr::new() };
+    while mbox.regs().lock().read().lock() {}
+    cprintln!("[wp10.0] mailbox lock acquired (uc_has_lock set)");
+
+    dma.write_dword(res + BENCH_SANITY_OFF, mcycle_sanity());
+
+    for (si, &words) in BENCH_SIZES_WORDS.iter().enumerate() {
+        let want = checksum(words, pattern);
+        for variant in 0..BENCH_NUM_VARIANTS {
+            mbox_scrub(words);
+            let cycles = match variant {
+                0 => bench_direct(dma, src, words),
+                1 => bench_fifo_perword(dma, src, words),
+                _ => bench_fifo_hoisted(dma, src, words),
+            };
+            let ok = (mbox_checksum(words) == want) as u32;
+            let slot = (si * BENCH_NUM_VARIANTS + variant) as u32;
+            let slot_at = BENCH_SLOTS_OFF + slot * BENCH_SLOT_STRIDE;
+            dma.write_dword(res + slot_at, cycles);
+            dma.write_dword(res + slot_at + 4u32, ok);
+            cprintln!(
+                "[wp10.0] size[{}] v{} cycles={} ok={}",
+                si,
+                variant + 1,
+                cycles,
+                ok
+            );
+        }
+    }
+
+    // Done marker last, so a partially written block is never mistaken for one.
+    dma.write_dword(res, BENCH_MAGIC);
+
+    // Release the lock we took above.  Nothing here needs it afterwards -- the
+    // ROM only spins from now on -- but leaving the mailbox locked would make
+    // this ROM unusable as a starting point for anything that does.
+    mbox.regs_mut().unlock().write(|w| w.unlock(true));
+}
+
 #[no_mangle]
 pub extern "C" fn rom_entry() -> ! {
     cprintln!("[dma_dram] DMA smoke test starting");
@@ -182,6 +368,13 @@ pub extern "C" fn rom_entry() -> ! {
     if run_dma_checks(&dma) {
         dma.write_dword(AxiAddr::from(DRAM_BASE + STATUS_OFFSET + 4), STATUS_PASSED);
         cprintln!("[dma_dram] all checks passed");
+
+        // WP10.0: the go/no-go measurement for WP10.  Runs after the smoke test
+        // so a benchmark failure can never be confused with a broken DMA, and
+        // only when it passed: the benchmark waits on DMA completion and on the
+        // mailbox lock without a bound, so against a DMA already shown to be
+        // broken it would hang here instead of letting the SoC read its verdict.
+        run_transport_bench(&dma);
     } else {
         cprintln!("[dma_dram] FAILED");
     }
