@@ -36,6 +36,11 @@ impl Packet {
         // Get reference to raw mailbox contents
         let raw_data = mbox.raw_mailbox_contents();
 
+        #[cfg(feature = "fhe")]
+        if dlen > raw_data.len() {
+            return Err(CaliptraError::RUNTIME_MAILBOX_INVALID_PARAMS);
+        }
+
         // Create the packet with raw pointers to the mailbox data
         let packet = Packet {
             cmd: cmd.into(),
@@ -75,8 +80,9 @@ impl Packet {
     pub fn payload(&self) -> &[u8] {
         unsafe {
             // Safety: This is safe because:
-            // 1. None of the mailbox request handlers use the mailbox in a way that
-            //    modifies the mailbox sram content before sending back a reply.
+            // The command owns mailbox SRAM. Callers must end these borrows
+            // and consume/drop Packet before mutating SRAM (the FHE raw branch
+            // copies its metadata and does this explicitly).
             core::slice::from_raw_parts(self.payload_ptr, self.payload_len)
         }
     }

@@ -893,6 +893,7 @@ dependencies = [
  "caliptra-drivers",
  "caliptra-emu-bus",
  "caliptra-error",
+ "caliptra-fhe-core",
  "caliptra-gen-linker-scripts",
  "caliptra-hw-model",
  "caliptra-image-crypto",

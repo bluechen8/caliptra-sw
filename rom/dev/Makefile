@@ -32,11 +32,21 @@ endif
 MINIMAL_DEMO ?= 0
 MINIMAL_DEMO_FEATURE = $(if $(filter 1,$(MINIMAL_DEMO)),minimal-demo,)
 
-# Set to 1 to compile the runtime FHE (CKKS) mailbox service (Track B). Gated so
-# existing runtime builds are unchanged when off. Enables the `fhe` cargo feature
-# on caliptra-runtime (build-rt below).
+# Set to 1 to compile software-client support. Raw commands require FHE_DEBUG.
+# Existing runtime builds are unchanged when off. Production FHE commands
+# are still pending; FHE_DEBUG selects the raw test commands.
 FHE ?= 0
-FHE_FEATURE = $(if $(filter 1,$(FHE)),fhe,)
+FHE_DEBUG ?= 0
+FHE_PARAMS ?= ps
+FHE_FEATURE = $(if $(filter 1,$(FHE_DEBUG)),fhe-debug,$(if $(filter 1,$(FHE)),fhe,))
+ifneq ($(filter 1,$(FHE) $(FHE_DEBUG)),)
+ifeq ($(filter $(FHE_PARAMS),ps pl pleq),)
+$(error FHE_PARAMS must be ps, pl or pleq)
+endif
+ifneq ($(FHE_PARAMS),ps)
+FHE_FEATURE := $(FHE_FEATURE),fhe-$(FHE_PARAMS)
+endif
+endif
 
 comma := ,
 

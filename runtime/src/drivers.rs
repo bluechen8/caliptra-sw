@@ -148,6 +148,8 @@ pub struct Drivers {
 
     pub dmtf_device_info: Option<ArrayVec<u8, { AddSubjectAltNameReq::MAX_DEVICE_INFO_LEN }>>,
     pub dma: Dma,
+    #[cfg(feature = "fhe-debug")]
+    pub fhe: crate::fhe_client::State,
 
     pub cryptographic_mailbox: CmStorage,
     pub aes: Aes,
@@ -195,6 +197,8 @@ impl Drivers {
             is_shutdown: false,
             dmtf_device_info: None,
             dma: Dma::default(),
+            #[cfg(feature = "fhe-debug")]
+            fhe: crate::fhe_client::State::new(),
             cryptographic_mailbox: CmStorage::new(),
             debug_unlock: ProductionDebugUnlock::new(),
             aes,

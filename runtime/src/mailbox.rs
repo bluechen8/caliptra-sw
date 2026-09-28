@@ -158,6 +158,35 @@ impl Mailbox {
         Ok(())
     }
 
+    /// Stream a response whose payload is staged immediately after `header` in
+    /// mailbox SRAM. Read each source word before DATAIN writes that same word.
+    /// No Rust reference to SRAM is retained while DATAIN mutates the storage.
+    #[cfg(feature = "fhe-debug")]
+    pub fn write_response_from_mailbox(
+        &mut self,
+        header: &[u8],
+        payload_len: usize,
+    ) -> CaliptraResult<()> {
+        let total = header
+            .len()
+            .checked_add(payload_len)
+            .ok_or(CaliptraError::RUNTIME_MAILBOX_INVALID_PARAMS)?;
+        if total > memory_layout::MBOX_SIZE as usize || (header.len() | payload_len) & 3 != 0 {
+            return Err(CaliptraError::RUNTIME_MAILBOX_INVALID_PARAMS);
+        }
+        self.set_dlen(total as u32)?;
+        self.copy_bytes_to_mbox(header)?;
+        for offset in (header.len()..total).step_by(4) {
+            // SAFETY: validated aligned mailbox offset, exclusive command
+            // ownership. Packet and compute-scratch borrows have ended.
+            let word = unsafe {
+                core::ptr::read_volatile((memory_layout::MBOX_ORG as usize + offset) as *const u32)
+            };
+            self.mbox.regs_mut().datain().write(|_| word);
+        }
+        Ok(())
+    }
+
     /// Set mailbox status to `status`
     pub fn set_status(&mut self, status: MboxStatusE) {
         let mbox = self.mbox.regs_mut();

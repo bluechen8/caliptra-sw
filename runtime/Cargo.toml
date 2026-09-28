@@ -7,6 +7,7 @@ edition = "2021"
 build = "build.rs"
 
 [dependencies]
+caliptra-fhe-core = { path = "../fhe-core", optional = true }
 bitfield.workspace = true
 caliptra-cfi-lib-git = { workspace = true, default-features = false, features = [
     "cfi",
@@ -89,7 +90,10 @@ std = ["ufmt/std", "caliptra_common/std"]
 slow_tests = []
 verilator = ["caliptra-hw-model/verilator"]
 fips_self_test = []
-fhe = []
+fhe = ["dep:caliptra-fhe-core"]
+fhe-debug = ["fhe"]
+fhe-pl = ["fhe"]
+fhe-pleq = ["fhe"]
 no-cfi = [
     "caliptra-image-verify/no-cfi",
     "caliptra-drivers/no-cfi",

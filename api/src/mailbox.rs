@@ -180,9 +180,12 @@ impl CommandId {
     pub const CM_DERIVE_STABLE_KEY: Self = Self(0x494D_4453); // "CMDS"
     pub const REALLOCATE_DPE_CONTEXT_LIMITS: Self = Self(0x5243_5458); // "RCTX"
 
-    // FHE (CKKS) accelerator commands. Handled by the runtime `fhe` feature; the
-    // handler drives the internal-AHB FHE block at 0x1005_0000.
+    // Software-client IDs. Raw commands require runtime fhe-debug.
+    // FHEN/FHDE and their legacy accelerator structs remain for source compatibility
+    // only; this runtime does not dispatch them.
     pub const FHE_KEYGEN: Self = Self(0x4648_4B47); // "FHKG"
+    pub const FHE_ENCRYPT_RAW: Self = Self(0x4648_4552); // "FHER"
+    pub const FHE_DECRYPT_RAW: Self = Self(0x4648_4452); // "FHDR"
     pub const FHE_ENCRYPT: Self = Self(0x4648_454E); // "FHEN"
     pub const FHE_DECRYPT: Self = Self(0x4648_4445); // "FHDE"
 }
@@ -1246,6 +1249,82 @@ pub struct StashMeasurementResp {
 }
 impl Response for StashMeasurementResp {}
 
+/// Debug keygen ABI: version 1; param_set 0=P-S, 1=P-L, 2=P-L-eq.
+/// The parameter must match the firmware build.
+/// session_id and seq must be zero. Returns a new nonzero session_id.
+/// seed_mode 0 uses TRNG and requires zero seed; 1 uses the supplied vector seed.
+/// Only dispatched with fhe-debug; WP4 production keygen/session ABI is pending.
+#[repr(C)]
+#[derive(Debug, Default, IntoBytes, FromBytes, Immutable, KnownLayout, PartialEq, Eq)]
+pub struct FheSwKeygenReq {
+    pub hdr: MailboxReqHeader,
+    pub version: u32,
+    pub param_set: u32,
+    pub session_id: u32,
+    pub seq: u32,
+    pub seed_mode: u32,
+    pub seed: [u8; 32],
+}
+
+impl Request for FheSwKeygenReq {
+    const ID: CommandId = CommandId::FHE_KEYGEN;
+    type Resp = FheSwResp;
+}
+
+/// Raw decrypt: mode 0 appends exactly 2*L*N*4 ciphertext bytes and requires
+/// zero pointers; mode 1 supplies input/output pointers and no inline payload.
+/// input_len must be 2*L*N*4. Output is L*N*4 coefficient-domain RNS bytes.
+/// P-L-eq supports pointer mode only (request/response headers need mailbox space).
+/// seq starts at 1 and advances after validation, including failed execution.
+/// Caller owns external buffers until successful completion; after DMA failure
+/// output may be partial and cannot be reclaimed until reset/quiescence.
+#[repr(C)]
+#[derive(Debug, Default, IntoBytes, FromBytes, Immutable, KnownLayout, PartialEq, Eq)]
+pub struct FheRawDecryptReq {
+    pub hdr: MailboxReqHeader,
+    pub version: u32,
+    pub param_set: u32,
+    pub session_id: u32,
+    pub seq: u32,
+    pub mode: u32,
+    pub src_lo: u32,
+    pub src_hi: u32,
+    pub dst_lo: u32,
+    pub dst_hi: u32,
+    pub input_len: u32,
+}
+
+/// Raw encryption uses the same transport/session header as decryption, with
+/// input_len=L*N*4 and output_len=2*L*N*4. All seed controls are debug-only:
+/// seed_mode 0 requires a zero seed and reseeds from TRNG for each command;
+/// seed_mode 1 uses this vector seed, consumes the ternary-keygen prefix of the WP0
+/// PRG stream into discarded scratch, then samples e once and a per limb.
+/// Vector mode does not replace the resident key. Never enable fhe-debug for
+/// protected-session deployments.
+#[repr(C)]
+#[derive(Debug, Default, IntoBytes, FromBytes, Immutable, KnownLayout, PartialEq, Eq)]
+pub struct FheRawEncryptReq {
+    pub common: FheRawDecryptReq,
+    pub seed_mode: u32,
+    pub seed: [u8; 32],
+}
+
+/// Followed by output_len bytes only in mailbox mode. cycles excludes common
+/// response checksum/DATAIN streaming. status is zero on success; errors use
+/// the standard mailbox failure path and publish no valid output.
+#[repr(C)]
+#[derive(Debug, Default, IntoBytes, FromBytes, Immutable, KnownLayout, PartialEq, Eq)]
+pub struct FheSwResp {
+    pub hdr: MailboxRespHeader,
+    pub status: u32,
+    pub session_id: u32,
+    pub cycles_lo: u32,
+    pub cycles_hi: u32,
+    pub output_len: u32,
+}
+impl Response for FheSwResp {}
+
+// Legacy accelerator ABI, NOT dispatched by the software-client runtime.
 // FHE_KEYGEN
 // Materializes the resident CKKS secret key. `kg_seed_{lo,hi}` is the plaintext
 // keygen root seed (used when `kv_en == 0`); when `kv_en != 0` the keygen seed

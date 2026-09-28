@@ -25,8 +25,12 @@ mod dpe_crypto;
 mod dpe_platform;
 mod drivers;
 mod fe_programming;
+#[cfg(feature = "fhe-debug")]
+#[path = "fhe/client.rs"]
+mod fhe_client;
 #[cfg(feature = "fhe")]
-mod fhe;
+#[path = "fhe/transport.rs"]
+mod fhe_transport;
 pub mod fips;
 mod firmware_verify;
 mod get_fmc_alias_csr;
@@ -240,6 +244,18 @@ fn handle_command(drivers: &mut Drivers) -> CaliptraResult<MboxStatusE> {
             req_packet.cmd,
             req_packet.payload().len()
         );
+    }
+
+    #[cfg(feature = "fhe-debug")]
+    if matches!(
+        CommandId::from(req_packet.cmd),
+        CommandId::FHE_ENCRYPT_RAW | CommandId::FHE_DECRYPT_RAW
+    ) {
+        // Parse into owned metadata before lending SRAM mutably to kernels.
+        // No Packet or payload reference survives this branch's call.
+        let request = fhe_client::RawRequest::parse(req_packet.cmd, cmd_bytes)?;
+        drop(req_packet);
+        return fhe_client::raw(drivers, request);
     }
 
     // stage the response once on the stack
@@ -472,12 +488,8 @@ fn handle_command(drivers: &mut Drivers) -> CaliptraResult<MboxStatusE> {
             cmd_bytes,
         ),
         CommandId::FE_PROG => FeProgrammingCmd::execute(drivers, cmd_bytes),
-        #[cfg(feature = "fhe")]
-        CommandId::FHE_KEYGEN => fhe::FheCmd::keygen(drivers, cmd_bytes, resp),
-        #[cfg(feature = "fhe")]
-        CommandId::FHE_ENCRYPT => fhe::FheCmd::encrypt(drivers, cmd_bytes, resp),
-        #[cfg(feature = "fhe")]
-        CommandId::FHE_DECRYPT => fhe::FheCmd::decrypt(drivers, cmd_bytes, resp),
+        #[cfg(feature = "fhe-debug")]
+        CommandId::FHE_KEYGEN => fhe_client::keygen(drivers, cmd_bytes, resp),
         CommandId::REALLOCATE_DPE_CONTEXT_LIMITS => {
             ReallocateDpeContextLimitsCmd::execute(drivers, cmd_bytes, resp)
         }
@@ -494,9 +506,19 @@ fn handle_command(drivers: &mut Drivers) -> CaliptraResult<MboxStatusE> {
     // Generate response checksum
     populate_checksum(resp);
     // Send the payload
-    mbox.write_response(resp)?;
-    // zero the original resp buffer so as not to leak sensitive data
-    resp.fill(0);
+    #[cfg(feature = "fhe")]
+    {
+        let write_result = mbox.write_response(resp);
+        // Scrub even when DATAIN response handling fails.
+        zeroize::Zeroize::zeroize(resp);
+        write_result?;
+    }
+    #[cfg(not(feature = "fhe"))]
+    {
+        // Preserve the baseline response path when FHE is disabled.
+        mbox.write_response(resp)?;
+        resp.fill(0);
+    }
     Ok(MboxStatusE::DataReady)
 }
 
