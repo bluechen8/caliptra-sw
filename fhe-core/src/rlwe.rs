@@ -107,6 +107,36 @@ pub fn encrypt_limb(
     Ok(())
 }
 
+/// Encrypt in place: `c0` initially contains reduced coefficient-domain plaintext;
+/// `c1` contains the sampled uniform NTT mask and is unchanged. Disjoint buffers
+/// let the runtime retain one protected input snapshot and stream each result.
+pub fn encrypt_limb_in_place(
+    c0: &mut [u32],
+    e: &[i8],
+    c1: &[u32],
+    s_ntt: &[u32],
+    p: &PrimeParams,
+    tw_fwd: &[u32],
+) -> Result<()> {
+    let n = c0.len();
+    if e.len() != n || c1.len() != n || s_ntt.len() != n {
+        return Err(Error::BadLength);
+    }
+    if c0.iter().any(|&v| v >= p.q) || c1.iter().any(|&v| v >= p.q) {
+        return Err(Error::NotReduced);
+    }
+    for (word, &error) in c0.iter_mut().zip(e) {
+        *word = add_mod(*word, crate::arith::from_i32(error as i32, p.q), p.q);
+    }
+    ntt(c0, tw_fwd, p)?;
+    for i in 0..n {
+        let am = mont_mul(c1[i], p.r2, p.q, p.q_inv_neg);
+        let prod = mont_mul(am, s_ntt[i], p.q, p.q_inv_neg);
+        c0[i] = sub_mod(c0[i], prod, p.q);
+    }
+    Ok(())
+}
+
 /// Decrypt one RNS limb: `out = INTT(c0 + c1 . NTT(s))`.
 ///
 /// `out` may alias neither `c0` nor `c1`; the caller must zeroize `out` and

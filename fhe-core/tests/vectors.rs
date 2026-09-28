@@ -180,6 +180,10 @@ fn encrypt_matches() {
             .unwrap();
             let o0 = format::c0_limb_off(ps, li);
             let o1 = format::c1_limb_off(ps, li);
+            let mut inplace = pt[li * ps.n..(li + 1) * ps.n].to_vec();
+            caliptra_fhe_core::rlwe::encrypt_limb_in_place(&mut inplace, &e, &c1, &s_ntt, p, &f)
+                .unwrap();
+            assert_eq!(&inplace, &want[o0..o0 + ps.n], "{set}: in-place limb {li}");
             got[o0..o0 + ps.n].copy_from_slice(&c0);
             got[o1..o1 + ps.n].copy_from_slice(&c1);
         }
