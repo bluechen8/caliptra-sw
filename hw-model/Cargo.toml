@@ -60,3 +60,9 @@ nix.workspace = true
 name = "fpga_realtime_mbox_pauser"
 path = "src/bin/fpga_realtime_mbox_pauser.rs"
 required-features = ["fpga_realtime"]
+
+# Exercise the real runtime command path using the model's existing dependencies.
+# Keeping this target here avoids the unrelated runtime crypto-test dependency set.
+[[test]]
+name = "fhe_commands"
+path = "../runtime/tests/fhe_commands.rs"

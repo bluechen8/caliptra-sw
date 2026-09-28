@@ -122,6 +122,44 @@ impl ModelEmulated {
     }
 }
 
+impl ModelEmulated {
+    /// Paint only unused runtime stack below the paused CPU's current SP.
+    /// Call after ready_for_runtime. This is a software-model measurement aid.
+    pub fn paint_runtime_stack_canary(&mut self) {
+        use caliptra_common::memory_layout::{DCCM_ORG, STACK_ORG, STACK_SIZE};
+        use caliptra_emu_cpu::xreg_file::XReg;
+        let sp = self.cpu.read_xreg(XReg::X2).unwrap();
+        assert!((STACK_ORG..=STACK_ORG + STACK_SIZE).contains(&sp));
+        self.cpu.bus.bus.dccm.data_mut()[(STACK_ORG - DCCM_ORG) as usize..(sp - DCCM_ORG) as usize]
+            .fill(0xa5);
+    }
+
+    /// Total stack extent through the lowest overwritten canary, including
+    /// frames resident when painted. Bounds untouched below that point remain
+    /// canaries; this is observed usage, not a worst-case proof.
+    pub fn runtime_stack_canary_used(&self) -> usize {
+        use caliptra_common::memory_layout::{DCCM_ORG, STACK_ORG, STACK_SIZE};
+        let stack = &self.cpu.bus.bus.dccm.data()
+            [(STACK_ORG - DCCM_ORG) as usize..(STACK_ORG + STACK_SIZE - DCCM_ORG) as usize];
+        let first = stack.iter().position(|&b| b != 0xa5).unwrap_or(stack.len());
+        stack.len() - first
+    }
+
+    /// Host-side access to the standalone model's SoC DRAM window at
+    /// 0x8000_0000. None in subsystem mode, where an external MCU owns it.
+    /// This does not access Caliptra mailbox SRAM or change mailbox ownership.
+    pub fn soc_dram_mut(&mut self) -> Option<&mut [u8]> {
+        self.cpu
+            .bus
+            .bus
+            .dma
+            .axi
+            .dram
+            .as_mut()
+            .map(|ram| ram.data_mut())
+    }
+}
+
 fn hash_slice(slice: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     std::hash::Hash::hash_slice(slice, &mut hasher);

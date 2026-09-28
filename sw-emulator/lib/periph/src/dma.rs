@@ -145,7 +145,17 @@ pub struct Dma {
     #[register(offset = 0x0000_0030, read_fn = on_read_data)]
     read_data: ReadOnlyRegister<u32>,
 
-    // TODO interrupt block
+    // Sticky DMA errors consumed by the runtime FIFO transport. Other
+    // interrupt registers remain unmodeled.
+    #[register(offset = 0x0000_0814, write_fn = on_write_error_intr)]
+    error_intr: ReadWriteRegister<u32>,
+
+    // Bytes moved by a synchronous FIFO-route transfer across timer polls.
+    fifo_offset: usize,
+    // Event-routed reads also drain through the bounded FIFO.
+    pending_fifo_data: Option<Vec<u32>>,
+
+    // TODO remaining interrupt block
     /// Timer
     timer: Timer,
 
@@ -192,7 +202,7 @@ struct WriteXfer {
 impl Dma {
     const NAME: u32 = 0x6776_8068; // CLPD
 
-    const FIFO_SIZE: usize = 0x400;
+    const FIFO_SIZE: usize = 128; // 512 bytes, depth is measured in DWORDs
 
     // [TODO][CAP2] DMA transactions need to be a multiple of this
     const AXI_DATA_WIDTH: usize = 4;
@@ -213,7 +223,7 @@ impl Dma {
     ) -> Self {
         Self {
             name: ReadOnlyRegister::new(Self::NAME),
-            capabilities: ReadOnlyRegister::new(Self::FIFO_SIZE as u32 - 1), // MAX FIFO DEPTH
+            capabilities: ReadOnlyRegister::new(Self::FIFO_SIZE as u32), // MAX FIFO DEPTH
             control: ReadWriteRegister::new(0),
             status0: ReadOnlyRegister::new(0),
             status1: ReadOnlyRegister::new(0),
@@ -225,6 +235,9 @@ impl Dma {
             block_size: ReadWriteRegister::new(0),
             write_data: WriteOnlyRegister::new(0),
             read_data: ReadOnlyRegister::new(0),
+            error_intr: ReadWriteRegister::new(0),
+            fifo_offset: 0,
+            pending_fifo_data: None,
             timer: Timer::new(clock),
             op_complete_action: None,
             op_payload_available_action: None,
@@ -242,6 +255,27 @@ impl Dma {
             pending_axi_to_mailbox: false,
             use_mcu_recovery_interface,
         }
+    }
+
+    fn on_write_error_intr(&mut self, size: RvSize, val: RvData) -> Result<(), BusError> {
+        if size != RvSize::Word {
+            return Err(BusError::StoreAccessFault);
+        }
+        self.error_intr.reg.set(self.error_intr.reg.get() & !val);
+        Ok(())
+    }
+
+    fn fifo_error(&mut self, bit: u32) {
+        self.error_intr
+            .reg
+            .set(self.error_intr.reg.get() | (1 << bit));
+        self.status0
+            .reg
+            .write(Status0::ERROR::SET + Status0::DMA_FSM_PRESENT_STATE::ERROR);
+    }
+
+    fn retry_fifo(&mut self) {
+        self.op_complete_action = Some(self.timer.schedule_poll_in(Self::DMA_CYCLES_MIN));
     }
 
     pub fn on_write_control(&mut self, size: RvSize, val: RvData) -> Result<(), BusError> {
@@ -267,6 +301,7 @@ impl Dma {
                 todo!();
             }
 
+            self.fifo_offset = 0;
             self.op_complete_action = Some(
                 self.timer.schedule_poll_in(
                     (Self::DMA_CYCLES_PER_WORD * self.byte_count.reg.get() as u64 / 4)
@@ -294,7 +329,7 @@ impl Dma {
         let status0 = ReadWriteRegister::new(self.status0.reg.get());
         status0
             .reg
-            .modify(Status0::FIFO_DEPTH.val(self.fifo.len() as u32 * 4));
+            .modify(Status0::FIFO_DEPTH.val(self.fifo.len() as u32));
 
         if self.use_mcu_recovery_interface {
             self.axi.send_get_recovery_indirect_fifo_status();
@@ -311,7 +346,11 @@ impl Dma {
     pub fn on_write_data(&mut self, size: RvSize, val: RvData) -> Result<(), BusError> {
         match size {
             RvSize::Word => {
-                self.fifo.push_back(val);
+                if self.fifo.len() == Self::FIFO_SIZE {
+                    self.fifo_error(5);
+                } else {
+                    self.fifo.push_back(val);
+                }
                 Ok(())
             }
             _ => Err(BusError::StoreAccessFault),
@@ -320,8 +359,13 @@ impl Dma {
 
     pub fn on_read_data(&mut self, size: RvSize) -> Result<RvData, BusError> {
         match size {
-            // TODO write status in interrupt if empty
-            RvSize::Word => Ok(self.fifo.pop_front().unwrap_or(0)),
+            RvSize::Word => match self.fifo.pop_front() {
+                Some(word) => Ok(word),
+                None => {
+                    self.fifo_error(6);
+                    Ok(0)
+                }
+            },
             _ => Err(BusError::LoadAccessFault),
         }
     }
@@ -373,6 +417,10 @@ impl Dma {
 
     // Returns true if this completed immediately.
     fn axi_to_fifo(&mut self) -> bool {
+        if self.pending_fifo_data.is_some() {
+            return self.drain_pending_fifo_data();
+        }
+
         let xfer = self.read_xfer();
 
         // check if we have to do the read async
@@ -383,20 +431,43 @@ impl Dma {
             return false;
         }
 
-        let block = self.read_axi_block(xfer);
-        self.write_fifo_block(&block);
-        true
+        // Backpressure on the finite FIFO; the CPU drains it between polls.
+        while self.fifo_offset < xfer.len && self.fifo.len() < Self::FIFO_SIZE {
+            let addr = xfer.src
+                + if xfer.fixed {
+                    0
+                } else {
+                    self.fifo_offset as AxiAddr
+                };
+            match self.axi.read(Self::AXI_DATA_WIDTH.into(), addr) {
+                Ok(word) => self.fifo.push_back(word),
+                Err(_) => {
+                    self.fifo_error(1);
+                    return false;
+                }
+            }
+            self.fifo_offset += Self::AXI_DATA_WIDTH;
+        }
+        if self.fifo_offset == xfer.len {
+            true
+        } else {
+            self.retry_fifo();
+            false
+        }
     }
 
-    fn write_fifo_block(&mut self, block: &[u32]) {
-        for i in (0..block.len() * 4).step_by(Self::AXI_DATA_WIDTH) {
-            let cur_fifo_depth = self.status0.reg.read(Status0::FIFO_DEPTH);
-            if cur_fifo_depth >= Self::FIFO_SIZE as u32 {
-                self.status0.reg.write(Status0::ERROR::SET);
-                // TODO set interrupt bits
-                return;
-            }
-            self.fifo.push_back(block[i / 4]);
+    fn drain_pending_fifo_data(&mut self) -> bool {
+        let block = self.pending_fifo_data.as_ref().unwrap();
+        while self.fifo_offset / 4 < block.len() && self.fifo.len() < Self::FIFO_SIZE {
+            self.fifo.push_back(block[self.fifo_offset / 4]);
+            self.fifo_offset += 4;
+        }
+        if self.fifo_offset / 4 == block.len() {
+            self.pending_fifo_data = None;
+            true
+        } else {
+            self.retry_fifo();
+            false
         }
     }
 
@@ -459,19 +530,25 @@ impl Dma {
     // Returns true if this completed immediately.
     fn fifo_to_axi(&mut self) -> bool {
         let xfer = self.write_xfer();
-        for i in (0..xfer.len).step_by(Self::AXI_DATA_WIDTH) {
+        while self.fifo_offset < xfer.len {
+            let i = self.fifo_offset;
             let addr = xfer.dest + if xfer.fixed { 0 } else { i as AxiAddr };
             let data = match self.fifo.pop_front() {
                 Some(b) => b,
                 None => {
-                    self.status0.reg.write(Status0::ERROR::SET);
-                    // TODO set interrupt bits
-                    return true;
+                    self.retry_fifo();
+                    return false;
                 }
             };
-            self.axi
+            if self
+                .axi
                 .write(Self::AXI_DATA_WIDTH.into(), addr, data)
-                .unwrap();
+                .is_err()
+            {
+                self.fifo_error(2);
+                return false;
+            }
+            self.fifo_offset += Self::AXI_DATA_WIDTH;
 
             if !self.use_mcu_recovery_interface {
                 // Check if FW is indicating that it is ready to receive the recovery image.
@@ -534,9 +611,11 @@ impl Dma {
                 self.write_axi_block(&dma_data, write_xfer);
                 self.set_status_complete();
             } else if self.pending_axi_to_fifo {
-                self.write_fifo_block(&dma_data);
-                self.set_status_complete();
                 self.pending_axi_to_fifo = false;
+                self.pending_fifo_data = Some(dma_data);
+                if self.drain_pending_fifo_data() {
+                    self.set_status_complete();
+                }
             } else if self.pending_axi_to_mailbox {
                 self.write_mailbox(&dma_data);
                 self.set_status_complete();
@@ -646,8 +725,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_dma_fifo_read_write() {
+    fn dma_model() -> (Rc<Clock>, Dma) {
         let clock = Rc::new(Clock::new());
         let mbox_ram = MailboxRam::new();
         let iccm = Iccm::new(&clock);
@@ -658,7 +736,7 @@ mod tests {
         let mailbox_internal = MailboxInternal::new(&clock, mbox_ram.clone());
         let mci = Mci::new(vec![]);
         let soc_reg = SocRegistersInternal::new(mailbox_internal, iccm, mci.clone(), args);
-        let mut dma = Dma::new(
+        let dma = Dma::new(
             &clock,
             mbox_ram.clone(),
             soc_reg,
@@ -668,6 +746,12 @@ mod tests {
             false,
         );
 
+        (clock, dma)
+    }
+
+    #[test]
+    fn test_dma_fifo_read_write() {
+        let (clock, mut dma) = dma_model();
         assert_eq!(
             dma_read_u32(&mut dma, &clock.clone(), AXI_TEST_OFFSET),
             0xaabbccdd
@@ -678,5 +762,44 @@ mod tests {
             dma_read_u32(&mut dma, &clock.clone(), AXI_TEST_OFFSET),
             test_value
         );
+    }
+
+    #[test]
+    fn fifo_capacity_depth_and_sticky_errors() {
+        let (_clock, mut dma) = dma_model();
+        assert_eq!(dma.read(RvSize::Word, 4).unwrap(), 128);
+        for i in 0..128 {
+            dma.on_write_data(RvSize::Word, i).unwrap();
+        }
+        let status = dma.read(RvSize::Word, STATUS0_OFFSET).unwrap();
+        assert_eq!((status >> 4) & 0xfff, 128);
+        dma.on_write_data(RvSize::Word, 999).unwrap();
+        assert_eq!(dma.read(RvSize::Word, 0x814).unwrap(), 1 << 5);
+        for i in 0..128 {
+            assert_eq!(dma.on_read_data(RvSize::Word).unwrap(), i);
+        }
+        dma.on_read_data(RvSize::Word).unwrap();
+        assert_eq!(dma.read(RvSize::Word, 0x814).unwrap(), (1 << 5) | (1 << 6));
+        dma.write(RvSize::Word, 0x814, 1 << 5).unwrap();
+        assert_eq!(dma.read(RvSize::Word, 0x814).unwrap(), 1 << 6);
+    }
+
+    #[test]
+    fn event_read_backpressures_without_dropping_tail() {
+        let (_clock, mut dma) = dma_model();
+        dma.pending_fifo_data = Some((0..257).collect());
+        assert!(!dma.drain_pending_fifo_data());
+        assert_eq!(dma.fifo.len(), 128);
+        for i in 0..128 {
+            assert_eq!(dma.on_read_data(RvSize::Word).unwrap(), i);
+        }
+        assert!(!dma.drain_pending_fifo_data());
+        for i in 128..256 {
+            assert_eq!(dma.on_read_data(RvSize::Word).unwrap(), i);
+        }
+        assert!(dma.drain_pending_fifo_data());
+        assert_eq!(dma.on_read_data(RvSize::Word).unwrap(), 256);
+        assert!(dma.pending_fifo_data.is_none());
+        assert_eq!(dma.read(RvSize::Word, 0x814).unwrap(), 0);
     }
 }

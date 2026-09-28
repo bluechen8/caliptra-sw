@@ -106,6 +106,12 @@ pub const FMC_WITH_UART: FwId = FwId {
     features: &["emu"],
 };
 
+pub const FMC_WITH_UART_NO_MLDSA: FwId = FwId {
+    crate_name: "caliptra-fmc",
+    bin_name: "caliptra-fmc",
+    features: &["emu", "no-mldsa"],
+};
+
 pub const FMC_FAKE_WITH_UART: FwId = FwId {
     crate_name: "caliptra-fmc",
     bin_name: "caliptra-fmc",
@@ -129,6 +135,25 @@ pub const APP_WITH_UART: FwId = FwId {
     crate_name: "caliptra-runtime",
     bin_name: "caliptra-runtime",
     features: &["emu", "fips_self_test"],
+};
+
+pub const APP_FHE_DEBUG: FwId = FwId {
+    crate_name: "caliptra-runtime",
+    bin_name: "caliptra-runtime",
+    features: &["emu", "no-mldsa", "fhe-debug"],
+};
+pub const APP_FHE_DEBUG_PL: FwId = FwId {
+    features: &["emu", "no-mldsa", "fhe-debug", "fhe-pl"],
+    ..APP_FHE_DEBUG
+};
+pub const APP_FHE_DEBUG_PLEQ: FwId = FwId {
+    features: &["emu", "no-mldsa", "fhe-debug", "fhe-pleq"],
+    ..APP_FHE_DEBUG
+};
+pub const APP_FHE: FwId = FwId {
+    crate_name: "caliptra-runtime",
+    bin_name: "caliptra-runtime",
+    features: &["emu", "no-mldsa", "fhe"],
 };
 
 pub const APP_WITH_UART_FIPS_TEST_HOOKS: FwId = FwId {
@@ -535,10 +560,15 @@ pub const REGISTERED_FW: &[&FwId] = &[
     &ROM_WITH_FIPS_TEST_HOOKS_FPGA,
     &ROM_FPGA_WITH_UART,
     &FMC_WITH_UART,
+    &FMC_WITH_UART_NO_MLDSA,
     &FMC_FAKE_WITH_UART,
     &FMC_FPGA_WITH_UART,
     &APP,
     &APP_WITH_UART,
+    &APP_FHE_DEBUG,
+    &APP_FHE_DEBUG_PL,
+    &APP_FHE_DEBUG_PLEQ,
+    &APP_FHE,
     &APP_WITH_UART_FIPS_TEST_HOOKS,
     &APP_WITH_UART_FPGA,
     &APP_ZEROS,
