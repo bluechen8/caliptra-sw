@@ -33,19 +33,38 @@ MINIMAL_DEMO ?= 0
 MINIMAL_DEMO_FEATURE = $(if $(filter 1,$(MINIMAL_DEMO)),minimal-demo,)
 
 # Set to 1 to compile software-client support. Raw commands require FHE_DEBUG.
-# Existing runtime builds are unchanged when off. Production FHE commands
-# are still pending; FHE_DEBUG selects the raw test commands.
+# Existing runtime builds are unchanged when off. FHE_PSK explicitly selects
+# the protected P-S demo; FHE_DEBUG selects the separate raw test commands.
 FHE ?= 0
 FHE_DEBUG ?= 0
+FHE_PSK ?= 0
+# Optional clear-reference model/command for FHE comparisons.
+ML_CLEAR ?= 0
 FHE_PARAMS ?= ps
 FHE_FEATURE = $(if $(filter 1,$(FHE_DEBUG)),fhe-debug,$(if $(filter 1,$(FHE)),fhe,))
-ifneq ($(filter 1,$(FHE) $(FHE_DEBUG)),)
+ifeq ($(FHE_PSK),1)
+ifeq ($(FHE_DEBUG),1)
+$(error FHE_PSK and FHE_DEBUG are mutually exclusive)
+endif
+ifneq ($(FHE_PARAMS),ps)
+$(error FHE_PSK currently supports FHE_PARAMS=ps only)
+endif
+FHE_FEATURE := fhe-psk
+endif
+ifneq ($(filter 1,$(FHE) $(FHE_DEBUG) $(FHE_PSK)),)
 ifeq ($(filter $(FHE_PARAMS),ps pl pleq),)
 $(error FHE_PARAMS must be ps, pl or pleq)
 endif
 ifneq ($(FHE_PARAMS),ps)
 FHE_FEATURE := $(FHE_FEATURE),fhe-$(FHE_PARAMS)
 endif
+endif
+
+ifeq ($(ML_CLEAR),1)
+ifneq ($(FHE_PSK),1)
+$(error ML_CLEAR requires FHE_PSK=1)
+endif
+FHE_FEATURE := $(FHE_FEATURE),ml-clear
 endif
 
 comma := ,

@@ -123,6 +123,27 @@ impl ModelEmulated {
 }
 
 impl ModelEmulated {
+    /// Fail protected-client tests on unsupported direct SRAM byte/halfword writes.
+    pub fn require_mailbox_word_writes(&mut self) {
+        self.cpu.bus.bus.mailbox_sram.require_word_writes();
+    }
+
+    /// Read backing mailbox SRAM for emulator-only ownership/cleanup assertions.
+    /// This is test instrumentation, not an exposed firmware or SoC interface.
+    pub fn mailbox_sram_snapshot(&mut self, offset: usize, len: usize) -> Vec<u8> {
+        assert!(offset.checked_add(len).unwrap() <= 256 * 1024);
+        (offset..offset + len)
+            .map(|i| {
+                self.cpu
+                    .bus
+                    .bus
+                    .mailbox_sram
+                    .read(RvSize::Byte, i as u32)
+                    .unwrap() as u8
+            })
+            .collect()
+    }
+
     /// Paint only unused runtime stack below the paused CPU's current SP.
     /// Call after ready_for_runtime. This is a software-model measurement aid.
     pub fn paint_runtime_stack_canary(&mut self) {

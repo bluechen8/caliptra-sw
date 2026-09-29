@@ -57,16 +57,26 @@ type StatusRegister = LocalRegisterCopy<u32, Status::Register>;
 #[derive(Clone)]
 pub struct MailboxRam {
     ram: Rc<RefCell<AlignedRam>>,
+    word_writes_only: bool,
 }
 
 impl MailboxRam {
     pub fn new() -> Self {
         Self {
+            word_writes_only: false,
             ram: Rc::new(RefCell::new(AlignedRam::new(vec![
                 0u8;
                 MAX_MAILBOX_CAPACITY_BYTES
             ]))),
         }
+    }
+}
+
+impl MailboxRam {
+    /// Test guard for clients using direct SRAM: RTL has no byte write enables.
+    /// Reject narrow writes instead of silently modeling byte-addressable RAM.
+    pub fn require_word_writes(&mut self) {
+        self.word_writes_only = true;
     }
 }
 
@@ -78,6 +88,9 @@ impl Bus for MailboxRam {
 
     /// Write data of specified size to given address
     fn write(&mut self, size: RvSize, addr: RvAddr, val: RvData) -> Result<(), BusError> {
+        if self.word_writes_only && size != RvSize::Word {
+            return Err(BusError::StoreAccessFault);
+        }
         self.ram.borrow_mut().write(size, addr, val)?;
         Ok(())
     }

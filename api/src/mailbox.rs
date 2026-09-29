@@ -183,6 +183,12 @@ impl CommandId {
     // Software-client IDs. Raw commands require runtime fhe-debug.
     // FHEN/FHDE and their legacy accelerator structs remain for source compatibility
     // only; this runtime does not dispatch them.
+    pub const FHE_SESSION_OPEN: Self = Self(0x4648_534f);
+    pub const FHE_SESSION_CLOSE: Self = Self(0x4648_5343);
+    pub const FHE_INGRESS: Self = Self(0x4648_494e);
+    pub const FHE_EGRESS: Self = Self(0x4648_4547);
+    #[cfg(feature = "ml-clear")]
+    pub const ML_INFER_CLEAR: Self = Self(0x4d4c_4943);
     pub const FHE_KEYGEN: Self = Self(0x4648_4B47); // "FHKG"
     pub const FHE_ENCRYPT_RAW: Self = Self(0x4648_4552); // "FHER"
     pub const FHE_DECRYPT_RAW: Self = Self(0x4648_4452); // "FHDR"
@@ -1253,7 +1259,7 @@ impl Response for StashMeasurementResp {}
 /// The parameter must match the firmware build.
 /// session_id and seq must be zero. Returns a new nonzero session_id.
 /// seed_mode 0 uses TRNG and requires zero seed; 1 uses the supplied vector seed.
-/// Only dispatched with fhe-debug; WP4 production keygen/session ABI is pending.
+/// Only dispatched with fhe-debug; protected PSK keygen uses the v3 authenticated envelope.
 #[repr(C)]
 #[derive(Debug, Default, IntoBytes, FromBytes, Immutable, KnownLayout, PartialEq, Eq)]
 pub struct FheSwKeygenReq {

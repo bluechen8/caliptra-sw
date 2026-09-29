@@ -92,6 +92,9 @@ verilator = ["caliptra-hw-model/verilator"]
 fips_self_test = []
 fhe = ["dep:caliptra-fhe-core"]
 fhe-debug = ["fhe"]
+fhe-psk = ["fhe"]
+# Reference classifier for comparing clear and encrypted inference; off by default.
+ml-clear = ["fhe-psk", "caliptra-api/ml-clear"]
 fhe-pl = ["fhe"]
 fhe-pleq = ["fhe"]
 no-cfi = [

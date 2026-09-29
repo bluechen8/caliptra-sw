@@ -150,6 +150,16 @@ pub const APP_FHE_DEBUG_PLEQ: FwId = FwId {
     features: &["emu", "no-mldsa", "fhe-debug", "fhe-pleq"],
     ..APP_FHE_DEBUG
 };
+pub const APP_FHE_PSK: FwId = FwId {
+    features: &["emu", "no-mldsa", "fhe-psk"],
+    ..APP_FHE_DEBUG
+};
+
+pub const APP_FHE_PSK_ML_CLEAR: FwId = FwId {
+    features: &["emu", "no-mldsa", "fhe-psk", "ml-clear"],
+    ..APP_FHE_PSK
+};
+
 pub const APP_FHE: FwId = FwId {
     crate_name: "caliptra-runtime",
     bin_name: "caliptra-runtime",
@@ -569,6 +579,8 @@ pub const REGISTERED_FW: &[&FwId] = &[
     &APP_FHE_DEBUG_PL,
     &APP_FHE_DEBUG_PLEQ,
     &APP_FHE,
+    &APP_FHE_PSK,
+    &APP_FHE_PSK_ML_CLEAR,
     &APP_WITH_UART_FIPS_TEST_HOOKS,
     &APP_WITH_UART_FPGA,
     &APP_ZEROS,

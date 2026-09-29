@@ -150,6 +150,8 @@ pub struct Drivers {
     pub dma: Dma,
     #[cfg(feature = "fhe-debug")]
     pub fhe: crate::fhe_client::State,
+    #[cfg(feature = "fhe-psk")]
+    pub fhe_session: crate::fhe_session::State,
 
     pub cryptographic_mailbox: CmStorage,
     pub aes: Aes,
@@ -199,6 +201,8 @@ impl Drivers {
             dma: Dma::default(),
             #[cfg(feature = "fhe-debug")]
             fhe: crate::fhe_client::State::new(),
+            #[cfg(feature = "fhe-psk")]
+            fhe_session: crate::fhe_session::State::new(),
             cryptographic_mailbox: CmStorage::new(),
             debug_unlock: ProductionDebugUnlock::new(),
             aes,

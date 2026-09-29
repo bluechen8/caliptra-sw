@@ -161,7 +161,7 @@ impl Mailbox {
     /// Stream a response whose payload is staged immediately after `header` in
     /// mailbox SRAM. Read each source word before DATAIN writes that same word.
     /// No Rust reference to SRAM is retained while DATAIN mutates the storage.
-    #[cfg(feature = "fhe-debug")]
+    #[cfg(any(feature = "fhe-debug", feature = "fhe-psk"))]
     pub fn write_response_from_mailbox(
         &mut self,
         header: &[u8],

@@ -28,6 +28,9 @@ mod fe_programming;
 #[cfg(feature = "fhe-debug")]
 #[path = "fhe/client.rs"]
 mod fhe_client;
+#[cfg(feature = "fhe-psk")]
+#[path = "fhe/session.rs"]
+mod fhe_session;
 #[cfg(feature = "fhe")]
 #[path = "fhe/transport.rs"]
 mod fhe_transport;
@@ -256,6 +259,13 @@ fn handle_command(drivers: &mut Drivers) -> CaliptraResult<MboxStatusE> {
         let request = fhe_client::RawRequest::parse(req_packet.cmd, cmd_bytes)?;
         drop(req_packet);
         return fhe_client::raw(drivers, request);
+    }
+
+    #[cfg(feature = "fhe-psk")]
+    if fhe_session::handles(req_packet.cmd) {
+        let request = fhe_session::Request::parse(req_packet.cmd, cmd_bytes)?;
+        drop(req_packet);
+        return fhe_session::execute(drivers, request);
     }
 
     // stage the response once on the stack
