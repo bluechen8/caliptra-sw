@@ -38,6 +38,10 @@ MINIMAL_DEMO_FEATURE = $(if $(filter 1,$(MINIMAL_DEMO)),minimal-demo,)
 FHE ?= 0
 FHE_DEBUG ?= 0
 FHE_PSK ?= 0
+FHE_ALOHA ?= 0
+ifeq ($(FHE_ALOHA),1)
+override FHE_PSK := 1
+endif
 # Optional clear-reference model/command for FHE comparisons.
 ML_CLEAR ?= 0
 FHE_PARAMS ?= ps
@@ -49,7 +53,7 @@ endif
 ifneq ($(FHE_PARAMS),ps)
 $(error FHE_PSK currently supports FHE_PARAMS=ps only)
 endif
-FHE_FEATURE := fhe-psk
+FHE_FEATURE := $(if $(filter 1,$(FHE_ALOHA)),fhe-aloha,fhe-psk)
 endif
 ifneq ($(filter 1,$(FHE) $(FHE_DEBUG) $(FHE_PSK)),)
 ifeq ($(filter $(FHE_PARAMS),ps pl pleq),)

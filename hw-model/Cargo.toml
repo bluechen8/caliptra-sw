@@ -9,6 +9,8 @@ edition = "2021"
 
 [features]
 default = ["coverage"]
+# Host-side co-simulation only; runtime firmware selects its own feature.
+fhe-aloha = ["caliptra-emu-periph/fhe-aloha", "caliptra-builder/fhe-aloha"]
 verilator = ["dep:caliptra-verilated"]
 fpga_realtime = ["dep:uio"]
 fpga_subsystem = ["dep:uio"]

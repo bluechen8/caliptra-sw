@@ -29,8 +29,12 @@ mod fe_programming;
 #[path = "fhe/client.rs"]
 mod fhe_client;
 #[cfg(feature = "fhe-psk")]
-#[path = "fhe/session.rs"]
+#[cfg_attr(not(feature = "fhe-aloha"), path = "fhe/session.rs")]
+#[cfg_attr(feature = "fhe-aloha", path = "fhe/session_aloha.rs")]
 mod fhe_session;
+#[cfg(feature = "fhe-aloha")]
+#[path = "fhe/aloha.rs"]
+mod fhe_aloha;
 #[cfg(feature = "fhe")]
 #[path = "fhe/transport.rs"]
 mod fhe_transport;

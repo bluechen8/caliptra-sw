@@ -155,6 +155,12 @@ pub const APP_FHE_PSK: FwId = FwId {
     ..APP_FHE_DEBUG
 };
 
+#[cfg(feature = "fhe-aloha")]
+pub const APP_FHE_ALOHA: FwId = FwId {
+    features: &["emu", "no-mldsa", "fhe-aloha", "ml-clear"],
+    ..APP_FHE_PSK
+};
+
 pub const APP_FHE_PSK_ML_CLEAR: FwId = FwId {
     features: &["emu", "no-mldsa", "fhe-psk", "ml-clear"],
     ..APP_FHE_PSK
@@ -580,6 +586,8 @@ pub const REGISTERED_FW: &[&FwId] = &[
     &APP_FHE_DEBUG_PLEQ,
     &APP_FHE,
     &APP_FHE_PSK,
+    #[cfg(feature = "fhe-aloha")]
+    &APP_FHE_ALOHA,
     &APP_FHE_PSK_ML_CLEAR,
     &APP_WITH_UART_FIPS_TEST_HOOKS,
     &APP_WITH_UART_FPGA,

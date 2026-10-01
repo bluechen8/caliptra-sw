@@ -21,6 +21,8 @@ mod csrng;
 pub mod dma;
 mod doe;
 mod emu_ctrl;
+#[cfg(feature = "fhe-aloha")]
+mod fhe_rtl;
 mod hash_sha256;
 mod hash_sha512;
 mod helpers;

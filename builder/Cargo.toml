@@ -30,6 +30,7 @@ zerocopy.workspace = true
 [features]
 default = ["openssl"]
 slow_tests = []
+fhe-aloha = []
 openssl = ["caliptra-image-crypto/openssl"]
 rustcrypto = ["caliptra-image-crypto/rustcrypto"]
 

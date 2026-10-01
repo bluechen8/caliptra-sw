@@ -323,6 +323,10 @@ pub struct CaliptraRootBus {
     #[peripheral(offset = 0x3002_2000, len = 0xa14)]
     pub dma: Dma,
 
+    #[cfg(feature = "fhe-aloha")]
+    #[peripheral(offset = 0x1005_0000, len = 0x8000)]
+    pub fhe: crate::fhe_rtl::FheRtl,
+
     #[peripheral(offset = 0x3003_0000, len = 0xa38)]
     pub soc_reg: SocRegistersInternal,
 
@@ -398,6 +402,8 @@ impl CaliptraRootBus {
             mailbox,
             sha512_acc,
             dma,
+            #[cfg(feature = "fhe-aloha")]
+            fhe: crate::fhe_rtl::FheRtl::new(),
             csrng: Csrng::new(itrng_nibbles.unwrap()),
             pic_regs: pic.mmio_regs(clock.clone()),
             mci,

@@ -129,6 +129,9 @@ fn word(b: &[u8], i: usize) -> u32 {
     u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap())
 }
 const IDS: [u32; 5] = [0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343];
+/// Authenticated parameter-set ID of the Aloha N=256 profile.
+#[cfg(feature = "fhe-aloha")]
+const ALOHA_PROFILE: u32 = 0xa108;
 struct User {
     open_request: Vec<u8>,
     id: u32,
@@ -177,6 +180,8 @@ impl User {
     }
     fn packet(&self, op: u32, body: &[u8], pointer: bool) -> (Vec<u8>, Vec<u8>) {
         let output = match op {
+            // P-S (profile 0) returns 4096 ciphertext bytes; Aloha returns 8192.
+            2 if self.policy[2] != 0 => 8192,
             2 => 4096,
             3 => 2048,
             4 => 40,
@@ -319,13 +324,26 @@ fn protected_flow_and_security() {
 /// same directory protocol is used by the Rocket HTIF relay; no simulator here.
 #[test]
 fn protected_host_demo() {
+    run_host_demo(&firmware::APP_FHE_PSK_ML_CLEAR, "protected_demo.py", false);
+}
+
+/// Requires a local-stream N=256 RTL RPC executable and initialized table cwd.
+#[test]
+#[cfg(feature = "fhe-aloha")]
+#[ignore = "requires FHE_ALOHA_RTL and FHE_ALOHA_RTL_CWD"]
+fn protected_aloha_host_demo() {
+    run_host_demo(&firmware::APP_FHE_ALOHA, "aloha_demo.py", true);
+}
+
+/// `mnist_data` forwards FHE_MNIST_DATA as the client's cached --data-dir.
+fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool) {
     use std::{
         fs,
         process::Command,
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
-    let mut m = boot(&firmware::APP_FHE_PSK_ML_CLEAR);
+    let mut m = boot(fwid);
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -338,12 +356,18 @@ fn protected_host_demo() {
         [0x80000000u64.to_le_bytes(), 0x80010000u64.to_le_bytes()].concat(),
     )
     .unwrap();
-    let script =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fhe/protected_demo.py");
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fhe")
+        .join(script);
     let mut cmd = Command::new("python3");
     cmd.arg(script).arg(&dir).arg("--timeout").arg("120");
     if std::env::var_os("FHE_FULL_DEMO").is_some() {
         cmd.arg("--full");
+    }
+    if mnist_data {
+        if let Some(path) = std::env::var_os("FHE_MNIST_DATA") {
+            cmd.arg("--data-dir").arg(path);
+        }
     }
     let mut user = cmd.spawn().unwrap();
     for i in 0..1000 {
@@ -586,4 +610,45 @@ fn protected_without_clear_reference() {
     let req = User::opening([0x1e, 2, 0, 2, 0]);
     let id = CommandId::FHE_SESSION_OPEN.into();
     assert!(m.mailbox_execute(id, &wire(id, &req, &[])).is_err());
+}
+
+/// Bad authentication leaves external output untouched and consumes no sequence;
+/// authenticated non-canonical ciphertext is rejected.
+#[test]
+#[cfg(feature = "fhe-aloha")]
+#[ignore = "requires FHE_ALOHA_RTL and FHE_ALOHA_RTL_CWD"]
+fn protected_aloha_bad_tag() {
+    let mut m = boot(&firmware::APP_FHE_ALOHA);
+    m.paint_runtime_stack_canary();
+    for pointer in [false, true] {
+        let mut u = User::open(&mut m, [0x0e, 8, ALOHA_PROFILE, 2, 0]);
+        u.call(&mut m, 1, &[], false);
+        let (h, ct) = u.packet(2, &[0; 2048], pointer);
+        let mut bad = h.clone();
+        bad[72] ^= 1;
+        m.soc_dram_mut().unwrap()[0x10000..0x12000].fill(0xa5);
+        if pointer {
+            m.soc_dram_mut().unwrap()[..ct.len()].copy_from_slice(&ct);
+        }
+        u.reject(&mut m, 2, &bad, if pointer { &[] } else { &ct });
+        assert!(m.soc_dram_mut().unwrap()[0x10000..0x12000]
+            .iter()
+            .all(|v| *v == 0xa5));
+        // A valid retry succeeds, then replay is rejected.
+        assert_eq!(u.call(&mut m, 2, &[0; 2048], pointer).len(), 8192);
+        u.reject(&mut m, 2, &h, if pointer { &[] } else { &ct });
+        u.call(&mut m, 5, &[], false);
+    }
+    // An authenticated but non-canonical residue is rejected before Aloha runs,
+    // including in limb 1, which decryption does not otherwise consume.
+    let mut u = User::open(&mut m, [0x0e, 8, ALOHA_PROFILE, 2, 0]);
+    u.call(&mut m, 1, &[], false);
+    let mut ct = u.call(&mut m, 2, &[0; 2048], false);
+    assert_eq!(u.call(&mut m, 3, &ct, false).len(), 2048);
+    // c0 limb 0, c0 limb 1, c1 limb 0, c1 limb 1: 2048 bytes each.
+    let q1 = (1u64 << 47) - (1 << 24) + 1;
+    ct[3 * 2048..3 * 2048 + 8].copy_from_slice(&q1.to_le_bytes());
+    let (h, body) = u.packet(3, &ct, false);
+    u.reject(&mut m, 3, &h, &body);
+    assert!(m.runtime_stack_canary_used() < caliptra_common::memory_layout::STACK_SIZE as usize);
 }
