@@ -369,6 +369,15 @@ fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool) {
             cmd.arg("--data-dir").arg(path);
         }
     }
+    let transport = if mnist_data {
+        None
+    } else {
+        std::env::var_os("FHE_DEMO_TRANSPORT")
+    };
+    let mailbox_only = transport.as_deref() == Some(std::ffi::OsStr::new("mailbox"));
+    if let Some(transport) = transport {
+        cmd.arg("--transport").arg(transport);
+    }
     let mut user = cmd.spawn().unwrap();
     for i in 0..1000 {
         let file = dir.join(format!("req-{i}"));
@@ -389,6 +398,9 @@ fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool) {
         }
         let len = word(&data, 1) as usize;
         let ext = word(&data, 2) as usize;
+        if mailbox_only {
+            assert_eq!(ext, 0, "mailbox-only request {i} used an external buffer");
+        }
         let h = &data[12..12 + len];
         if ext > 0 {
             m.soc_dram_mut().unwrap()[..ext].copy_from_slice(&data[12 + len..]);
