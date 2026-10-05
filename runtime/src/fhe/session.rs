@@ -1,5 +1,5 @@
 // Licensed under the Apache-2.0 license
-//! P-S PSK test protocol v3. See software/fhe/RUNTIME.md in the wrapper.
+//! P-S protected protocols: PSK test v3 and device-attested ECDH v4. See software/fhe/RUNTIME.md in the wrapper.
 use crate::{fhe_transport::Transport, Drivers};
 use caliptra_drivers::memory_layout::MBOX_ORG;
 use caliptra_drivers::{AesKey, CaliptraError, CaliptraResult};
@@ -13,10 +13,23 @@ mod model;
 #[cfg(any(feature = "fhe-debug", feature = "fhe-pl", feature = "fhe-pleq"))]
 compile_error!("fhe-psk supports P-S only and must not be combined with raw debug commands");
 const INVALID: CaliptraError = CaliptraError::RUNTIME_MAILBOX_INVALID_PARAMS;
+#[cfg(feature = "fhe-psk")]
 const PSK: [u8; 32] = [
     0xa7, 0xb1, 0xc3, 0xd5, 0xe7, 0xf9, 0x01, 0x24, 0x36, 0x48, 0x5a, 0x6c, 0x7e, 0x90, 0xa2, 0xb4,
     0xc6, 0xd8, 0xea, 0xf1, 0x03, 0x15, 0x27, 0x49, 0x61, 0x73, 0x85, 0x97, 0xa9, 0xbb, 0xcd, 0xdf,
 ];
+#[cfg(feature = "fhe-ecdh")]
+#[path = "ecdh.rs"]
+mod ecdh;
+const VERSION: u32 = if cfg!(feature = "fhe-ecdh") { 4 } else { 3 };
+const OPEN_LEN: usize = if cfg!(feature = "fhe-ecdh") { 156 } else { 76 };
+const HEADER_LEN: usize = if cfg!(feature = "fhe-ecdh") { 268 } else { 100 };
+const COMMAND_LEN: usize = 88;
+const REQUEST_LEN: usize = if OPEN_LEN > COMMAND_LEN {
+    OPEN_LEN
+} else {
+    COMMAND_LEN
+};
 const OPEN: u32 = 0x4648534f;
 const IDS: [u32; 5] = [0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343];
 fn word(b: &[u8], i: usize) -> u32 {
@@ -30,6 +43,18 @@ fn nonce(seq: u32, direction: u32) -> [u8; 12] {
     put(&mut n, 0, direction);
     put(&mut n, 1, seq);
     n
+}
+/// Shared v3/v4 open-policy shape check; callers reject with INVALID.
+fn policy_supported(r: &Request) -> bool {
+    let supported = if cfg!(feature = "ml-clear") {
+        0x1e
+    } else {
+        0x0e
+    };
+    word(&r.bytes, 2) & !supported == 0
+        && word(&r.bytes, 4) == 0
+        && word(&r.bytes, 5) == 2
+        && word(&r.bytes, 6) == 0
 }
 fn cycles() -> u64 {
     #[cfg(target_arch = "riscv32")]
@@ -48,9 +73,13 @@ fn cycles() -> u64 {
     }
 }
 pub struct State {
+    #[cfg(feature = "fhe-ecdh")]
+    crypto_failed: bool,
     id: u32,
     active: bool,
+    #[cfg(feature = "fhe-psk")]
     request_key: [u8; 32],
+    #[cfg(feature = "fhe-psk")]
     response_key: [u8; 32],
     policy: [u8; 20],
     next: u32,
@@ -62,9 +91,13 @@ pub struct State {
 impl State {
     pub fn new() -> Self {
         Self {
+            #[cfg(feature = "fhe-ecdh")]
+            crypto_failed: false,
             id: 0,
             active: false,
+            #[cfg(feature = "fhe-psk")]
             request_key: [0; 32],
+            #[cfg(feature = "fhe-psk")]
             response_key: [0; 32],
             policy: [0; 20],
             next: 1,
@@ -76,8 +109,11 @@ impl State {
     }
     fn erase(&mut self) {
         self.active = false;
-        self.request_key.zeroize();
-        self.response_key.zeroize();
+        #[cfg(feature = "fhe-psk")]
+        {
+            self.request_key.zeroize();
+            self.response_key.zeroize();
+        }
         self.policy.zeroize();
         self.secret.zeroize();
         self.keyed = false;
@@ -95,7 +131,7 @@ pub fn handles(id: u32) -> bool {
 }
 /// Only owned metadata survives Packet; payload is copied after its references die.
 pub struct Request {
-    bytes: [u8; 88],
+    bytes: [u8; REQUEST_LEN],
     open: bool,
     input: usize,
     output: usize,
@@ -106,14 +142,14 @@ pub struct Request {
 impl Request {
     pub fn parse(id: u32, b: &[u8]) -> CaliptraResult<Self> {
         let open = id == OPEN;
-        let len = if open { 76 } else { 88 };
-        if b.len() < len || word(b, 1) != 3 {
+        let len = if open { OPEN_LEN } else { COMMAND_LEN };
+        if b.len() < len || word(b, 1) != VERSION {
             return Err(INVALID);
         }
-        let mut bytes = [0; 88];
+        let mut bytes = [0; REQUEST_LEN];
         bytes[..len].copy_from_slice(&b[..len]);
         if open {
-            if b.len() != 76 {
+            if b.len() != OPEN_LEN {
                 return Err(INVALID);
             }
             return Ok(Self {
@@ -175,7 +211,8 @@ impl Request {
         })
     }
 }
-fn open(d: &mut Drivers, r: &Request, header: &mut [u8; 100]) -> CaliptraResult<usize> {
+#[cfg(feature = "fhe-psk")]
+fn open(d: &mut Drivers, r: &Request, header: &mut [u8; HEADER_LEN]) -> CaliptraResult<usize> {
     let s = &mut d.fhe_session;
     if s.active || s.transport.is_poisoned() {
         return Err(INVALID);
@@ -187,16 +224,7 @@ fn open(d: &mut Drivers, r: &Request, header: &mut [u8; 100]) -> CaliptraResult<
     if !constant_time_eq::constant_time_eq(&tag, &r.bytes[60..76]) {
         return Err(INVALID);
     }
-    let supported = if cfg!(feature = "ml-clear") {
-        0x1e
-    } else {
-        0x0e
-    };
-    if word(&r.bytes, 2) & !supported != 0
-        || word(&r.bytes, 4) != 0
-        || word(&r.bytes, 5) != 2
-        || word(&r.bytes, 6) != 0
-    {
+    if !policy_supported(r) {
         return Err(INVALID);
     }
     s.erase();
@@ -302,7 +330,7 @@ fn kernel(
 
 pub fn execute(d: &mut Drivers, r: Request) -> CaliptraResult<MboxStatusE> {
     let start = cycles();
-    let mut header = [0u8; 100];
+    let mut header = [0u8; HEADER_LEN];
     // AES handles partial blocks with byte stores. Mailbox SRAM requires word
     // stores, so keep driver output in DCCM until it can be copied as words.
     let mut aes_output = Zeroizing::new([0u32; 1024]);
@@ -314,7 +342,10 @@ pub fn execute(d: &mut Drivers, r: Request) -> CaliptraResult<MboxStatusE> {
     }
     let result = (|| {
         if r.open {
+            #[cfg(feature = "fhe-psk")]
             return open(d, &r, &mut header);
+            #[cfg(feature = "fhe-ecdh")]
+            return ecdh::open(d, &r, &mut header);
         }
         let op = word(&r.bytes, 2);
         let seq = word(&r.bytes, 4);
@@ -341,7 +372,7 @@ pub fn execute(d: &mut Drivers, r: Request) -> CaliptraResult<MboxStatusE> {
         let auth = d.aes.aes_256_gcm_decrypt(
             &mut d.trng,
             &nonce(seq, 0),
-            AesKey::Array(&d.fhe_session.request_key),
+            session_key(&d.fhe_session, false),
             &r.bytes[4..72],
             &input.as_bytes()[..r.input],
             &mut aes_output.as_mut_bytes()[..r.input],
@@ -370,6 +401,11 @@ pub fn execute(d: &mut Drivers, r: Request) -> CaliptraResult<MboxStatusE> {
             }
             s.egress += 1;
         }
+        // The first authenticated keygen proves possession of the negotiated key.
+        #[cfg(feature = "fhe-ecdh")]
+        if !s.keyed && op != 1 && op != 5 {
+            return Err(INVALID);
+        }
         kernel(d, op, plain, input, &mut scratch[..768])?;
         header[8..76].copy_from_slice(&r.bytes[4..72]);
         header[76..84].copy_from_slice(&cycles().wrapping_sub(start).to_le_bytes());
@@ -381,7 +417,7 @@ pub fn execute(d: &mut Drivers, r: Request) -> CaliptraResult<MboxStatusE> {
         let (_, tag) = d.aes.aes_256_gcm_encrypt(
             &mut d.trng,
             (&nonce(seq, 1)).into(),
-            AesKey::Array(&d.fhe_session.response_key),
+            session_key(&d.fhe_session, true),
             &header[8..84],
             &source[..r.output],
             &mut aes_output.as_mut_bytes()[..r.output],
@@ -400,7 +436,7 @@ pub fn execute(d: &mut Drivers, r: Request) -> CaliptraResult<MboxStatusE> {
                 .map_err(|_| CaliptraError::RUNTIME_FHE_ENCRYPT_FAILED)?;
         }
         if op == 5 {
-            d.fhe_session.erase();
+            erase(d)?;
         }
         Ok(100)
     })();
@@ -422,9 +458,10 @@ pub fn execute(d: &mut Drivers, r: Request) -> CaliptraResult<MboxStatusE> {
         put(&mut header, 0, sum);
         // End the SRAM borrow before DATAIN overwrites its source.
         if let Err(error) = d.mbox.write_response_from_mailbox(&header[..len], payload) {
-            d.fhe_session.erase();
+            let cleanup = erase(d);
             // SAFETY: no DMA targets mailbox; still exclusively command-owned.
             unsafe { core::slice::from_raw_parts_mut(MBOX_ORG as *mut u32, 4096) }.zeroize();
+            cleanup?;
             return Err(error);
         }
         Ok(MboxStatusE::DataReady)
@@ -432,8 +469,37 @@ pub fn execute(d: &mut Drivers, r: Request) -> CaliptraResult<MboxStatusE> {
         work.zeroize();
         let e = result.unwrap_err();
         if e != INVALID || d.fhe_session.transport.is_poisoned() {
-            d.fhe_session.erase();
+            erase(d)?;
         }
         Err(e)
     }
+}
+
+fn session_key(s: &State, response: bool) -> AesKey<'_> {
+    #[cfg(feature = "fhe-psk")]
+    return AesKey::Array(if response {
+        &s.response_key
+    } else {
+        &s.request_key
+    });
+    #[cfg(feature = "fhe-ecdh")]
+    {
+        let _ = s;
+        let id = if response {
+            ecdh::RESPONSE_KEY
+        } else {
+            ecdh::REQUEST_KEY
+        };
+        AesKey::KV(caliptra_drivers::KeyReadArgs::new(id))
+    }
+}
+#[inline(never)]
+pub(crate) fn erase(d: &mut Drivers) -> CaliptraResult<()> {
+    d.fhe_session.erase();
+    #[cfg(feature = "fhe-ecdh")]
+    if let Err(e) = ecdh::erase_keys(&mut d.key_vault) {
+        d.fhe_session.crypto_failed = true;
+        return Err(e);
+    }
+    Ok(())
 }

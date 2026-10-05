@@ -150,7 +150,7 @@ pub struct Drivers {
     pub dma: Dma,
     #[cfg(feature = "fhe-debug")]
     pub fhe: crate::fhe_client::State,
-    #[cfg(feature = "fhe-psk")]
+    #[cfg(any(feature = "fhe-psk", feature = "fhe-ecdh"))]
     pub fhe_session: crate::fhe_session::State,
 
     pub cryptographic_mailbox: CmStorage,
@@ -201,7 +201,7 @@ impl Drivers {
             dma: Dma::default(),
             #[cfg(feature = "fhe-debug")]
             fhe: crate::fhe_client::State::new(),
-            #[cfg(feature = "fhe-psk")]
+            #[cfg(any(feature = "fhe-psk", feature = "fhe-ecdh"))]
             fhe_session: crate::fhe_session::State::new(),
             cryptographic_mailbox: CmStorage::new(),
             debug_unlock: ProductionDebugUnlock::new(),
@@ -211,6 +211,8 @@ impl Drivers {
 
     #[cfg_attr(not(feature = "no-cfi"), cfi_impl_fn)]
     pub fn run_reset_flow(&mut self) -> CaliptraResult<()> {
+        #[cfg(feature = "fhe-ecdh")]
+        crate::fhe_session::erase(self)?;
         Self::create_cert_chain(self)?;
         self.cryptographic_mailbox
             .init(&self.persistent_data, &mut self.trng)?;

@@ -93,10 +93,11 @@ fips_self_test = []
 fhe = ["dep:caliptra-fhe-core"]
 fhe-debug = ["fhe"]
 fhe-psk = ["fhe"]
+fhe-ecdh = ["fhe"]
 # N=256 hardware client with private AHB stream; distinct authenticated profile.
 fhe-aloha = ["fhe-psk"]
 # Reference classifier for comparing clear and encrypted inference; off by default.
-ml-clear = ["fhe-psk", "caliptra-api/ml-clear"]
+ml-clear = ["caliptra-api/ml-clear"]
 fhe-pl = ["fhe"]
 fhe-pleq = ["fhe"]
 no-cfi = [

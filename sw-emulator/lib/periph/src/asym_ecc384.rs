@@ -214,7 +214,7 @@ pub struct AsymEcc384 {
     error_global_intr: ReadOnlyRegister<u32>,
 
     /// Error Internal Intr register
-    #[register(offset = 0x0000_0814)]
+    #[register(offset = 0x0000_0814, write_fn = on_write_error_internal)]
     error_internal_intr: ReadOnlyRegister<u32>,
 
     /// Tracks whether priv_key_in was set internally
@@ -729,15 +729,31 @@ impl AsymEcc384 {
         self.dh_shared_key.as_mut().fill(0);
     }
 
+    /// W1C clear of error_internal_intr
+    fn on_write_error_internal(&mut self, size: RvSize, value: RvData) -> Result<(), BusError> {
+        if size != RvSize::Word {
+            return Err(BusError::StoreAccessFault);
+        }
+        self.error_internal_intr
+            .reg
+            .set(self.error_internal_intr.reg.get() & !value);
+        Ok(())
+    }
+
     /// Generate Diffie-Hellman shared key
     fn generate_dh_shared_key(&mut self) {
-        let shared_key = Ecc384::compute_shared_secret(
+        let Some(shared_key) = Ecc384::compute_shared_secret(
             &bytes_from_words_le(&self.priv_key_in),
             &Ecc384PubKey {
                 x: bytes_from_words_le(&self.pub_key_x),
                 y: bytes_from_words_le(&self.pub_key_y),
             },
-        );
+        ) else {
+            // ecc_dsa_ctrl.sv rejects out-of-range/off-curve public points via
+            // error_internal_sts. Do not schedule a KV write on this path.
+            self.error_internal_intr.reg.set(1);
+            return;
+        };
         // Handle the shared key based on control register settings
         if self
             .key_write_ctrl

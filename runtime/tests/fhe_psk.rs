@@ -12,6 +12,13 @@ use caliptra_image_types::FwVerificationPqcKeyType;
 use zerocopy::IntoBytes;
 
 fn boot(fwid: &'static FwId<'static>) -> DefaultHwModel {
+    boot_with_measurement(fwid, false).0
+}
+/// Returns the runtime SHA-384 for ECDH builds, whose host pins it.
+fn boot_with_measurement(
+    fwid: &'static FwId<'static>,
+    wrapper_fixture: bool,
+) -> (DefaultHwModel, Option<String>) {
     let rom = caliptra_builder::build_firmware_rom(&firmware::ROM_WITH_UART_NO_MLDSA).unwrap();
     let mut opts = ImageOptions::default();
     opts.pqc_key_type = FwVerificationPqcKeyType::LMS;
@@ -26,10 +33,18 @@ fn boot(fwid: &'static FwId<'static>) -> DefaultHwModel {
     }
     let vendor_pk_hash = hash_words(image.manifest.preamble.vendor_pub_key_info.as_bytes());
     let owner_pk_hash = hash_words(image.manifest.preamble.owner_pub_keys.as_bytes());
+    let ecdh = fwid.features.contains(&"fhe-ecdh");
+    let runtime_digest = ecdh.then(|| {
+        hex(&hash_words(&image.runtime)
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect::<Vec<_>>())
+    });
     let image = image.to_bytes().unwrap();
-    let mut model = caliptra_hw_model::new(
-        InitParams {
+    let mut init = InitParams {
             rom: &rom,
+            security_state: *caliptra_hw_model::SecurityState::default()
+                .set_debug_locked(ecdh),
             fuses: Fuses {
                 vendor_pk_hash,
                 owner_pk_hash,
@@ -37,14 +52,32 @@ fn boot(fwid: &'static FwId<'static>) -> DefaultHwModel {
                 ..Default::default()
             },
             ..Default::default()
-        },
+        };
+    if wrapper_fixture {
+        // Public fixture values from wrapper Caliptra.scala and caliptra.h.
+        // The independent Python pin is derived without querying the device.
+        init.cptra_obf_key = [0xcfe891e7,0x28b07f11,0xfb41700d,0x334714bf,
+            0x5c8fb33c,0x1c958bbd,0xf34d6ac3,0x31358e8a];
+        init.fuses.uds_seed = [0xe4046d05,0x385ab789,0xc6a72866,0xe08350f9,
+            0x3f583e2a,0x005ca0fa,0xecc32b5c,0xfc323d46,0x1c76c107,0x307654db,
+            0x5566a5bd,0x693e227c,0x14451624,0x6a752c32,0x9056d884,0xdaf3c89d];
+        init.fuses.field_entropy = [0xb32e2b17,0x1b638270,0x34ebb0d1,0x909f7ef1,
+            0xd51c5f82,0xc1bb9bc2,0x6bc4ac4d,0xccdee835];
+        init.security_state.set_device_lifecycle(caliptra_hw_model::DeviceLifecycle::Manufacturing);
+    }
+    let mut model = caliptra_hw_model::new(
+        init,
         BootParams {
             fw_image: Some(&image),
             ..Default::default()
         },
     )
     .unwrap();
-    let mut ready = false;
+    wait_runtime_ready(&mut model);
+    model.require_mailbox_word_writes();
+    (model, runtime_digest)
+}
+fn wait_runtime_ready(model: &mut DefaultHwModel) {
     for _ in 0..20_000_000 {
         assert_eq!(
             model.soc_ifc().cptra_fw_error_fatal().read(),
@@ -57,14 +90,11 @@ fn boot(fwid: &'static FwId<'static>) -> DefaultHwModel {
             .read()
             .ready_for_runtime()
         {
-            ready = true;
-            break;
+            return;
         }
         model.step();
     }
-    assert!(ready, "runtime boot timed out");
-    model.require_mailbox_word_writes();
-    model
+    panic!("runtime boot timed out");
 }
 fn wire(id: u32, data: &[u8], payload: &[u8]) -> Vec<u8> {
     let mut out = data.to_vec();
@@ -114,6 +144,9 @@ fn crypto(op: &str, key: &[u8], data: &[u8], aad: &[u8], iv: &[u8]) -> Vec<u8> {
     if op != "mac" {
         cmd.arg(hex(aad)).arg(hex(iv));
     }
+    run_python(&mut cmd)
+}
+fn run_python(cmd: &mut std::process::Command) -> Vec<u8> {
     let out = cmd.output().unwrap();
     assert!(
         out.status.success(),
@@ -121,6 +154,19 @@ fn crypto(op: &str, key: &[u8], data: &[u8], aad: &[u8], iv: &[u8]) -> Vec<u8> {
         String::from_utf8_lossy(&out.stderr)
     );
     unhex(String::from_utf8(out.stdout).unwrap().trim())
+}
+/// P-S decryption must stay within the CBD error support of the plaintext.
+fn assert_ps_close(dec: &[u8], pt: &[u8]) {
+    for (limb, q) in [1073738753i64, 1073732609].into_iter().enumerate() {
+        for i in 0..256 {
+            let diff =
+                (word(dec, limb * 256 + i) as i64 - word(pt, limb * 256 + i) as i64 + q) % q;
+            assert!(
+                diff <= 20 || diff >= q - 20,
+                "decryption outside CBD support"
+            );
+        }
+    }
 }
 fn words(w: &[u32]) -> Vec<u8> {
     w.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -133,6 +179,7 @@ const IDS: [u32; 5] = [0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x4648534
 #[cfg(feature = "fhe-aloha")]
 const ALOHA_PROFILE: u32 = 0xa108;
 struct User {
+    version: u32,
     open_request: Vec<u8>,
     id: u32,
     seq: u32,
@@ -170,6 +217,7 @@ impl User {
         let mut tx = k(3);
         tx.extend(k(4));
         Self {
+            version: 3,
             open_request: req,
             id,
             seq: 1,
@@ -187,7 +235,7 @@ impl User {
             4 => 40,
             _ => 0,
         };
-        let mut h = words(&[0, 3, op, self.id, self.seq]);
+        let mut h = words(&[0, self.version, op, self.id, self.seq]);
         h.extend(words(&self.policy));
         h.extend(words(&[
             pointer as u32,
@@ -262,17 +310,7 @@ fn protected_flow_and_security() {
         let ct = u.call(&mut m, 2, pt, pointer);
         assert_eq!(ct.len(), 4096);
         let dec = u.call(&mut m, 3, &ct, pointer);
-        for limb in 0..2 {
-            let q = [1073738753i64, 1073732609][limb];
-            for i in 0..256 {
-                let diff =
-                    (word(&dec, limb * 256 + i) as i64 - word(pt, limb * 256 + i) as i64 + q) % q;
-                assert!(
-                    diff <= 20 || diff >= q - 20,
-                    "decryption outside CBD support"
-                );
-            }
-        }
+        assert_ps_close(&dec, pt);
         // Fresh encryption must not repeat the uniform component.
         assert_ne!(u.call(&mut m, 2, pt, pointer), ct);
         let pixels: Vec<u8> = (0..196).map(|i| (i % 16) as u8).collect();
@@ -327,6 +365,21 @@ fn protected_host_demo() {
     run_host_demo(&firmware::APP_FHE_PSK_ML_CLEAR, "protected_demo.py", false);
 }
 
+#[test]
+fn ecdh_host_demo() {
+    run_host_demo(&firmware::APP_FHE_ECDH_ML_CLEAR, "protected_demo.py", false);
+}
+
+#[test]
+fn ecdh_host_verifier_tampering() {
+    run_host_demo(&firmware::APP_FHE_ECDH_ML_CLEAR, "test_ecdh.py", false);
+}
+
+#[test]
+fn ecdh_wrapper_fixture() {
+    run_host_demo_fixture(&firmware::APP_FHE_ECDH_ML_CLEAR, "protected_demo.py", false, true);
+}
+
 /// Requires a local-stream N=256 RTL RPC executable and initialized table cwd.
 #[test]
 #[cfg(feature = "fhe-aloha")]
@@ -337,13 +390,17 @@ fn protected_aloha_host_demo() {
 
 /// `mnist_data` forwards FHE_MNIST_DATA as the client's cached --data-dir.
 fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool) {
+    run_host_demo_fixture(fwid, script, mnist_data, false);
+}
+fn run_host_demo_fixture(fwid: &'static FwId<'static>, script: &str, mnist_data: bool, wrapper_fixture: bool) {
     use std::{
         fs,
         process::Command,
         thread,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
-    let mut m = boot(fwid);
+    let (mut m, runtime_digest) = boot_with_measurement(fwid, wrapper_fixture);
+    m.paint_runtime_stack_canary();
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -361,6 +418,27 @@ fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool) {
         .join(script);
     let mut cmd = Command::new("python3");
     cmd.arg(script).arg(&dir).arg("--timeout").arg("120");
+    if let Some(runtime_digest) = runtime_digest {
+        let root = dir.join("device-root.pem");
+        if wrapper_fixture {
+            let out = Command::new("python3").arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fhe/demo_root.py")).output().unwrap();
+            assert!(out.status.success());
+            fs::write(&root, out.stdout).unwrap();
+        } else {
+            // Provision from the repository's independent golden device CSR, never
+            // from the relay/command under test. Its key is checked by ROM tests.
+            let csr = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../test/tests/caliptra_integration_tests/smoke_testdata/idevid_csr_ecc.der");
+            assert!(Command::new("python3").arg("-c").arg(
+                "from pathlib import Path; import sys; from cryptography import x509; from cryptography.hazmat.primitives import serialization as s; Path(sys.argv[2]).write_bytes(x509.load_der_x509_csr(Path(sys.argv[1]).read_bytes()).public_key().public_bytes(s.Encoding.PEM,s.PublicFormat.SubjectPublicKeyInfo))"
+            ).arg(csr).arg(&root).status().unwrap().success());
+        }
+        cmd.arg("--session").arg("ecdh").arg("--device-root").arg(root)
+            .arg("--runtime-sha384").arg(runtime_digest);
+    } else if !mnist_data {
+        cmd.arg("--session").arg("psk");
+    }
     if std::env::var_os("FHE_FULL_DEMO").is_some() {
         cmd.arg("--full");
     }
@@ -394,6 +472,8 @@ fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool) {
         let id = word(&data, 0);
         if id == 0 {
             assert!(user.wait().unwrap().success());
+            println!("host demo {:?} stack extent {}", fwid.features, m.runtime_stack_canary_used());
+            assert!(m.runtime_stack_canary_used() < caliptra_common::memory_layout::STACK_SIZE as usize);
             return;
         }
         let len = word(&data, 1) as usize;
@@ -419,8 +499,11 @@ fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool) {
 
 #[test]
 fn protected_snapshot_and_cleanup() {
-    let mut m = boot(&firmware::APP_FHE_PSK_ML_CLEAR);
-    let mut u = User::open(&mut m, [0x1e, 4, 0, 2, 0]);
+    snapshot_and_cleanup(&firmware::APP_FHE_PSK_ML_CLEAR, User::open);
+}
+fn snapshot_and_cleanup(fwid: &'static FwId<'static>, open: fn(&mut DefaultHwModel, [u32; 5]) -> User) {
+    let mut m = boot(fwid);
+    let mut u = open(&mut m, [0x1e, 4, 0, 2, 0]);
     u.call(&mut m, 1, &[], false);
     let pt = include_bytes!("../../fhe-core/tests/vectors/ps/pt.bin");
     let (h, ct) = u.packet(2, pt, true);
@@ -461,13 +544,7 @@ fn protected_snapshot_and_cleanup() {
         .iter()
         .all(|&v| v == 0));
     let dec = u.call(&mut m, 3, &ciphertext, false);
-    for li in 0..2 {
-        let q = [1073738753i64, 1073732609][li];
-        for i in 0..256 {
-            let d = (word(&dec, li * 256 + i) as i64 - word(pt, li * 256 + i) as i64 + q) % q;
-            assert!(d <= 20 || d >= q - 20);
-        }
-    }
+    assert_ps_close(&dec, pt);
     let (mut h, ct) = u.packet(2, pt, false);
     h[75] ^= 1;
     u.reject(&mut m, 2, &h, &ct);
@@ -506,17 +583,22 @@ fn protected_policy_exhaustion_and_dma_poison() {
     u.seq += 1;
     u.call(&mut m, 5, &[], false);
     let mut u = User::open(&mut m, [0x1e, 4, 0, 2, 0]);
-    u.call(&mut m, 1, &[], false);
+    dma_poison(&mut m, &mut u, |_| {});
+}
+/// Valid fabric range but beyond emulator RAM: partial read then DMA fault.
+/// The poisoned transport must refuse every later open and command.
+fn dma_poison(m: &mut DefaultHwModel, u: &mut User, after_fault: fn(&mut DefaultHwModel)) {
+    u.call(m, 1, &[], false);
     let pt = include_bytes!("../../fhe-core/tests/vectors/ps/pt.bin");
     let (mut h, _) = u.packet(2, pt, true);
-    // Valid fabric range but beyond emulator RAM: partial read then DMA fault.
     let end = m.soc_dram_mut().unwrap().len();
     h[44..48].copy_from_slice(&(0x80000000u32 + end as u32 - 4).to_le_bytes());
     let ct = crypto("encrypt", &u.rx, pt, &h[4..72], &words(&[0, u.seq, 0]));
     h[72..88].copy_from_slice(&ct[ct.len() - 16..]);
     m.soc_dram_mut().unwrap()[end - 4..].copy_from_slice(&ct[..4]);
     m.soc_dram_mut().unwrap()[0x10000..0x11000].fill(0x5a);
-    u.reject(&mut m, 2, &h, &[]);
+    u.reject(m, 2, &h, &[]);
+    after_fault(m);
     assert!(m.soc_dram_mut().unwrap()[0x10000..0x11000]
         .iter()
         .all(|&v| v == 0x5a));
@@ -524,13 +606,14 @@ fn protected_policy_exhaustion_and_dma_poison() {
         .mailbox_sram_snapshot(128, 16384 - 128)
         .iter()
         .all(|&v| v == 0));
-    let open = User::opening([0x1e, 4, 0, 2, 0]);
     for _ in 0..2 {
         let id: u32 = CommandId::FHE_SESSION_OPEN.into();
-        assert!(m.mailbox_execute(id, &wire(id, &open, &[])).is_err());
+        assert!(m
+            .mailbox_execute(id, &wire(id, &u.open_request, &[]))
+            .is_err());
     }
     let (h, ct) = u.packet(5, &[], false);
-    u.reject(&mut m, 5, &h, &ct);
+    u.reject(m, 5, &h, &ct);
 }
 
 #[test]
@@ -569,8 +652,11 @@ fn protected_open_authentication_and_lifetime() {
 
 #[test]
 fn protected_failed_egress_write() {
-    let mut m = boot(&firmware::APP_FHE_PSK_ML_CLEAR);
-    let mut u = User::open(&mut m, [0x1e, 4, 0, 2, 0]);
+    failed_egress_write(&firmware::APP_FHE_PSK_ML_CLEAR, User::open);
+}
+fn failed_egress_write(fwid: &'static FwId<'static>, open: fn(&mut DefaultHwModel, [u32; 5]) -> User) {
+    let mut m = boot(fwid);
+    let mut u = open(&mut m, [0x1e, 4, 0, 2, 0]);
     u.call(&mut m, 1, &[], false);
     let pt = include_bytes!("../../fhe-core/tests/vectors/ps/pt.bin");
     let ct = u.call(&mut m, 2, pt, false);
@@ -591,7 +677,7 @@ fn protected_failed_egress_write() {
         .mailbox_sram_snapshot(128, 16384 - 128)
         .iter()
         .all(|&v| v == 0));
-    let open = User::opening([0x1e, 4, 0, 2, 0]);
+    let open = u.open_request.clone();
     let id: u32 = CommandId::FHE_SESSION_OPEN.into();
     assert!(m.mailbox_execute(id, &wire(id, &open, &[])).is_err());
 }
@@ -610,13 +696,7 @@ fn protected_without_clear_reference() {
     let pt = include_bytes!("../../fhe-core/tests/vectors/ps/pt.bin");
     let ct = u.call(&mut m, 2, pt, false);
     let dec = u.call(&mut m, 3, &ct, false);
-    for (limb, q) in [1073738753i64, 1073732609].into_iter().enumerate() {
-        for i in 0..256 {
-            let diff =
-                (word(&dec, limb * 256 + i) as i64 - word(pt, limb * 256 + i) as i64 + q) % q;
-            assert!(diff <= 20 || diff >= q - 20);
-        }
-    }
+    assert_ps_close(&dec, pt);
     u.call(&mut m, 5, &[], false);
     // A correctly authenticated open cannot grant the compiled-out operation.
     let req = User::opening([0x1e, 2, 0, 2, 0]);
@@ -664,3 +744,6 @@ fn protected_aloha_bad_tag() {
     u.reject(&mut m, 3, &h, &body);
     assert!(m.runtime_stack_canary_used() < caliptra_common::memory_layout::STACK_SIZE as usize);
 }
+
+#[path = "fhe_ecdh.rs"]
+mod ecdh_tests;

@@ -33,7 +33,7 @@ MINIMAL_DEMO ?= 0
 MINIMAL_DEMO_FEATURE = $(if $(filter 1,$(MINIMAL_DEMO)),minimal-demo,)
 
 # Set to 1 to compile software-client support. Raw commands require FHE_DEBUG.
-# Existing runtime builds are unchanged when off. FHE_PSK explicitly selects
+# FHE=1 defaults to device-attested ECDH. Off builds are unchanged. FHE_PSK selects
 # the protected P-S demo; FHE_DEBUG selects the separate raw test commands.
 FHE ?= 0
 FHE_DEBUG ?= 0
@@ -45,15 +45,19 @@ endif
 # Optional clear-reference model/command for FHE comparisons.
 ML_CLEAR ?= 0
 FHE_PARAMS ?= ps
-FHE_FEATURE = $(if $(filter 1,$(FHE_DEBUG)),fhe-debug,$(if $(filter 1,$(FHE)),fhe,))
+FHE_FEATURE = $(if $(filter 1,$(FHE_DEBUG)),fhe-debug,$(if $(filter 1,$(FHE)),fhe-ecdh,))
 ifeq ($(FHE_PSK),1)
 ifeq ($(FHE_DEBUG),1)
 $(error FHE_PSK and FHE_DEBUG are mutually exclusive)
 endif
-ifneq ($(FHE_PARAMS),ps)
-$(error FHE_PSK currently supports FHE_PARAMS=ps only)
-endif
 FHE_FEATURE := $(if $(filter 1,$(FHE_ALOHA)),fhe-aloha,fhe-psk)
+endif
+# Evaluated before params/ml-clear suffixes are comma-joined onto FHE_FEATURE.
+FHE_PROTECTED := $(filter fhe-psk fhe-ecdh fhe-aloha,$(FHE_FEATURE))
+ifneq ($(FHE_PROTECTED),)
+ifneq ($(FHE_PARAMS),ps)
+$(error protected FHE builds currently support FHE_PARAMS=ps only)
+endif
 endif
 ifneq ($(filter 1,$(FHE) $(FHE_DEBUG) $(FHE_PSK)),)
 ifeq ($(filter $(FHE_PARAMS),ps pl pleq),)
@@ -65,8 +69,8 @@ endif
 endif
 
 ifeq ($(ML_CLEAR),1)
-ifneq ($(FHE_PSK),1)
-$(error ML_CLEAR requires FHE_PSK=1)
+ifeq ($(FHE_PROTECTED),)
+$(error ML_CLEAR requires a protected FHE build)
 endif
 FHE_FEATURE := $(FHE_FEATURE),ml-clear
 endif

@@ -184,6 +184,11 @@ impl KeyVault {
         self.regs.borrow().read_key_as_data(key_id, desired_usage)
     }
 
+    /// Internal emulator interface to read a key slot's usage flags (not key bytes)
+    pub fn key_usage(&self, key_id: u32) -> u32 {
+        self.regs.borrow().key_control[key_id as usize].read(KV_CONTROL::USAGE)
+    }
+
     /// Internal emulator interface to write key to key vault
     pub fn write_key(&mut self, key_id: u32, key: &[u8], key_usage: u32) -> Result<(), BusError> {
         self.regs.borrow_mut().write_key(key_id, key, key_usage)
@@ -470,10 +475,15 @@ impl KeyVaultRegs {
                 .val(key_ctrl_reg.read(KV_CONTROL::USE_LOCK) | val.read(KV_CONTROL::USE_LOCK)),
         );
 
-        if key_ctrl_reg.read(KV_CONTROL::WRITE_LOCK) == 0 && val.is_set(KV_CONTROL::CLEAR) {
+        if key_ctrl_reg.read(KV_CONTROL::WRITE_LOCK) == 0
+            && key_ctrl_reg.read(KV_CONTROL::USE_LOCK) == 0
+            && val.is_set(KV_CONTROL::CLEAR)
+        {
             let key_min = index * KeyVault::KEY_SIZE;
             let key_max = key_min + KeyVault::KEY_SIZE;
             self.keys.data_mut()[key_min..key_max].fill(0);
+            // kv.sv clears destination validity and length with the key.
+            key_ctrl_reg.modify(KV_CONTROL::USAGE::CLEAR + KV_CONTROL::LAST_DWORD::CLEAR);
         }
         Ok(())
     }
@@ -1025,7 +1035,15 @@ mod tests {
                 Some(())
             );
 
-            assert_eq!(&vault.read_key(key_id, key_usage).unwrap(), &cleared_key);
+            assert!(vault.read_key(key_id, key_usage).is_err());
+            assert_eq!(vault.read(RvSize::Word, key_id * 4).unwrap(), 0);
+            let begin = key_id as usize * KeyVault::KEY_SIZE;
+            assert_eq!(&vault.regs.borrow().keys.data()[begin..begin + KeyVault::KEY_SIZE], &cleared_key);
+            // A use-locked slot must not be cleared by a software request.
+            vault.write_key(key_id, expected, u32::from(key_usage)).unwrap();
+            vault.write(RvSize::Word, key_id * 4, KV_CONTROL::USE_LOCK::SET.value).unwrap();
+            vault.write(RvSize::Word, key_id * 4, KV_CONTROL::CLEAR::SET.value).unwrap();
+            assert_eq!(&vault.regs.borrow().keys.data()[begin..begin + expected.len()], expected);
         }
     }
 

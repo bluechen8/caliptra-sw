@@ -24,17 +24,19 @@ mod disable;
 mod dpe_crypto;
 mod dpe_platform;
 mod drivers;
+#[cfg(all(feature = "fhe-ecdh", feature = "fhe-psk"))]
+compile_error!("fhe-ecdh and fhe-psk (including fhe-aloha) are mutually exclusive");
 mod fe_programming;
-#[cfg(feature = "fhe-debug")]
-#[path = "fhe/client.rs"]
-mod fhe_client;
-#[cfg(feature = "fhe-psk")]
-#[cfg_attr(not(feature = "fhe-aloha"), path = "fhe/session.rs")]
-#[cfg_attr(feature = "fhe-aloha", path = "fhe/session_aloha.rs")]
-mod fhe_session;
 #[cfg(feature = "fhe-aloha")]
 #[path = "fhe/aloha.rs"]
 mod fhe_aloha;
+#[cfg(feature = "fhe-debug")]
+#[path = "fhe/client.rs"]
+mod fhe_client;
+#[cfg(any(feature = "fhe-psk", feature = "fhe-ecdh"))]
+#[cfg_attr(not(feature = "fhe-aloha"), path = "fhe/session.rs")]
+#[cfg_attr(feature = "fhe-aloha", path = "fhe/session_aloha.rs")]
+mod fhe_session;
 #[cfg(feature = "fhe")]
 #[path = "fhe/transport.rs"]
 mod fhe_transport;
@@ -265,7 +267,7 @@ fn handle_command(drivers: &mut Drivers) -> CaliptraResult<MboxStatusE> {
         return fhe_client::raw(drivers, request);
     }
 
-    #[cfg(feature = "fhe-psk")]
+    #[cfg(any(feature = "fhe-psk", feature = "fhe-ecdh"))]
     if fhe_session::handles(req_packet.cmd) {
         let request = fhe_session::Request::parse(req_packet.cmd, cmd_bytes)?;
         drop(req_packet);
