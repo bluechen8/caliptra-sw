@@ -1,5 +1,5 @@
 // Licensed under the Apache-2.0 license
-//! Aloha PSK test protocol v3; compiled only with fhe-aloha.
+//! Aloha PSK protocol v3 plus v4 scale/refresh; compiled only with fhe-aloha.
 //! Kept separate from session.rs because the legacy firmware embeds panic line
 //! numbers: any shared-file edit changes its image. Security/protocol fixes
 //! must be reviewed in both service implementations.
@@ -23,7 +23,9 @@ const BUFFER_WORDS: usize = 2048;
 const WORK_WORDS: usize = 8192;
 const PARAM_ID: u32 = 0xa108;
 const OPEN: u32 = 0x4648534f;
-const IDS: [u32; 5] = [0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343];
+const IDS: [u32; 6] = [
+    0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485246,
+];
 fn word(b: &[u8], i: usize) -> u32 {
     u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap())
 }
@@ -110,13 +112,13 @@ impl Request {
     pub fn parse(id: u32, b: &[u8]) -> CaliptraResult<Self> {
         let open = id == OPEN;
         let len = if open { 76 } else { 88 };
-        if b.len() < len || word(b, 1) != 3 {
+        if b.len() < len || !matches!(word(b, 1), 3 | 4) {
             return Err(INVALID);
         }
         let mut bytes = [0; 88];
         bytes[..len].copy_from_slice(&b[..len]);
         if open {
-            if b.len() != 76 {
+            if b.len() != 76 || word(b, 1) != 3 {
                 return Err(INVALID);
             }
             return Ok(Self {
@@ -130,7 +132,15 @@ impl Request {
             });
         }
         let op = word(b, 2);
-        if !(1..=5).contains(&op) || IDS[(op - 1) as usize] != id {
+        if !(1..=6).contains(&op) || IDS[(op - 1) as usize] != id {
+            return Err(INVALID);
+        }
+        // v3 remains byte-for-byte compatible. v4 adds an authenticated
+        // log2(scale) for refresh and decode; no general non-power-of-two scale.
+        let version = word(b, 1);
+        if (version == 3 && (op == 6 || word(b, 17) != 0))
+            || (version == 4 && (!matches!(op, 3 | 6) || !(1..=40).contains(&word(b, 17))))
+        {
             return Err(INVALID);
         }
         if op == 4 && !cfg!(feature = "ml-clear") {
@@ -140,19 +150,16 @@ impl Request {
             2 => (2048, BUFFER_WORDS * 4),
             3 => (BUFFER_WORDS * 4, 2048),
             4 => (196, 40),
+            6 => (4096, BUFFER_WORDS * 4),
             _ => (0, 0),
         };
         let mode = word(b, 10);
         let src = (u64::from(word(b, 12)) << 32) | u64::from(word(b, 11));
         let dst = (u64::from(word(b, 14)) << 32) | u64::from(word(b, 13));
-        if mode > 1
-            || word(b, 15) as usize != input
-            || word(b, 16) as usize != output
-            || word(b, 17) != 0
-        {
+        if mode > 1 || word(b, 15) as usize != input || word(b, 16) as usize != output {
             return Err(INVALID);
         }
-        // Word 17 is reserved zero and included in AAD.
+        // Word 17 is authenticated: reserved in v3, log2(scale) in v4.
         if mode == 0 {
             if src != 0 || dst != 0 || b.len() != len + input {
                 return Err(INVALID);
@@ -191,9 +198,9 @@ fn open(d: &mut Drivers, r: &Request, header: &mut [u8; 100]) -> CaliptraResult<
         return Err(INVALID);
     }
     let supported = if cfg!(feature = "ml-clear") {
-        0x1e
+        0x5e
     } else {
-        0x0e
+        0x4e
     };
     if word(&r.bytes, 2) & !supported != 0
         || word(&r.bytes, 4) != PARAM_ID
@@ -225,7 +232,13 @@ fn open(d: &mut Drivers, r: &Request, header: &mut [u8; 100]) -> CaliptraResult<
     caliptra_drivers::cprintln!("FHE PSK WIP: NO OPEN REPLAY PROTECTION");
     Ok(28)
 }
-fn kernel(d: &mut Drivers, op: u32, plain: &mut [u32], input: &mut [u32]) -> CaliptraResult<()> {
+fn kernel(
+    d: &mut Drivers,
+    op: u32,
+    log_scale: u32,
+    plain: &mut [u32],
+    input: &mut [u32],
+) -> CaliptraResult<()> {
     let keyed = d.fhe_session.keyed;
     match op {
         1 if keyed => Err(INVALID),
@@ -249,9 +262,10 @@ fn kernel(d: &mut Drivers, op: u32, plain: &mut [u32], input: &mut [u32]) -> Cal
             }
             Ok(())
         }
-        2 | 3 if !keyed => Err(INVALID),
+        2 | 3 | 6 if !keyed => Err(INVALID),
         2 => crate::fhe_aloha::encrypt(&mut d.trng, plain),
-        3 => crate::fhe_aloha::decrypt(plain, input),
+        3 => crate::fhe_aloha::decrypt_with_scale(plain, input, log_scale),
+        6 => crate::fhe_aloha::refresh(&mut d.trng, plain),
         // Op 5: erasure follows authenticated response generation. Parse
         // rejects op 4 without ml-clear.
         _ => Ok(()),
@@ -329,10 +343,15 @@ pub fn execute(d: &mut Drivers, r: Request) -> CaliptraResult<MboxStatusE> {
             }
             s.egress += 1;
         }
-        kernel(d, op, plain, input)?;
+        let log_scale = if word(&r.bytes, 1) == 4 {
+            word(&r.bytes, 17)
+        } else {
+            25
+        };
+        kernel(d, op, log_scale, plain, input)?;
         header[8..76].copy_from_slice(&r.bytes[4..72]);
         header[76..84].copy_from_slice(&cycles().wrapping_sub(start).to_le_bytes());
-        let source = if op == 2 {
+        let source = if op == 2 || op == 6 {
             plain.as_bytes()
         } else {
             input.as_bytes()

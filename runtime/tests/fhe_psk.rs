@@ -1,10 +1,16 @@
 // Licensed under the Apache-2.0 license
-//! Real RV32 runtime dispatch on the software SoC model; no RTL claims.
+//! RV32 runtime on the software SoC model; optional Aloha RTL RPC tests.
+//! These hybrid tests do not validate full-SoC RTL.
 #![cfg(not(any(
     feature = "verilator",
     feature = "fpga_realtime",
     feature = "fpga_subsystem"
 )))]
+// Exercise the same integer reconstruction source used by the Aloha backend.
+#[cfg(feature = "fhe-aloha")]
+#[path = "../src/fhe/recovery.rs"]
+mod coefficient_recovery;
+
 use caliptra_api::{mailbox::CommandId, SocManager};
 use caliptra_builder::{firmware, FwId, ImageOptions};
 use caliptra_hw_model::{BootParams, DefaultHwModel, Fuses, HwModel, InitParams};
@@ -128,7 +134,9 @@ fn words(w: &[u32]) -> Vec<u8> {
 fn word(b: &[u8], i: usize) -> u32 {
     u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap())
 }
-const IDS: [u32; 5] = [0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343];
+const IDS: [u32; 6] = [
+    0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485246,
+];
 /// Authenticated parameter-set ID of the Aloha N=256 profile.
 #[cfg(feature = "fhe-aloha")]
 const ALOHA_PROFILE: u32 = 0xa108;
@@ -139,6 +147,7 @@ struct User {
     policy: [u32; 5],
     rx: Vec<u8>,
     tx: Vec<u8>,
+    log_scale: Option<u32>,
 }
 impl User {
     fn opening(policy: [u32; 5]) -> Vec<u8> {
@@ -176,18 +185,33 @@ impl User {
             policy,
             rx,
             tx,
+            log_scale: None,
         }
     }
     fn packet(&self, op: u32, body: &[u8], pointer: bool) -> (Vec<u8>, Vec<u8>) {
         let output = match op {
             // P-S (profile 0) returns 4096 ciphertext bytes; Aloha returns 8192.
+            6 => 8192,
             2 if self.policy[2] != 0 => 8192,
             2 => 4096,
             3 => 2048,
             4 => 40,
             _ => 0,
         };
-        let mut h = words(&[0, 3, op, self.id, self.seq]);
+        let scale = if op == 6 {
+            Some(self.log_scale.unwrap_or(25))
+        } else if op == 3 {
+            self.log_scale
+        } else {
+            None
+        };
+        let mut h = words(&[
+            0,
+            if scale.is_some() { 4 } else { 3 },
+            op,
+            self.id,
+            self.seq,
+        ]);
         h.extend(words(&self.policy));
         h.extend(words(&[
             pointer as u32,
@@ -197,7 +221,7 @@ impl User {
             0,
             body.len() as u32,
             output,
-            0,
+            scale.unwrap_or(0),
         ]));
         let ct = crypto(
             "encrypt",
@@ -365,6 +389,8 @@ fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool) {
         cmd.arg("--full");
     }
     if mnist_data {
+        // Exercise the refresh client in both transport modes.
+        cmd.arg("--refresh");
         if let Some(path) = std::env::var_os("FHE_MNIST_DATA") {
             cmd.arg("--data-dir").arg(path);
         }
@@ -650,5 +676,100 @@ fn protected_aloha_bad_tag() {
     ct[3 * 2048..3 * 2048 + 8].copy_from_slice(&q1.to_le_bytes());
     let (h, body) = u.packet(3, &ct, false);
     u.reject(&mut m, 3, &h, &body);
+    assert!(m.runtime_stack_canary_used() < caliptra_common::memory_layout::STACK_SIZE as usize);
+}
+
+/// Real RV32 firmware + Aloha RTL: retain coefficients and scale while restoring
+/// the two-prime chain. AES/DMA/mailbox remain emulator models.
+#[test]
+#[cfg(feature = "fhe-aloha")]
+#[ignore = "requires FHE_ALOHA_RTL and FHE_ALOHA_RTL_CWD"]
+fn protected_aloha_level_refresh() {
+    let mut m = boot(&firmware::APP_FHE_ALOHA);
+    m.paint_runtime_stack_canary();
+    let values: Vec<f64> = (0..256)
+        .map(|i| {
+            if i % 2 == 1 {
+                0.0
+            } else {
+                (i as f64 - 128.0) / 64.0
+            }
+        })
+        .collect();
+    let pt: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let drop_to_q0 = |ct: &[u8]| [ct[..2048].to_vec(), ct[4096..6144].to_vec()].concat();
+    for pointer in [false, true] {
+        let mut u = User::open(&mut m, [0x4e, 8, ALOHA_PROFILE, 2, 0]);
+        u.call(&mut m, 1, &[], false);
+        let mut ct = u.call(&mut m, 2, &pt, pointer);
+        // A real numerical scale change: multiply the integer polynomial AND
+        // scale by two. Merely relabeling the metadata would change the value.
+        for (li, block) in ct.chunks_exact_mut(2048).enumerate() {
+            let q = coefficient_recovery::Q[li % 2];
+            for v in block.chunks_exact_mut(8) {
+                let x = u64::from_le_bytes(v.try_into().unwrap());
+                v.copy_from_slice(&((2 * x) % q).to_le_bytes());
+            }
+        }
+        let mut single = drop_to_q0(&ct);
+        u.log_scale = Some(26);
+        let (h, encrypted) = u.packet(6, &single, pointer);
+        let mut bad = h.clone();
+        // Authenticated exponent is bound to the GCM tag.
+        bad[68..72].copy_from_slice(&27u32.to_le_bytes());
+        if pointer {
+            m.soc_dram_mut().unwrap()[..encrypted.len()].copy_from_slice(&encrypted);
+        }
+        m.soc_dram_mut().unwrap()[0x10000..0x12000].fill(0xa5);
+        u.reject(&mut m, 6, &bad, if pointer { &[] } else { &encrypted });
+        assert!(m.soc_dram_mut().unwrap()[0x10000..0x12000]
+            .iter()
+            .all(|v| *v == 0xa5));
+        for invalid in [0, 41] {
+            u.log_scale = Some(invalid);
+            let (h, b) = u.packet(6, &single, false);
+            u.reject(&mut m, 6, &h, &b);
+        }
+        u.log_scale = Some(26);
+        let mut previous = Vec::new();
+        for iteration in 0..2 {
+            let refreshed = u.call(&mut m, 6, &single, pointer);
+            assert_eq!(refreshed.len(), 8192);
+            if iteration == 0 {
+                u.reject(&mut m, 6, &h, if pointer { &[] } else { &encrypted });
+            } else {
+                assert_ne!(
+                    &refreshed[4096..],
+                    &previous[4096..],
+                    "refresh repeated uniform a"
+                );
+            }
+            let decoded = u.call(&mut m, 3, &refreshed, pointer);
+            let max_error = decoded
+                .chunks_exact(8)
+                .zip(&values)
+                .map(|(b, v)| (f64::from_le_bytes(b.try_into().unwrap()) - v).abs())
+                .fold(0.0, f64::max);
+            assert!(
+                max_error < 0.001,
+                "refresh scale/precision mismatch: {max_error}"
+            );
+            println!("refresh pointer={pointer} iteration={iteration} log_scale=26 max_error={max_error}");
+            single = drop_to_q0(&refreshed);
+            previous = refreshed;
+        }
+        // An authenticated out-of-range source residue must never reach RTL.
+        single[..8].copy_from_slice(&coefficient_recovery::Q[0].to_le_bytes());
+        let (h, b) = u.packet(6, &single, false);
+        u.reject(&mut m, 6, &h, &b);
+        // Backend failure erases the session; the next iteration opens afresh.
+    }
+    // Refresh needs an explicit policy grant, even for an authenticated caller.
+    let mut u = User::open(&mut m, [0x0e, 8, ALOHA_PROFILE, 2, 0]);
+    u.call(&mut m, 1, &[], false);
+    let (h, b) = u.packet(6, &[0; 4096], false);
+    u.reject(&mut m, 6, &h, &b);
+    u.seq += 1; // Authenticated policy rejection consumes its sequence.
+    u.call(&mut m, 5, &[], false);
     assert!(m.runtime_stack_canary_used() < caliptra_common::memory_layout::STACK_SIZE as usize);
 }
