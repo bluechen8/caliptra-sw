@@ -20,11 +20,13 @@ use caliptra_api::mailbox::{
 };
 use caliptra_cfi_lib::{cfi_assert_eq_12_words, cfi_launder};
 use caliptra_drivers::{
-    sha2_512_384::Sha2DigestOpTrait, Array4x12, AxiAddr, Dma, Ecc384, Ecc384PubKey,
-    Ecc384Result, Ecc384Scalar, Ecc384Signature, Sha2_512_384, Sha2_512_384Acc, ShaAccLockState, SocIfc, Trng,
+    sha2_512_384::Sha2DigestOpTrait, Array4x12, AxiAddr, Dma, Ecc384, Ecc384PubKey, Ecc384Result,
+    Ecc384Scalar, Ecc384Signature, Sha2_512_384, Sha2_512_384Acc, ShaAccLockState, SocIfc, Trng,
 };
 #[cfg(not(feature = "no-mldsa"))]
-use caliptra_drivers::{Array4x16, LEArray4x16, Mldsa87, Mldsa87PubKey, Mldsa87Result, Mldsa87Signature};
+use caliptra_drivers::{
+    Array4x16, LEArray4x16, Mldsa87, Mldsa87PubKey, Mldsa87Result, Mldsa87Signature,
+};
 use caliptra_error::{CaliptraError, CaliptraResult};
 use memoffset::{offset_of, span_of};
 use zerocopy::IntoBytes;
@@ -85,13 +87,14 @@ pub fn create_debug_unlock_challenge(
     Ok(challenge_resp)
 }
 
-/// Common ECC-only debug unlock token validation logic
+/// Validates a production debug unlock token
 #[allow(clippy::too_many_arguments)]
-fn validate_debug_unlock_token_ecc(
+pub fn validate_debug_unlock_token(
     soc_ifc: &SocIfc,
     sha2_512_384: &mut Sha2_512_384,
     sha2_512_384_acc: &mut Sha2_512_384Acc,
     ecc384: &mut Ecc384,
+    #[cfg(not(feature = "no-mldsa"))] mldsa87: &mut Mldsa87,
     dma: &mut Dma,
     request: &ProductionAuthDebugUnlockReq,
     challenge: &ProductionAuthDebugUnlockChallenge,
@@ -196,67 +199,31 @@ fn validate_debug_unlock_token_ecc(
         Err(CaliptraError::SS_DBG_UNLOCK_PROD_INVALID_TOKEN_INVALID_SIGNATURE)?;
     }
 
-    Ok(())
-}
+    #[cfg(not(feature = "no-mldsa"))]
+    {
+        // Create MLDSA message hash
+        let mut digest_op = sha2_512_384.sha512_digest_init()?;
+        digest_op.update(&token.unique_device_identifier)?;
+        digest_op.update(&[token.unlock_level])?;
+        digest_op.update(&token.reserved)?;
+        digest_op.update(&token.challenge)?;
+        let mut mldsa_msg = Array4x16::default();
+        digest_op.finalize(&mut mldsa_msg)?;
 
-/// Validates a production debug unlock token (with MLDSA verification)
-#[cfg(not(feature = "no-mldsa"))]
-#[allow(clippy::too_many_arguments)]
-pub fn validate_debug_unlock_token(
-    soc_ifc: &SocIfc,
-    sha2_512_384: &mut Sha2_512_384,
-    sha2_512_384_acc: &mut Sha2_512_384Acc,
-    ecc384: &mut Ecc384,
-    mldsa87: &mut Mldsa87,
-    dma: &mut Dma,
-    request: &ProductionAuthDebugUnlockReq,
-    challenge: &ProductionAuthDebugUnlockChallenge,
-    token: &ProductionAuthDebugUnlockToken,
-) -> CaliptraResult<()> {
-    validate_debug_unlock_token_ecc(
-        soc_ifc, sha2_512_384, sha2_512_384_acc, ecc384, dma, request, challenge, token,
-    )?;
+        // Convert the digest to little endian format for MLDSA.
+        let mldsa_msg: LEArray4x16 = mldsa_msg.into();
 
-    // Create MLDSA message hash
-    let mut digest_op = sha2_512_384.sha512_digest_init()?;
-    digest_op.update(&token.unique_device_identifier)?;
-    digest_op.update(&[token.unlock_level])?;
-    digest_op.update(&token.reserved)?;
-    digest_op.update(&token.challenge)?;
-    let mut mldsa_msg = Array4x16::default();
-    digest_op.finalize(&mut mldsa_msg)?;
+        let result = mldsa87.verify(
+            &Mldsa87PubKey::from(&token.mldsa_public_key),
+            &mldsa_msg,
+            &Mldsa87Signature::from(&token.mldsa_signature),
+        )?;
 
-    // Convert the digest to little endian format for MLDSA.
-    let mldsa_msg: LEArray4x16 = mldsa_msg.into();
-
-    let result = mldsa87.verify(
-        &Mldsa87PubKey::from(&token.mldsa_public_key),
-        &mldsa_msg,
-        &Mldsa87Signature::from(&token.mldsa_signature),
-    )?;
-
-    if result == Mldsa87Result::SigVerifyFailed {
-        crate::cprintln!("MLDSA Signature verification failed");
-        Err(CaliptraError::SS_DBG_UNLOCK_PROD_INVALID_TOKEN_INVALID_SIGNATURE)?;
+        if result == Mldsa87Result::SigVerifyFailed {
+            crate::cprintln!("MLDSA Signature verification failed");
+            Err(CaliptraError::SS_DBG_UNLOCK_PROD_INVALID_TOKEN_INVALID_SIGNATURE)?;
+        }
     }
 
     Ok(())
-}
-
-/// Validates a production debug unlock token (ECC only, no MLDSA)
-#[cfg(feature = "no-mldsa")]
-#[allow(clippy::too_many_arguments)]
-pub fn validate_debug_unlock_token(
-    soc_ifc: &SocIfc,
-    sha2_512_384: &mut Sha2_512_384,
-    sha2_512_384_acc: &mut Sha2_512_384Acc,
-    ecc384: &mut Ecc384,
-    dma: &mut Dma,
-    request: &ProductionAuthDebugUnlockReq,
-    challenge: &ProductionAuthDebugUnlockChallenge,
-    token: &ProductionAuthDebugUnlockToken,
-) -> CaliptraResult<()> {
-    validate_debug_unlock_token_ecc(
-        soc_ifc, sha2_512_384, sha2_512_384_acc, ecc384, dma, request, challenge, token,
-    )
 }

@@ -102,10 +102,16 @@ pub fn generate_csr(env: &mut FmcEnv) -> CaliptraResult<()> {
 /// Generate FMC Alias CSRs (ECC, and MLDSA when available)
 // Inlined to reduce FMC size
 #[inline(always)]
+#[cfg(not(feature = "no-mldsa"))]
 pub fn make_csr(env: &mut FmcEnv, output: &DiceOutput) -> CaliptraResult<()> {
     make_ecc_csr(env, output)?;
-    #[cfg(not(feature = "no-mldsa"))]
-    make_mldsa_csr(env, output)?;
+    make_mldsa_csr(env, output)
+}
+
+#[cfg(feature = "no-mldsa")]
+#[inline(always)]
+pub fn make_csr(env: &mut FmcEnv, output: &DiceOutput) -> CaliptraResult<()> {
+    make_ecc_csr(env, output)?;
     Ok(())
 }
 
