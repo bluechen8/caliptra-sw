@@ -129,6 +129,11 @@ impl ModelEmulated {
         self.cpu.bus.bus.mailbox_sram.require_word_writes();
     }
 
+    /// Bound CPU direct SRAM accesses while testing DMA-only export commands.
+    pub fn limit_direct_mailbox_access(&mut self, bytes: Option<u32>) {
+        self.cpu.bus.bus.mailbox_sram.limit_direct_access(bytes);
+    }
+
     /// Read backing mailbox SRAM for emulator-only ownership/cleanup assertions.
     /// This is test instrumentation, not an exposed firmware or SoC interface.
     pub fn mailbox_sram_snapshot(&mut self, offset: usize, len: usize) -> Vec<u8> {

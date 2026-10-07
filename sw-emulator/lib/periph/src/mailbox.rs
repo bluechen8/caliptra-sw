@@ -58,12 +58,14 @@ type StatusRegister = LocalRegisterCopy<u32, Status::Register>;
 pub struct MailboxRam {
     ram: Rc<RefCell<AlignedRam>>,
     word_writes_only: bool,
+    direct_access_limit: Option<u32>,
 }
 
 impl MailboxRam {
     pub fn new() -> Self {
         Self {
             word_writes_only: false,
+            direct_access_limit: None,
             ram: Rc::new(RefCell::new(AlignedRam::new(vec![
                 0u8;
                 MAX_MAILBOX_CAPACITY_BYTES
@@ -75,6 +77,11 @@ impl MailboxRam {
 impl MailboxRam {
     /// Test guard for clients using direct SRAM: RTL has no byte write enables.
     /// Reject narrow writes instead of silently modeling byte-addressable RAM.
+    /// Test-only direct SRAM access boundary; FIFO register access is separate.
+    pub fn limit_direct_access(&mut self, bytes: Option<u32>) {
+        self.direct_access_limit = bytes;
+    }
+
     pub fn require_word_writes(&mut self) {
         self.word_writes_only = true;
     }
@@ -83,11 +90,17 @@ impl MailboxRam {
 impl Bus for MailboxRam {
     /// Read data of specified size from given address
     fn read(&mut self, size: RvSize, addr: RvAddr) -> Result<RvData, BusError> {
+        if self.direct_access_limit.is_some_and(|limit| addr.checked_add(size as u32).is_none_or(|end| end > limit)) {
+            return Err(BusError::LoadAccessFault);
+        }
         self.ram.borrow_mut().read(size, addr)
     }
 
     /// Write data of specified size to given address
     fn write(&mut self, size: RvSize, addr: RvAddr, val: RvData) -> Result<(), BusError> {
+        if self.direct_access_limit.is_some_and(|limit| addr.checked_add(size as u32).is_none_or(|end| end > limit)) {
+            return Err(BusError::StoreAccessFault);
+        }
         if self.word_writes_only && size != RvSize::Word {
             return Err(BusError::StoreAccessFault);
         }

@@ -12,6 +12,11 @@ use zeroize::{Zeroize, Zeroizing};
 mod model;
 #[cfg(any(feature = "fhe-debug", feature = "fhe-pl", feature = "fhe-pleq"))]
 compile_error!("fhe-psk supports P-S only and must not be combined with raw debug commands");
+#[cfg(all(
+    feature = "fhe-eval-keys",
+    any(feature = "ml-clear", feature = "fhe-aloha")
+))]
+compile_error!("evaluation-key profile excludes ml-clear and fhe-aloha");
 const INVALID: CaliptraError = CaliptraError::RUNTIME_MAILBOX_INVALID_PARAMS;
 #[cfg(feature = "fhe-psk")]
 const PSK: [u8; 32] = [
@@ -31,7 +36,9 @@ const REQUEST_LEN: usize = if OPEN_LEN > COMMAND_LEN {
     COMMAND_LEN
 };
 const OPEN: u32 = 0x4648534f;
-const IDS: [u32; 5] = [0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343];
+const IDS: [u32; 7] = [
+    0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485254, 0x4648524c,
+];
 fn word(b: &[u8], i: usize) -> u32 {
     u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap())
 }
@@ -51,6 +58,12 @@ fn policy_supported(r: &Request) -> bool {
     } else {
         0x0e
     };
+    let supported = supported
+        | if cfg!(feature = "fhe-eval-keys") {
+            0xc0
+        } else {
+            0
+        };
     word(&r.bytes, 2) & !supported == 0
         && word(&r.bytes, 4) == 0
         && word(&r.bytes, 5) == 2
@@ -163,38 +176,52 @@ impl Request {
             });
         }
         let op = word(b, 2);
-        if !(1..=5).contains(&op) || IDS[(op - 1) as usize] != id {
+        if !(1..=7).contains(&op) || IDS[(op - 1) as usize] != id {
             return Err(INVALID);
         }
-        if op == 4 && !cfg!(feature = "ml-clear") {
+        if (op == 4 && !cfg!(feature = "ml-clear")) || (op >= 6 && !cfg!(feature = "fhe-eval-keys"))
+        {
             return Err(INVALID);
         }
         let (input, output) = match op {
             2 => (2048, 4096),
             3 => (4096, 2048),
             4 => (196, 40),
+            6 | 7 => (0, 4096),
             _ => (0, 0),
         };
         let mode = word(b, 10);
         let src = (u64::from(word(b, 12)) << 32) | u64::from(word(b, 11));
         let dst = (u64::from(word(b, 14)) << 32) | u64::from(word(b, 13));
-        if mode > 1
-            || word(b, 15) as usize != input
-            || word(b, 16) as usize != output
-            || word(b, 17) != 0
-        {
+        let descriptor = word(b, 17);
+        if op >= 6 {
+            let g = descriptor >> 8;
+            if descriptor & 255 >= 16
+                || (op == 6 && (g <= 1 || g >= 512 || g & 1 == 0))
+                || (op == 7 && g != 0)
+                || mode != 1
+                || src != 0
+            {
+                return Err(INVALID);
+            }
+        } else if descriptor != 0 {
             return Err(INVALID);
         }
-        // Word 17 is reserved zero and included in AAD.
+        if mode > 1 || word(b, 15) as usize != input || word(b, 16) as usize != output {
+            return Err(INVALID);
+        }
+        // Word 17 binds evaluation-key Galois element/row, otherwise reserved zero.
         if mode == 0 {
             if src != 0 || dst != 0 || b.len() != len + input {
                 return Err(INVALID);
             }
         } else {
-            if input == 0 || b.len() != len {
+            if (input == 0 && op < 6) || b.len() != len {
                 return Err(INVALID);
             }
-            crate::fhe_transport::validate_range(src, input as u64).map_err(|_| INVALID)?;
+            if input != 0 {
+                crate::fhe_transport::validate_range(src, input as u64).map_err(|_| INVALID)?;
+            }
             crate::fhe_transport::validate_range(dst, output as u64).map_err(|_| INVALID)?;
             if src < dst + output as u64 && dst < src + input as u64 {
                 return Err(INVALID);
@@ -253,6 +280,7 @@ fn open(d: &mut Drivers, r: &Request, header: &mut [u8; HEADER_LEN]) -> Caliptra
 fn kernel(
     d: &mut Drivers,
     op: u32,
+    descriptor: u32,
     plain: &mut [u32],
     input: &mut [u32],
     scratch: &mut [u32],
@@ -290,14 +318,13 @@ fn kernel(
     if !s.keyed {
         return Err(INVALID);
     }
-    let (secret, rest) = scratch.split_at_mut(256);
-    let (tw, out) = rest.split_at_mut(256);
     for (li, p) in PS.primes.iter().enumerate() {
-        if plain[li * 256..(li + 1) * 256].iter().any(|&v| v >= p.q)
-            || (op == 3
-                && plain[(li + 2) * 256..(li + 3) * 256]
-                    .iter()
-                    .any(|&v| v >= p.q))
+        if op < 6
+            && (plain[li * 256..(li + 1) * 256].iter().any(|&v| v >= p.q)
+                || (op == 3
+                    && plain[(li + 2) * 256..(li + 3) * 256]
+                        .iter()
+                        .any(|&v| v >= p.q)))
         {
             return Err(INVALID);
         }
@@ -307,9 +334,26 @@ fn kernel(
     seed.copy_from_slice(&entropy.as_bytes()[..32]);
     let mut prg = ChaCha20Prg::new(&seed);
     let mut error = Zeroizing::new([0i8; 256]);
-    if op == 2 {
+    if op == 2 || op >= 6 {
         sample::sample_cbd(&mut prg, &mut error[..]);
     }
+    #[cfg(feature = "fhe-eval-keys")]
+    if op >= 6 {
+        return caliptra_fhe_core::evalkey::generate_row(
+            &s.secret,
+            if op == 6 { descriptor >> 8 } else { 0 },
+            (descriptor & 255) as usize,
+            &mut prg,
+            &error[..],
+            plain,
+            scratch,
+        )
+        .map_err(|_| INVALID);
+    }
+    #[cfg(not(feature = "fhe-eval-keys"))]
+    let _ = descriptor;
+    let (secret, rest) = scratch.split_at_mut(256);
+    let (tw, out) = rest.split_at_mut(256);
     for (li, p) in PS.primes.iter().enumerate() {
         ntt::gen_twiddles_fwd(256, p, tw).map_err(|_| INVALID)?;
         rlwe::secret_ntt_limb(&s.secret, p, tw, secret).map_err(|_| INVALID)?;
@@ -336,6 +380,19 @@ pub fn execute(d: &mut Drivers, r: Request) -> CaliptraResult<MboxStatusE> {
     let mut aes_output = Zeroizing::new([0u32; 1024]);
     // SAFETY: Packet is dropped, SoC command owns SRAM, no direct mailbox DMA.
     // 128 header bytes + 3*4096 payload bytes + 3072 scratch < 16 KiB.
+    #[cfg(feature = "fhe-eval-keys")]
+    let mut evaluation_work = Zeroizing::new([0u32; 4096]);
+    #[cfg(feature = "fhe-eval-keys")]
+    let evaluation = !r.open && word(&r.bytes, 2) >= 6;
+    #[cfg(not(feature = "fhe-eval-keys"))]
+    let evaluation = false;
+    #[cfg(feature = "fhe-eval-keys")]
+    let work = if evaluation {
+        &mut evaluation_work[..]
+    } else {
+        unsafe { core::slice::from_raw_parts_mut(MBOX_ORG as *mut u32, 4096) }
+    };
+    #[cfg(not(feature = "fhe-eval-keys"))]
     let work = unsafe { core::slice::from_raw_parts_mut(MBOX_ORG as *mut u32, 4096) };
     if !r.open && !r.pointer {
         work.copy_within(22..22 + r.input / 4, 32);
@@ -362,7 +419,7 @@ pub fn execute(d: &mut Drivers, r: Request) -> CaliptraResult<MboxStatusE> {
         let (input, rest) = work[32..].split_at_mut(1024);
         let (plain, rest) = rest.split_at_mut(1024);
         let (out, scratch) = rest.split_at_mut(1024);
-        if r.pointer {
+        if r.pointer && r.input != 0 {
             d.fhe_session
                 .transport
                 .with_fifo(&mut d.dma, |t| t.read(r.src, &mut input[..r.input / 4]))
@@ -395,7 +452,7 @@ pub fn execute(d: &mut Drivers, r: Request) -> CaliptraResult<MboxStatusE> {
         if op != 5 && word(&s.policy, 0) & (1 << op) == 0 {
             return Err(INVALID);
         }
-        if op == 3 || op == 4 {
+        if op == 3 || op == 4 || op >= 6 {
             if s.egress >= word(&s.policy, 1) {
                 return Err(INVALID);
             }
@@ -406,10 +463,10 @@ pub fn execute(d: &mut Drivers, r: Request) -> CaliptraResult<MboxStatusE> {
         if !s.keyed && op != 1 && op != 5 {
             return Err(INVALID);
         }
-        kernel(d, op, plain, input, &mut scratch[..768])?;
+        kernel(d, op, word(&r.bytes, 17), plain, input, &mut scratch[..768])?;
         header[8..76].copy_from_slice(&r.bytes[4..72]);
         header[76..84].copy_from_slice(&cycles().wrapping_sub(start).to_le_bytes());
-        let source = if op == 2 {
+        let source = if op == 2 || evaluation {
             plain.as_bytes()
         } else {
             input.as_bytes()

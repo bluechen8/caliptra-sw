@@ -39,6 +39,7 @@ FHE ?= 0
 FHE_DEBUG ?= 0
 FHE_PSK ?= 0
 FHE_ALOHA ?= 0
+FHE_EVAL_KEYS ?= 0
 ifeq ($(FHE_ALOHA),1)
 override FHE_PSK := 1
 endif
@@ -73,6 +74,16 @@ ifeq ($(FHE_PROTECTED),)
 $(error ML_CLEAR requires a protected FHE build)
 endif
 FHE_FEATURE := $(FHE_FEATURE),ml-clear
+endif
+
+ifeq ($(FHE_EVAL_KEYS),1)
+ifneq ($(FHE_PROTECTED),fhe-ecdh)
+$(error FHE_EVAL_KEYS requires the ECDH profile)
+endif
+ifeq ($(ML_CLEAR),1)
+$(error FHE_EVAL_KEYS excludes ML_CLEAR in the frozen runtime allocation)
+endif
+FHE_FEATURE := $(FHE_FEATURE),fhe-eval-keys
 endif
 
 comma := ,

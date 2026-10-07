@@ -16,8 +16,8 @@ Abstract:
     on VeeR (plan §3.2: the microcontroller may read *and* write mailbox SRAM
     while a SoC command is executing).
 
-    Scope, per plan §2.6: encrypt and decrypt only.  There are no homomorphic
-    operations here, no refresh, and no path that returns a decryption to the
+    Scope: encrypt/decrypt and evaluation-key generation. There are no
+    user-ciphertext evaluation operations here, no refresh, and no path that returns a decryption to the
     SoC in the clear -- that is the runtime's job, and only `FHE_EGRESS`
     (decrypt fused with AES-GCM to the user) may do it.
 
@@ -33,6 +33,8 @@ Abstract:
 
 /// Modular arithmetic mod q < 2^31, Montgomery form with R = 2^32.
 pub mod arith;
+/// Streamable rotation/relinearization evaluation-key generation.
+pub mod evalkey;
 /// Wrapped-blob header and the little-endian polynomial wire layout.
 pub mod format;
 /// Negacyclic NTT in the plan §4.1 layout.

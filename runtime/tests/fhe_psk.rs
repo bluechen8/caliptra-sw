@@ -366,6 +366,11 @@ fn protected_host_demo() {
 }
 
 #[test]
+fn evalkey_host_demo() {
+    run_host_demo(&firmware::APP_FHE_EVAL_KEYS, "evalkey_demo.py", false);
+}
+
+#[test]
 fn ecdh_host_demo() {
     run_host_demo(&firmware::APP_FHE_ECDH_ML_CLEAR, "protected_demo.py", false);
 }
@@ -439,7 +444,7 @@ fn run_host_demo_fixture(fwid: &'static FwId<'static>, script: &str, mnist_data:
     } else if !mnist_data {
         cmd.arg("--session").arg("psk");
     }
-    if std::env::var_os("FHE_FULL_DEMO").is_some() {
+    if std::env::var_os("FHE_FULL_DEMO").is_some() && !fwid.features.contains(&"fhe-eval-keys") {
         cmd.arg("--full");
     }
     if mnist_data {
@@ -485,8 +490,11 @@ fn run_host_demo_fixture(fwid: &'static FwId<'static>, script: &str, mnist_data:
         if ext > 0 {
             m.soc_dram_mut().unwrap()[..ext].copy_from_slice(&data[12 + len..]);
         }
+        let evaluation = id == 0x46485254 || id == 0x4648524c;
+        if evaluation { m.limit_direct_mailbox_access(Some(128)); }
         let result = send(&mut m, CommandId::from(id), h, &[]);
-        let outlen = if ext > 0 { word(h, 16) as usize } else { 0 };
+        if evaluation { m.limit_direct_mailbox_access(None); }
+        let outlen = if h.len() >= 88 && word(h, 10) == 1 { word(h, 16) as usize } else { 0 };
         let mut packet = words(&[result.len() as u32, outlen as u32]);
         packet.extend(result);
         if outlen > 0 {

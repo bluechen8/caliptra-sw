@@ -19,9 +19,8 @@ Abstract:
     runtime can drive it straight over mailbox SRAM without a copy and
     without ever materialising a whole ciphertext in DCCM.
 
-    There is no homomorphic operation here and no key generation beyond the
-    ternary secret: refresh, relinearization and evaluation all live on the
-    untrusted server (plan §2.6).
+    Evaluation-key generation is in evalkey.rs. Ciphertext evaluation, including
+    rotation and relinearization using exported keys, runs on the untrusted server.
 
 --*/
 

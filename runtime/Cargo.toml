@@ -94,6 +94,8 @@ fhe = ["dep:caliptra-fhe-core"]
 fhe-debug = ["fhe"]
 fhe-psk = ["fhe"]
 fhe-ecdh = ["fhe"]
+# DCCM-only evaluation-key generation and FIFO DMA export; P-S ECDH only.
+fhe-eval-keys = ["fhe-ecdh"]
 # N=256 hardware client with private AHB stream; distinct authenticated profile.
 fhe-aloha = ["fhe-psk"]
 # Reference classifier for comparing clear and encrypted inference; off by default.

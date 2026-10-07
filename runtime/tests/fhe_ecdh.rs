@@ -208,3 +208,103 @@ fn ecdh_warm_reset_erases_slots() {
     fresh.call(&mut m, 5, &[], false);
     erased(&mut m);
 }
+
+const ROTATE_KEY: u32 = 0x46485254;
+const RELIN_KEY: u32 = 0x4648524c;
+fn eval_request(u: &User, op: u32, descriptor: u32, dst: u64) -> Vec<u8> {
+    let mut h = words(&[0, 4, op, u.id, u.seq]);
+    h.extend(words(&u.policy));
+    h.extend(words(&[
+        1,
+        0,
+        0,
+        dst as u32,
+        (dst >> 32) as u32,
+        0,
+        4096,
+        descriptor,
+    ]));
+    let tag = crypto("encrypt", &u.rx, &[], &h[4..], &words(&[0, u.seq, 0]));
+    h.extend(tag);
+    h
+}
+fn reject_eval(m: &mut DefaultHwModel, id: u32, h: &[u8]) {
+    assert!(m.mailbox_execute(id, &wire(id, h, &[])).is_err());
+}
+
+#[test]
+fn evaluation_key_security_and_dma() {
+    let mut m = boot(&firmware::APP_FHE_EVAL_KEYS);
+    let mut u = open(&mut m, [0xce, 2, 0, 2, 0]);
+    // Authenticated generation before keygen is rejected, and counts the attempt.
+    reject_eval(&mut m, ROTATE_KEY, &eval_request(&u, 6, 5 << 8, 0x80010000));
+    u.seq += 1;
+    u.call(&mut m, 1, &[], false);
+    let request = eval_request(&u, 6, 5 << 8, 0x80010000);
+    let mut bad = request.clone();
+    bad[72] ^= 1;
+    reject_eval(&mut m, ROTATE_KEY, &bad);
+    for offset in [8usize, 20, 52, 68] {
+        // operation, policy, address, descriptor
+        let mut bad = request.clone();
+        bad[offset] ^= 1;
+        reject_eval(&mut m, ROTATE_KEY, &bad);
+    }
+    for dst in [u64::MAX - 3, 0x1_8000_0000 - 4, 0x1_0000_8001_0000] {
+        reject_eval(&mut m, ROTATE_KEY, &eval_request(&u, 6, 5 << 8, dst));
+    }
+    for descriptor in [16, 2 << 8, 512 << 8] {
+        reject_eval(
+            &mut m,
+            ROTATE_KEY,
+            &eval_request(&u, 6, descriptor, 0x80010000),
+        );
+    }
+    m.limit_direct_mailbox_access(Some(128));
+    let response = send(&mut m, ROTATE_KEY.into(), &request, &[]);
+    m.limit_direct_mailbox_access(None);
+    assert_eq!(response.len(), 100);
+    let mut wrapped = m.soc_dram_mut().unwrap()[0x10000..0x11000].to_vec();
+    wrapped.extend_from_slice(&response[84..100]);
+    assert_eq!(
+        crypto(
+            "decrypt",
+            &u.tx,
+            &wrapped,
+            &response[8..84],
+            &words(&[1, u.seq, 0])
+        )
+        .len(),
+        4096
+    );
+    u.seq += 1;
+    reject_eval(&mut m, ROTATE_KEY, &request); // replay
+    let h = eval_request(&u, 7, 0, 0x80010000);
+    reject_eval(&mut m, RELIN_KEY, &h); // quota: pre-keygen attempt + successful row
+    u.seq += 1;
+    u.call(&mut m, 5, &[], false);
+    erased(&mut m);
+    let mut v = open(&mut m, [0x0e, 8, 0, 2, 0]);
+    v.call(&mut m, 1, &[], false);
+    reject_eval(&mut m, RELIN_KEY, &eval_request(&v, 7, 0, 0x80010000)); // policy
+    v.seq += 1;
+    v.call(&mut m, 5, &[], false);
+    let mut v = open(&mut m, [0xce, 8, 0, 2, 0]);
+    v.call(&mut m, 1, &[], false);
+    let end = m.soc_dram_mut().unwrap().len();
+    let h = eval_request(&v, 7, 0, 0x80000000 + end as u64 - 4);
+    reject_eval(&mut m, RELIN_KEY, &h); // partial DMA write must poison permanently
+    erased(&mut m);
+    reject_open(&mut m, &v.open_request);
+    reject_eval(&mut m, RELIN_KEY, &h);
+}
+
+#[test]
+fn evaluation_keys_are_gated() {
+    let mut m = boot(&firmware::APP_FHE_ECDH);
+    reject_open(&mut m, &opening([0xce, 8, 0, 2, 0]));
+    let mut u = open(&mut m, [0x0e, 8, 0, 2, 0]);
+    u.call(&mut m, 1, &[], false);
+    reject_eval(&mut m, RELIN_KEY, &eval_request(&u, 7, 0, 0x80010000));
+    u.call(&mut m, 5, &[], false);
+}

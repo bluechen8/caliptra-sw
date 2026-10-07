@@ -170,6 +170,11 @@ pub const APP_FHE_ECDH: FwId = FwId {
     features: &["emu", "no-mldsa", "fhe-ecdh"],
     ..APP_FHE_PSK
 };
+pub const APP_FHE_EVAL_KEYS: FwId = FwId {
+    features: &["emu", "no-mldsa", "fhe-ecdh", "fhe-eval-keys"],
+    ..APP_FHE_PSK
+};
+
 pub const APP_FHE_ECDH_ML_CLEAR: FwId = FwId {
     features: &["emu", "no-mldsa", "fhe-ecdh", "ml-clear"],
     ..APP_FHE_PSK
@@ -596,6 +601,7 @@ pub const REGISTERED_FW: &[&FwId] = &[
     &APP_FHE,
     &APP_FHE_PSK,
     &APP_FHE_ECDH,
+    &APP_FHE_EVAL_KEYS,
     &APP_FHE_ECDH_ML_CLEAR,
     #[cfg(feature = "fhe-aloha")]
     &APP_FHE_ALOHA,
