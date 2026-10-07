@@ -24,8 +24,31 @@ mod disable;
 mod dpe_crypto;
 mod dpe_platform;
 mod drivers;
-#[cfg(all(feature = "fhe-ecdh", feature = "fhe-psk"))]
-compile_error!("fhe-ecdh and fhe-psk (including fhe-aloha) are mutually exclusive");
+// Protected session profiles: exactly one of fhe-ecdh, fhe-test-key, fhe-aloha.
+#[cfg(all(feature = "fhe-ecdh", feature = "fhe-test-key"))]
+compile_error!("fhe-ecdh and fhe-test-key are mutually exclusive");
+#[cfg(all(
+    feature = "fhe-session",
+    not(any(feature = "fhe-ecdh", feature = "fhe-test-key", feature = "fhe-aloha"))
+))]
+compile_error!("fhe-session requires fhe-ecdh, fhe-test-key or fhe-aloha");
+#[cfg(all(
+    feature = "fhe-session",
+    any(feature = "fhe-debug", feature = "fhe-pl", feature = "fhe-pleq")
+))]
+compile_error!("protected FHE supports P-S only and must not be combined with raw debug commands");
+#[cfg(all(feature = "fhe-eval-keys", feature = "ml-clear"))]
+compile_error!("evaluation-key profile excludes ml-clear in the frozen runtime allocation");
+#[cfg(all(
+    feature = "fhe-aloha",
+    any(feature = "fhe-ecdh", feature = "fhe-test-key")
+))]
+compile_error!("fhe-aloha is a separate session profile");
+#[cfg(all(
+    feature = "fhe-eval-keys",
+    not(any(feature = "fhe-ecdh", feature = "fhe-test-key"))
+))]
+compile_error!("fhe-eval-keys requires protocol v5 (fhe-ecdh or fhe-test-key)");
 mod fe_programming;
 #[cfg(feature = "fhe-aloha")]
 #[path = "fhe/aloha.rs"]
@@ -33,7 +56,7 @@ mod fhe_aloha;
 #[cfg(feature = "fhe-debug")]
 #[path = "fhe/client.rs"]
 mod fhe_client;
-#[cfg(any(feature = "fhe-psk", feature = "fhe-ecdh"))]
+#[cfg(feature = "fhe-session")]
 #[cfg_attr(not(feature = "fhe-aloha"), path = "fhe/session.rs")]
 #[cfg_attr(feature = "fhe-aloha", path = "fhe/session_aloha.rs")]
 mod fhe_session;
@@ -267,7 +290,7 @@ fn handle_command(drivers: &mut Drivers) -> CaliptraResult<MboxStatusE> {
         return fhe_client::raw(drivers, request);
     }
 
-    #[cfg(any(feature = "fhe-psk", feature = "fhe-ecdh"))]
+    #[cfg(feature = "fhe-session")]
     if fhe_session::handles(req_packet.cmd) {
         let request = fhe_session::Request::parse(req_packet.cmd, cmd_bytes)?;
         drop(req_packet);

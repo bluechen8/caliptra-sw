@@ -1,11 +1,12 @@
 // Licensed under the Apache-2.0 license
-//! Device-only attested P-384 session establishment. No caller authorization.
-use super::{nonce, policy_supported, put, Request, HEADER_LEN, INVALID};
+//! Device-only attested P-384 session open (the `fhe-ecdh` profile). No caller
+//! authorization.
+use super::{nonce, put, Request, HEADER_LEN, INVALID};
 use crate::Drivers;
 use caliptra_drivers::sha2_512_384::Sha2DigestOpTrait;
 use caliptra_drivers::{
     hmac_kdf, AesKey, Array4x12, CaliptraResult, Ecc384PubKey, HmacMode, KeyId, KeyReadArgs,
-    KeyUsage, KeyVault, KeyWriteArgs,
+    KeyUsage, KeyWriteArgs,
 };
 use zeroize::Zeroizing;
 
@@ -13,18 +14,30 @@ use zeroize::Zeroizing;
 // to this feature; no user handle or mailbox command exposes them.
 const PRIVATE: KeyId = KeyId::KeyId13;
 const SHARED: KeyId = KeyId::KeyId14;
-pub(super) const REQUEST_KEY: KeyId = KeyId::KeyId15;
-pub(super) const RESPONSE_KEY: KeyId = KeyId::KeyId16;
-const DOMAIN: &[u8] = b"Caliptra FHE ECDH v4";
+const REQUEST_KEY: KeyId = KeyId::KeyId15;
+const RESPONSE_KEY: KeyId = KeyId::KeyId16;
+const DOMAIN: &[u8] = b"Caliptra FHE ECDH v5";
 
+pub(super) fn session_key(response: bool) -> AesKey<'static> {
+    AesKey::KV(KeyReadArgs::new(if response {
+        RESPONSE_KEY
+    } else {
+        REQUEST_KEY
+    }))
+}
+
+/// Erase every session slot; a failure latches the service unavailable.
 #[inline(never)]
-pub(super) fn erase_keys(kv: &mut KeyVault) -> CaliptraResult<()> {
+pub(super) fn erase_keys(d: &mut Drivers) -> CaliptraResult<()> {
     // Try every slot even when an earlier erase fails.
     let mut result = Ok(());
     for id in [PRIVATE, SHARED, REQUEST_KEY, RESPONSE_KEY] {
-        if let Err(e) = kv.erase_key(id) {
+        if let Err(e) = d.key_vault.erase_key(id) {
             result = Err(e);
         }
+    }
+    if result.is_err() {
+        d.fhe_session.crypto_failed = true;
     }
     result
 }
@@ -35,7 +48,7 @@ pub(super) fn open(
     header: &mut [u8; HEADER_LEN],
 ) -> CaliptraResult<usize> {
     let s = &d.fhe_session;
-    if s.active || s.crypto_failed || s.transport.is_poisoned() || !policy_supported(r) {
+    if s.active || s.crypto_failed || s.transport.is_poisoned() {
         return Err(INVALID);
     }
     let id = s.id.checked_add(1).ok_or(INVALID)?;
@@ -56,7 +69,6 @@ pub(super) fn open(
         private?;
         shared?;
     }
-    d.fhe_session.policy.copy_from_slice(&r.bytes[8..28]);
     d.fhe_session.active = true;
     Ok(HEADER_LEN)
 }
@@ -76,8 +88,8 @@ fn establish(
         KeyWriteArgs::new(PRIVATE, KeyUsage::default().set_ecc_private_key_en()).into(),
     )?;
     let client = Ecc384PubKey {
-        x: Array4x12::from(<[u8; 48]>::try_from(&r.bytes[60..108]).unwrap()),
-        y: Array4x12::from(<[u8; 48]>::try_from(&r.bytes[108..156]).unwrap()),
+        x: Array4x12::from(<[u8; 48]>::try_from(&r.bytes[40..88]).unwrap()),
+        y: Array4x12::from(<[u8; 48]>::try_from(&r.bytes[88..136]).unwrap()),
     };
     d.ecc384.ecdh(
         KeyReadArgs::new(PRIVATE).into(),
@@ -93,7 +105,7 @@ fn establish(
     header[108..156].copy_from_slice(&cert_hash);
     let mut transcript = d.sha2_512_384.sha384_digest_init()?;
     transcript.update(DOMAIN)?;
-    transcript.update(&r.bytes[4..156])?;
+    transcript.update(&r.bytes[4..136])?;
     transcript.update(&header[8..156])?;
     let mut hash = Array4x12::default();
     transcript.finalize(&mut hash)?;
@@ -111,8 +123,8 @@ fn establish(
     context[..48].copy_from_slice(&<[u8; 48]>::from(hash));
     context[48..].copy_from_slice(&256u32.to_be_bytes());
     for (slot, label) in [
-        (REQUEST_KEY, b"FHE-v4-request".as_slice()),
-        (RESPONSE_KEY, b"FHE-v4-response".as_slice()),
+        (REQUEST_KEY, b"FHE-v5-request".as_slice()),
+        (RESPONSE_KEY, b"FHE-v5-response".as_slice()),
     ] {
         hmac_kdf(
             &mut d.hmac,

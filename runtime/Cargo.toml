@@ -92,12 +92,16 @@ verilator = ["caliptra-hw-model/verilator"]
 fips_self_test = []
 fhe = ["dep:caliptra-fhe-core"]
 fhe-debug = ["fhe"]
-fhe-psk = ["fhe"]
-fhe-ecdh = ["fhe"]
-# DCCM-only evaluation-key generation and FIFO DMA export; P-S ECDH only.
-fhe-eval-keys = ["fhe-ecdh"]
+# One resident protected session; exactly one session profile below.
+fhe-session = ["fhe"]
+# Protocol v5 with device-attested ECDH open.
+fhe-ecdh = ["fhe-session"]
+# Protocol v5 with fixed public test keys; debug-unlocked fake-ROM runs only.
+fhe-test-key = ["fhe-session"]
+# DCCM-only evaluation-key generation and FIFO DMA export; protocol v5 only.
+fhe-eval-keys = ["fhe"]
 # N=256 hardware client with private AHB stream; distinct authenticated profile.
-fhe-aloha = ["fhe-psk"]
+fhe-aloha = ["fhe-session"]
 # Reference classifier for comparing clear and encrypted inference; off by default.
 ml-clear = ["caliptra-api/ml-clear"]
 fhe-pl = ["fhe"]

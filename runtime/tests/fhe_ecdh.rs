@@ -1,7 +1,8 @@
 // Licensed under the Apache-2.0 license
-//! Actual runtime-command negative/lifetime coverage. The separate Python host
-//! demo verifies the DICE chain and trusted measurement. This command harness
-//! deliberately reuses a fixed client private key/nonce to test device freshness.
+//! Protocol v5 with the attested ECDH open, and evaluation-key rows. The
+//! Python host demo verifies the DICE chain and trusted measurement. This
+//! harness deliberately reuses a fixed client private key/nonce to test device
+//! freshness.
 use super::*;
 
 fn python(script: &str, args: &[String]) -> Vec<u8> {
@@ -14,17 +15,11 @@ fn python(script: &str, args: &[String]) -> Vec<u8> {
 }
 /// Public key (x||y) of the fixed client scalar 1: the P-384 base point G.
 const CLIENT_PUBLIC: &str = "aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab73617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f";
-fn opening(policy: [u32; 5]) -> Vec<u8> {
-    [
-        words(&[0, 4]),
-        words(&policy),
-        vec![0x36; 32],
-        unhex(CLIENT_PUBLIC),
-    ]
-    .concat()
+fn opening() -> Vec<u8> {
+    [words(&[0, 5]), vec![0x36; 32], unhex(CLIENT_PUBLIC)].concat()
 }
-fn open(m: &mut DefaultHwModel, policy: [u32; 5]) -> User {
-    let request = opening(policy);
+fn open(m: &mut DefaultHwModel) -> Client {
+    let request = opening();
     let response = send(m, CommandId::FHE_SESSION_OPEN, &request, &[]);
     assert_eq!(response.len(), 268);
     let keys = python(
@@ -33,12 +28,12 @@ import sys, hashlib, hmac, struct
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 request, response = map(bytes.fromhex, sys.argv[1:])
-digest = hashlib.sha384(b'Caliptra FHE ECDH v4' + request[4:] + response[8:156]).digest()
+digest = hashlib.sha384(b'Caliptra FHE ECDH v5' + request[4:] + response[8:156]).digest()
 peer = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP384R1(), b'\x04' + response[12:108])
 z = ec.derive_private_key(1, ec.SECP384R1()).exchange(ec.ECDH(), peer)
 def k(label):
     return hmac.new(z, b'\0\0\0\1' + label + b'\0' + digest + struct.pack('>I',256), hashlib.sha384).digest()[:32]
-rx, tx = k(b'FHE-v4-request'), k(b'FHE-v4-response')
+rx, tx = k(b'FHE-v5-request'), k(b'FHE-v5-response')
 AESGCM(tx).decrypt(struct.pack('<IQ',1,0),response[252:],digest)
 print((rx+tx).hex())
 "#,
@@ -48,263 +43,175 @@ print((rx+tx).hex())
     assert_eq!(m.key_vault_usage(14), 0);
     assert_eq!(m.key_vault_usage(15), 1 << 5);
     assert_eq!(m.key_vault_usage(16), 1 << 5);
-    User {
-        version: 4,
-        open_request: request,
-        id: word(&response, 2),
-        seq: 1,
-        policy,
-        rx: keys[..32].to_vec(),
-        tx: keys[32..].to_vec(),
-    }
+    Client::new(
+        request,
+        word(&response, 2),
+        keys[..32].to_vec(),
+        keys[32..].to_vec(),
+    )
 }
 fn erased(m: &mut DefaultHwModel) {
     for slot in 13..=16 {
         assert_eq!(m.key_vault_usage(slot), 0, "slot {slot} retained");
     }
 }
-fn reject_open(m: &mut DefaultHwModel, request: &[u8]) {
-    let id = CommandId::FHE_SESSION_OPEN.into();
-    assert!(m.mailbox_execute(id, &wire(id, request, &[])).is_err());
-}
 
 #[test]
-fn ecdh_control_lifetime_and_freshness() {
-    let mut m = boot(&firmware::APP_FHE_ECDH_ML_CLEAR);
-    m.paint_runtime_stack_canary();
-    let policy = [0x1e, 2, 0, 2, 0];
-    let mut u = open(&mut m, policy);
-    reject_open(&mut m, &u.open_request); // pending/live cannot be replaced
-    let (h, ct) = u.packet(4, &[0; 196], false);
-    u.reject(&mut m, 4, &h, &ct); // no clear reference before keygen confirmation
-    u.seq += 1; // authenticated failure consumes sequence and one egress
-    let (h, ct) = u.packet(1, &[], false);
-    let mut bad = h.clone();
-    bad[72] ^= 1;
-    u.reject(&mut m, 1, &bad, &ct);
-    u.call(&mut m, 1, &[], false);
-    u.reject(&mut m, 1, &h, &ct); // replay
-    u.call(&mut m, 4, &[0; 196], false);
-    let (h, ct) = u.packet(4, &[0; 196], false);
-    u.reject(&mut m, 4, &h, &ct); // quota
-    u.seq += 1;
-    let old_close = u.packet(5, &[], false);
-    u.call(&mut m, 5, &[], false);
-    erased(&mut m);
-    let mut v = open(&mut m, policy);
-    assert_eq!(u.open_request, v.open_request); // device, not caller, supplies freshness
-    assert_ne!(u.rx, v.rx);
-    assert_ne!(u.tx, v.tx);
-    v.reject(&mut m, 5, &old_close.0, &old_close.1);
-    let seq = v.seq;
-    v.seq = u32::MAX;
-    let (h, ct) = v.packet(5, &[], false);
-    v.reject(&mut m, 5, &h, &ct);
-    v.seq = seq;
-    v.call(&mut m, 5, &[], false);
-    erased(&mut m);
-    println!("ECDH stack extent {}", m.runtime_stack_canary_used());
-    assert!(m.runtime_stack_canary_used() < caliptra_common::memory_layout::STACK_SIZE as usize);
-    // Fresh cold boot repeats session ID 1, but not communication keys. An old
-    // keygen with matching ID/seq/policy still must fail authentication.
-    let mut m = boot(&firmware::APP_FHE_ECDH_ML_CLEAR);
-    let mut fresh = open(&mut m, policy);
-    assert_eq!(u.id, fresh.id);
-    assert_ne!(u.rx, fresh.rx);
-    u.seq = 1;
-    let (h, ct) = u.packet(1, &[], false);
-    fresh.reject(&mut m, 1, &h, &ct);
-    fresh.call(&mut m, 1, &[], false);
-    fresh.call(&mut m, 5, &[], false);
-    erased(&mut m);
+fn ecdh_flow_and_lifecycle() {
+    flow_and_lifecycle(&firmware::APP_FHE_ECDH_ML_CLEAR, open);
 }
-
 #[test]
-fn ecdh_bad_points_and_policy() {
-    let mut m = boot(&firmware::APP_FHE_ECDH_ML_CLEAR);
-    let original = opening([0x1e, 4, 0, 2, 0]);
-    for offset in [4, 8, 16, 20, 24] {
-        let mut bad = original.clone();
-        bad[offset] ^= 0x80;
-        reject_open(&mut m, &bad);
-        erased(&mut m);
-    }
-    for point in [vec![0; 96], vec![0xff; 96]] {
-        let mut bad = original.clone();
-        bad[60..].copy_from_slice(&point);
-        reject_open(&mut m, &bad);
-        erased(&mut m);
-        assert_eq!(m.soc_ifc().cptra_fw_error_fatal().read(), 0);
-    }
-    let mut u = open(&mut m, [0x1e, 4, 0, 2, 0]);
-    u.call(&mut m, 1, &[], false);
-    let pt = include_bytes!("../../fhe-core/tests/vectors/ps/pt.bin");
-    let (h, ct) = u.packet(2, pt, false);
-    for offset in [
-        12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 87,
-    ] {
-        let mut bad = h.clone();
-        bad[offset] ^= 1;
-        u.reject(&mut m, 2, &bad, &ct);
-    }
-    let mut bad = ct.clone();
-    bad[3] ^= 1;
-    u.reject(&mut m, 2, &h, &bad);
-    assert!(m
-        .mailbox_sram_snapshot(128, 16384 - 128)
-        .iter()
-        .all(|&v| v == 0));
-    u.call(&mut m, 2, pt, false);
-    u.call(&mut m, 5, &[], false);
-    erased(&mut m);
+fn ecdh_validation() {
+    validation(&firmware::APP_FHE_ECDH_ML_CLEAR, open);
 }
-
 #[test]
-fn ecdh_dma_failure_poison_and_cleanup() {
-    let mut m = boot(&firmware::APP_FHE_ECDH_ML_CLEAR);
-    let mut u = open(&mut m, [0x1e, 4, 0, 2, 0]);
-    dma_poison(&mut m, &mut u, erased);
+fn ecdh_failed_write_and_poison() {
+    failed_write_and_poison(&firmware::APP_FHE_ECDH_ML_CLEAR, open);
 }
-
+#[test]
+fn ecdh_read_poison() {
+    read_poison(&firmware::APP_FHE_ECDH_ML_CLEAR, open);
+}
 #[test]
 fn ecdh_snapshot_and_cleanup() {
     snapshot_and_cleanup(&firmware::APP_FHE_ECDH_ML_CLEAR, open);
 }
+
+/// The device, not the caller, supplies freshness; close and resets erase
+/// every key slot, and old blobs never authenticate in a new session.
 #[test]
-fn ecdh_failed_egress_write() {
-    failed_egress_write(&firmware::APP_FHE_ECDH_ML_CLEAR, open);
-}
-#[test]
-fn ecdh_without_clear_reference() {
-    let mut m = boot(&firmware::APP_FHE_ECDH);
-    reject_open(&mut m, &opening([0x1e, 4, 0, 2, 0]));
-    let mut u = open(&mut m, [0x0e, 4, 0, 2, 0]);
-    let (h, ct) = u.packet(4, &[0; 196], false);
-    u.reject(&mut m, 4, &h, &ct);
+fn ecdh_freshness_and_key_erasure() {
+    let mut m = boot(&firmware::APP_FHE_ECDH_ML_CLEAR);
+    let mut u = open(&mut m);
     u.call(&mut m, 1, &[], false);
-    let pt = include_bytes!("../../fhe-core/tests/vectors/ps/pt.bin");
-    let ct = u.call(&mut m, 2, pt, false);
-    let dec = u.call(&mut m, 3, &ct, false);
-    assert_ps_close(&dec, pt);
+    let old = u.seal(2, PT);
     u.call(&mut m, 5, &[], false);
     erased(&mut m);
-}
-
-#[test]
-fn ecdh_warm_reset_erases_slots() {
-    let mut m = boot(&firmware::APP_FHE_ECDH_ML_CLEAR);
-    let mut old = open(&mut m, [0x1e, 4, 0, 2, 0]);
-    old.call(&mut m, 1, &[], false);
+    let mut v = open(&mut m);
+    assert_eq!(u.open_request, v.open_request);
+    assert_ne!(u.rx, v.rx);
+    assert_ne!(u.tx, v.tx);
+    v.call(&mut m, 1, &[], false);
+    let mut forged = old.clone();
+    forged[4..8].copy_from_slice(&v.id.to_le_bytes()); // current ID, old keys
+    v.reject(&mut m, 2, &command(v.id, 2, false, 0), &forged);
+    v.call(&mut m, 5, &[], false);
+    erased(&mut m);
+    // Warm reset erases a live session; the same request then yields new keys.
+    let mut w = open(&mut m);
+    w.call(&mut m, 1, &[], false);
     m.warm_reset_flow().unwrap();
     wait_runtime_ready(&mut m);
     erased(&mut m);
-    let mut fresh = open(&mut m, old.policy);
-    assert_eq!(old.id, fresh.id);
-    assert_ne!(old.rx, fresh.rx);
-    old.seq = 1;
-    let (h, ct) = old.packet(1, &[], false);
-    fresh.reject(&mut m, 1, &h, &ct);
-    fresh.call(&mut m, 1, &[], false);
-    fresh.call(&mut m, 5, &[], false);
+    let fresh = open(&mut m);
+    assert_ne!(w.rx, fresh.rx);
+    // A cold boot repeats session ID 1, but not communication keys.
+    let mut m = boot(&firmware::APP_FHE_ECDH_ML_CLEAR);
+    let mut cold = open(&mut m);
+    assert_eq!(cold.id, u.id);
+    assert_ne!(cold.rx, u.rx);
+    cold.call(&mut m, 1, &[], false);
+    cold.reject(&mut m, 2, &command(cold.id, 2, false, 0), &old);
+    cold.call(&mut m, 5, &[], false);
     erased(&mut m);
-}
-
-const ROTATE_KEY: u32 = 0x46485254;
-const RELIN_KEY: u32 = 0x4648524c;
-fn eval_request(u: &User, op: u32, descriptor: u32, dst: u64) -> Vec<u8> {
-    let mut h = words(&[0, 4, op, u.id, u.seq]);
-    h.extend(words(&u.policy));
-    h.extend(words(&[
-        1,
-        0,
-        0,
-        dst as u32,
-        (dst >> 32) as u32,
-        0,
-        4096,
-        descriptor,
-    ]));
-    let tag = crypto("encrypt", &u.rx, &[], &h[4..], &words(&[0, u.seq, 0]));
-    h.extend(tag);
-    h
-}
-fn reject_eval(m: &mut DefaultHwModel, id: u32, h: &[u8]) {
-    assert!(m.mailbox_execute(id, &wire(id, h, &[])).is_err());
 }
 
 #[test]
-fn evaluation_key_security_and_dma() {
-    let mut m = boot(&firmware::APP_FHE_EVAL_KEYS);
-    let mut u = open(&mut m, [0xce, 2, 0, 2, 0]);
-    // Authenticated generation before keygen is rejected, and counts the attempt.
-    reject_eval(&mut m, ROTATE_KEY, &eval_request(&u, 6, 5 << 8, 0x80010000));
-    u.seq += 1;
+fn ecdh_bad_open() {
+    let mut m = boot(&firmware::APP_FHE_ECDH_ML_CLEAR);
+    let original = opening();
+    let mut bad = original.clone();
+    bad[4] ^= 0x80; // version
+    reject_open(&mut m, &bad);
+    reject_open(&mut m, &original[..original.len() - 4]);
+    for point in [vec![0; 96], vec![0xff; 96]] {
+        let mut bad = original.clone();
+        bad[40..].copy_from_slice(&point);
+        reject_open(&mut m, &bad);
+        erased(&mut m);
+        assert_eq!(m.soc_ifc().cptra_fw_error_fatal().read(), 0);
+    }
+    let mut u = open(&mut m);
     u.call(&mut m, 1, &[], false);
-    let request = eval_request(&u, 6, 5 << 8, 0x80010000);
-    let mut bad = request.clone();
-    bad[72] ^= 1;
-    reject_eval(&mut m, ROTATE_KEY, &bad);
-    for offset in [8usize, 20, 52, 68] {
-        // operation, policy, address, descriptor
-        let mut bad = request.clone();
-        bad[offset] ^= 1;
-        reject_eval(&mut m, ROTATE_KEY, &bad);
-    }
-    for dst in [u64::MAX - 3, 0x1_8000_0000 - 4, 0x1_0000_8001_0000] {
-        reject_eval(&mut m, ROTATE_KEY, &eval_request(&u, 6, 5 << 8, dst));
-    }
-    for descriptor in [16, 2 << 8, 512 << 8] {
-        reject_eval(
-            &mut m,
-            ROTATE_KEY,
-            &eval_request(&u, 6, descriptor, 0x80010000),
-        );
-    }
-    m.limit_direct_mailbox_access(Some(128));
-    let response = send(&mut m, ROTATE_KEY.into(), &request, &[]);
-    m.limit_direct_mailbox_access(None);
-    assert_eq!(response.len(), 100);
-    let mut wrapped = m.soc_dram_mut().unwrap()[0x10000..0x11000].to_vec();
-    wrapped.extend_from_slice(&response[84..100]);
-    assert_eq!(
-        crypto(
-            "decrypt",
-            &u.tx,
-            &wrapped,
-            &response[8..84],
-            &words(&[1, u.seq, 0])
-        )
-        .len(),
-        4096
-    );
-    u.seq += 1;
-    reject_eval(&mut m, ROTATE_KEY, &request); // replay
-    let h = eval_request(&u, 7, 0, 0x80010000);
-    reject_eval(&mut m, RELIN_KEY, &h); // quota: pre-keygen attempt + successful row
-    u.seq += 1;
     u.call(&mut m, 5, &[], false);
     erased(&mut m);
-    let mut v = open(&mut m, [0x0e, 8, 0, 2, 0]);
-    v.call(&mut m, 1, &[], false);
-    reject_eval(&mut m, RELIN_KEY, &eval_request(&v, 7, 0, 0x80010000)); // policy
-    v.seq += 1;
-    v.call(&mut m, 5, &[], false);
-    let mut v = open(&mut m, [0xce, 8, 0, 2, 0]);
-    v.call(&mut m, 1, &[], false);
-    let end = m.soc_dram_mut().unwrap().len();
-    let h = eval_request(&v, 7, 0, 0x80000000 + end as u64 - 4);
-    reject_eval(&mut m, RELIN_KEY, &h); // partial DMA write must poison permanently
+}
+
+/// The ordinary protected build neither exposes MLIC nor includes its model.
+#[test]
+fn ecdh_without_clear_reference() {
+    let mut m = boot(&firmware::APP_FHE_ECDH);
+    let mut u = open(&mut m);
+    u.call(&mut m, 1, &[], false);
+    let pixels = u.seal(4, &[0; 196]);
+    u.reject(&mut m, 4, &command(u.id, 4, false, 0), &pixels);
+    let ct = u.call(&mut m, 2, PT, false);
+    assert!(ps_close(&u.call(&mut m, 3, &ct, false), PT));
+    u.call(&mut m, 5, &[], false);
     erased(&mut m);
-    reject_open(&mut m, &v.open_request);
-    reject_eval(&mut m, RELIN_KEY, &h);
+}
+
+/// Row commands are pointer-only plain commands; rows are public, fresh per
+/// request, fully reduced, and never staged in mailbox SRAM.
+#[test]
+fn evaluation_key_rows() {
+    let mut m = boot(&firmware::APP_FHE_EVAL_KEYS);
+    let mut u = open(&mut m);
+    let row = |id, op, arg| command(id, op, true, arg);
+    u.reject(&mut m, 6, &row(u.id, 6, 5 << 8), &[]); // before keygen
+    u.call(&mut m, 1, &[], false);
+    // Galois element must be odd, non-identity, < 512; row < 16; op 7 needs g = 0.
+    for (op, arg) in [
+        (6, 16),
+        (6, 0),
+        (6, 1 << 8),
+        (6, 2 << 8),
+        (6, 512 << 8),
+        (7, 5 << 8),
+        (7, 16),
+    ] {
+        u.reject(&mut m, op, &row(u.id, op, arg), &[]);
+    }
+    u.reject(&mut m, 6, &command(u.id, 6, false, 5 << 8), &[]); // mailbox mode
+    for dst in [0x7fff_f000u64, 0x1_8000_0000 - 4, 0x1_0000_8001_0000] {
+        let mut h = row(u.id, 6, 5 << 8);
+        h[28..36].copy_from_slice(&dst.to_le_bytes());
+        u.reject(&mut m, 6, &h, &[]);
+    }
+    let mut rows = Vec::new();
+    for _ in 0..2 {
+        m.limit_direct_mailbox_access(Some(48));
+        let response = send(&mut m, CommandId::from(IDS[5]), &row(u.id, 6, 5 << 8), &[]);
+        m.limit_direct_mailbox_access(None);
+        assert_eq!(response.len(), 16);
+        rows.push(m.soc_dram_mut().unwrap()[0x10000..0x11000].to_vec());
+    }
+    assert_ne!(rows[0], rows[1], "rows must use fresh randomness");
+    for (i, q) in [PS_Q, PS_Q].concat().into_iter().enumerate() {
+        assert!(
+            (0..256).all(|j| word(&rows[0], i * 256 + j) < q),
+            "unreduced residue"
+        );
+    }
+    m.limit_direct_mailbox_access(Some(48));
+    send(&mut m, CommandId::from(IDS[6]), &row(u.id, 7, 15), &[]);
+    m.limit_direct_mailbox_access(None);
+    // A partial DMA write poisons transport: only close runs afterwards.
+    let end = m.soc_dram_mut().unwrap().len() as u64;
+    let mut h = row(u.id, 7, 0);
+    h[28..36].copy_from_slice(&(0x8000_0000 + end - 4).to_le_bytes());
+    u.reject(&mut m, 7, &h, &[]);
+    u.reject(&mut m, 7, &row(u.id, 7, 0), &[]);
+    u.call(&mut m, 5, &[], false);
+    erased(&mut m);
+    reject_open(&mut m, &u.open_request);
 }
 
 #[test]
 fn evaluation_keys_are_gated() {
     let mut m = boot(&firmware::APP_FHE_ECDH);
-    reject_open(&mut m, &opening([0xce, 8, 0, 2, 0]));
-    let mut u = open(&mut m, [0x0e, 8, 0, 2, 0]);
+    let mut u = open(&mut m);
     u.call(&mut m, 1, &[], false);
-    reject_eval(&mut m, RELIN_KEY, &eval_request(&u, 7, 0, 0x80010000));
+    u.reject(&mut m, 7, &command(u.id, 7, true, 0), &[]);
     u.call(&mut m, 5, &[], false);
 }

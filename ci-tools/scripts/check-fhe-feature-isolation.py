@@ -64,9 +64,8 @@ def main():
     profiles = {
         'standard': 'emu,riscv',
         'no_mldsa': 'emu,riscv,no-mldsa',
-        'software_psk': 'emu,riscv,no-mldsa,fhe-psk',
-        # Registered APP_FHE_PSK_ML_CLEAR image used by the default protected tests.
-        'software_psk_ml_clear': 'emu,riscv,no-mldsa,fhe-psk,ml-clear',
+        # Protected profiles are not compared: they change with the protocol by
+        # design, and older baselines may lack the current profile features.
     }
     report = {'baseline': revision, 'artifact': 'runtime objcopy -O binary', 'profiles': {}}
     for name, features in profiles.items():

@@ -33,34 +33,38 @@ MINIMAL_DEMO ?= 0
 MINIMAL_DEMO_FEATURE = $(if $(filter 1,$(MINIMAL_DEMO)),minimal-demo,)
 
 # Set to 1 to compile software-client support. Raw commands require FHE_DEBUG.
-# FHE=1 defaults to device-attested ECDH. Off builds are unchanged. FHE_PSK selects
-# the protected P-S demo; FHE_DEBUG selects the separate raw test commands.
+# FHE=1 builds protocol v5 with device-attested ECDH; FHE_TEST_KEY=1 uses fixed
+# public test keys (debug-unlocked fake-ROM runs only). Off builds are unchanged.
+# FHE_ALOHA selects the separate Aloha PSK profile; FHE_DEBUG the raw test commands.
 FHE ?= 0
 FHE_DEBUG ?= 0
-FHE_PSK ?= 0
+FHE_TEST_KEY ?= 0
 FHE_ALOHA ?= 0
 FHE_EVAL_KEYS ?= 0
-ifeq ($(FHE_ALOHA),1)
-override FHE_PSK := 1
+ifeq ($(FHE_PSK),1)
+$(error FHE_PSK is retired; use FHE_TEST_KEY=1, or FHE_ALOHA=1 for Aloha)
 endif
 # Optional clear-reference model/command for FHE comparisons.
 ML_CLEAR ?= 0
 FHE_PARAMS ?= ps
 FHE_FEATURE = $(if $(filter 1,$(FHE_DEBUG)),fhe-debug,$(if $(filter 1,$(FHE)),fhe-ecdh,))
-ifeq ($(FHE_PSK),1)
+ifneq ($(filter 1,$(FHE_TEST_KEY) $(FHE_ALOHA)),)
 ifeq ($(FHE_DEBUG),1)
-$(error FHE_PSK and FHE_DEBUG are mutually exclusive)
+$(error FHE_TEST_KEY/FHE_ALOHA and FHE_DEBUG are mutually exclusive)
 endif
-FHE_FEATURE := $(if $(filter 1,$(FHE_ALOHA)),fhe-aloha,fhe-psk)
+ifneq ($(words $(filter 1,$(FHE) $(FHE_TEST_KEY) $(FHE_ALOHA))),1)
+$(error choose one of FHE=1, FHE_TEST_KEY=1 or FHE_ALOHA=1)
+endif
+FHE_FEATURE := $(if $(filter 1,$(FHE_ALOHA)),fhe-aloha,fhe-test-key)
 endif
 # Evaluated before params/ml-clear suffixes are comma-joined onto FHE_FEATURE.
-FHE_PROTECTED := $(filter fhe-psk fhe-ecdh fhe-aloha,$(FHE_FEATURE))
+FHE_PROTECTED := $(filter fhe-test-key fhe-ecdh fhe-aloha,$(FHE_FEATURE))
 ifneq ($(FHE_PROTECTED),)
 ifneq ($(FHE_PARAMS),ps)
 $(error protected FHE builds currently support FHE_PARAMS=ps only)
 endif
 endif
-ifneq ($(filter 1,$(FHE) $(FHE_DEBUG) $(FHE_PSK)),)
+ifneq ($(filter 1,$(FHE) $(FHE_DEBUG) $(FHE_TEST_KEY) $(FHE_ALOHA)),)
 ifeq ($(filter $(FHE_PARAMS),ps pl pleq),)
 $(error FHE_PARAMS must be ps, pl or pleq)
 endif
@@ -77,8 +81,8 @@ FHE_FEATURE := $(FHE_FEATURE),ml-clear
 endif
 
 ifeq ($(FHE_EVAL_KEYS),1)
-ifneq ($(FHE_PROTECTED),fhe-ecdh)
-$(error FHE_EVAL_KEYS requires the ECDH profile)
+ifeq ($(filter fhe-ecdh fhe-test-key,$(FHE_PROTECTED)),)
+$(error FHE_EVAL_KEYS requires protocol v5 (FHE=1 or FHE_TEST_KEY=1))
 endif
 ifeq ($(ML_CLEAR),1)
 $(error FHE_EVAL_KEYS excludes ML_CLEAR in the frozen runtime allocation)

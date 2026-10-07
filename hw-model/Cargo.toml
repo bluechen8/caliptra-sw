@@ -70,5 +70,5 @@ name = "fhe_commands"
 path = "../runtime/tests/fhe_commands.rs"
 
 [[test]]
-name = "fhe_psk"
-path = "../runtime/tests/fhe_psk.rs"
+name = "fhe_protected"
+path = "../runtime/tests/fhe_protected.rs"

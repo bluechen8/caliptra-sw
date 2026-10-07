@@ -15,12 +15,17 @@ pub const ROW_WORDS: usize = 1024;
 /// Polynomial scratch words, to be erased by the caller after use.
 pub const SCRATCH_WORDS: usize = 768;
 
+/// Whether `(galois, row)` names a supported row: `galois=0` is relinearization,
+/// otherwise a non-identity odd Galois element modulo 2N=512.
+pub const fn valid(galois: u32, row: usize) -> bool {
+    row < ROWS && (galois == 0 || (galois > 1 && galois < 512 && galois & 1 == 1))
+}
+
 /// Generate one evaluation-key row into caller-owned private memory.
 ///
-/// `galois=0` selects relinearization; otherwise it is an odd element modulo
-/// 512. The caller authenticates/authorizes the key identifier and row, supplies
-/// fresh randomness, and zeroizes scratch/errors on every exit. `error` must be
-/// shared across the two limbs of this row and independently sampled per row.
+/// The caller supplies fresh randomness and zeroizes output/scratch/errors on
+/// every exit. `error` must be shared across the two limbs of this row and
+/// independently sampled per row.
 pub fn generate_row(
     packed: &[u8],
     galois: u32,
@@ -31,45 +36,33 @@ pub fn generate_row(
     scratch: &mut [u32],
 ) -> Result<()> {
     if packed.len() != 64
-        || row >= ROWS
+        || !valid(galois, row)
         || error.len() != 256
         || output.len() != ROW_WORDS
         || scratch.len() != SCRATCH_WORDS
-        || (galois != 0 && (galois >= 512 || galois & 1 == 0))
     {
         return Err(Error::BadLength);
     }
-    // An odd element has an inverse modulo 2N. Fixed bounded search, public data.
-    let inverse = if galois == 0 {
-        1
-    } else {
-        (1..512)
-            .step_by(2)
-            .find(|v| (v * galois) & 511 == 1)
-            .ok_or(Error::BadHeader)?
-    };
     let (secret, rest) = scratch.split_at_mut(256);
     let (tw, message) = rest.split_at_mut(256);
     for (li, p) in PS.primes.iter().enumerate() {
+        // Only the selected RNS component carries the gadget message.
+        let gadget = li == row / 8;
         ntt::gen_twiddles_fwd(256, p, tw)?;
-        rlwe::secret_ntt_limb(packed, p, tw, secret)?;
-        for i in 0..256 {
-            message[i] = if galois == 0 {
-                arith::mont_mul(arith::to_mont(secret[i], p), secret[i], p.q, p.q_inv_neg)
-            } else {
-                secret[i]
-            };
-        }
-        if galois != 0 {
-            // Build sigma_inverse(s) in coefficient form, using c0 as scratch.
-            sample::secret_to_limb(packed, p.q, &mut output[li * 256..(li + 1) * 256])?;
-            for i in 0..256 {
-                let index = (i as u32 * inverse) & 511;
-                secret[(index & 255) as usize] = if index < 256 {
-                    output[li * 256 + i]
-                } else {
-                    arith::neg_mod(output[li * 256 + i], p.q)
-                };
+        if galois == 0 {
+            rlwe::secret_ntt_limb(packed, p, tw, secret)?;
+            if gadget {
+                ntt::mul_pointwise(secret, secret, message, p)?;
+            }
+        } else {
+            if gadget {
+                rlwe::secret_ntt_limb(packed, p, tw, message)?;
+            }
+            // sigma_{g^-1}(s) has s[j*g mod 2N] at X^j, negated past N.
+            for (j, v) in secret.iter_mut().enumerate() {
+                let m = (j as u32 * galois) & 511;
+                let t = sample::unpack_ternary(packed, (m & 255) as usize);
+                *v = arith::from_i32(if m < 256 { t } else { -t }, p.q);
             }
             ntt::ntt(secret, tw, p)?;
         }
@@ -79,14 +72,10 @@ pub fn generate_row(
         c0.fill(0);
         sample::sample_uniform(prg, p.q, c1);
         rlwe::encrypt_limb_in_place(c0, error, c1, secret, p, tw)?;
-        if li == row / 8 {
+        if gadget {
             let factor = arith::to_mont(1 << (4 * (row % 8)), p);
-            for i in 0..256 {
-                c0[i] = arith::add_mod(
-                    c0[i],
-                    arith::mont_mul(factor, message[i], p.q, p.q_inv_neg),
-                    p.q,
-                );
+            for (c, &m) in c0.iter_mut().zip(message.iter()) {
+                *c = arith::add_mod(*c, arith::mont_mul(factor, m, p.q, p.q_inv_neg), p.q);
             }
         }
     }
@@ -98,20 +87,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn descriptor_rule() {
+        assert!(valid(0, 0) && valid(5, 15) && valid(511, 7));
+        for (g, row) in [(1, 0), (2, 0), (512, 0), (0, ROWS), (5, ROWS)] {
+            assert!(!valid(g, row), "g={g} row={row}");
+        }
+    }
+
+    #[test]
     fn rows_decrypt_to_gadget_message_plus_error() {
         let mut prg = ChaCha20Prg::new(&[0x47; 32]);
         let mut packed = [0u8; 64];
         rlwe::keygen(&mut prg, 256, &mut packed).unwrap();
-        let mut signed = [0i64; 256];
-        let mut coefficients = [0u32; 256];
-        sample::secret_to_limb(&packed, PS.primes[0].q, &mut coefficients).unwrap();
-        for (v, c) in signed.iter_mut().zip(coefficients) {
-            *v = if c == PS.primes[0].q - 1 {
-                -1
-            } else {
-                c as i64
-            };
-        }
+        let signed: [i64; 256] =
+            core::array::from_fn(|i| sample::unpack_ternary(&packed, i) as i64);
         let fixture = std::env::var_os("FHE_EVALKEY_FIXTURE_DIR").map(std::path::PathBuf::from);
         if let Some(dir) = &fixture {
             std::fs::create_dir_all(dir).unwrap();
@@ -150,8 +139,7 @@ mod tests {
                 }
                 for (li, p) in PS.primes.iter().enumerate() {
                     let mut transformed = [0u32; 256];
-                    // Compose sigma_g(output-secret) = s to recover each
-                    // coefficient without reusing generation's inverse search.
+                    // Independently apply sigma_g to s; it must decrypt every row.
                     for i in 0..256 {
                         let power = if g == 0 { i } else { (i * g as usize) % 512 };
                         let value = signed[power % 256] * if power < 256 { 1 } else { -1 };
