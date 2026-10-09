@@ -1,30 +1,35 @@
 // Licensed under the Apache-2.0 license
-//! P-S evaluation-key rows, compatible with Q-only RLWE gadget switching.
+//! P-S evaluation keys with hybrid key switching: an auxiliary prime P and
+//! RNS decomposition, compatible with Lattigo's default (dnum = 2) keys.
 //!
-//! A key has 2 RNS decomposition components, each with eight base-16 digits.
-//! Each row is an ordinary degree-one RLWE ciphertext (4096 bytes). Rotation
-//! keys encrypt s under sigma_g^-1(s); relinearization keys encrypt s^2 under s.
-//! Only the selected RNS component carries the gadget message. Outputs are
+//! A key has one row per Q prime. Each row is a degree-one RLWE ciphertext mod
+//! P*Q (limbs q0, q1, P). Row j encrypts P*m only in limb q_j, the CRT gadget
+//! P*(Q/q_j)*[(Q/q_j)^-1]_{q_j}. Rotation keys use m = s under
+//! sigma_g^-1(s); relinearization keys use m = s^2 under s. Outputs are
 //! standard (not Montgomery) bit-reversed NTT residues, like the other kernels.
-use crate::{arith, ntt, params::PS, prg::ChaCha20Prg, rlwe, sample, Error, Result};
+use crate::params::{PrimeParams, PS_AUX, PS_PRIMES};
+use crate::{arith, ntt, prg::ChaCha20Prg, rlwe, sample, Error, Result};
 
-/// Number of independently generated rows in one evaluation key.
-pub const ROWS: usize = 16;
-/// Serialized words per row: two polynomials, two primes, 256 coefficients.
-pub const ROW_WORDS: usize = 1024;
+/// Row limb primes: the Q primes, then the auxiliary key-switching prime P.
+pub const LIMBS: [PrimeParams; 3] = [PS_PRIMES[0], PS_PRIMES[1], PS_AUX];
+/// Rows in one evaluation key: one per Q prime.
+pub const ROWS: usize = 2;
+/// Serialized words per row: two polynomials, three limbs, 256 coefficients,
+/// laid out `[c0 q0, c0 q1, c0 P, c1 q0, c1 q1, c1 P]`.
+pub const ROW_WORDS: usize = 2 * LIMBS.len() * 256;
 /// Polynomial scratch words, to be erased by the caller after use.
 pub const SCRATCH_WORDS: usize = 768;
 
-/// Whether `(galois, row)` names a supported row: `galois=0` is relinearization,
-/// otherwise a non-identity odd Galois element modulo 2N=512.
-pub const fn valid(galois: u32, row: usize) -> bool {
-    row < ROWS && (galois == 0 || (galois > 1 && galois < 512 && galois & 1 == 1))
+/// Whether `galois` names a supported key: 0 is relinearization, otherwise a
+/// non-identity odd Galois element modulo 2N=512.
+pub const fn valid(galois: u32) -> bool {
+    galois == 0 || (galois > 1 && galois < 512 && galois & 1 == 1)
 }
 
-/// Generate one evaluation-key row into caller-owned private memory.
+/// Generate row `row` of one evaluation key into caller-owned private memory.
 ///
 /// The caller supplies fresh randomness and zeroizes output/scratch/errors on
-/// every exit. `error` must be shared across the two limbs of this row and
+/// every exit. `error` must be shared across the three limbs of this row and
 /// independently sampled per row.
 pub fn generate_row(
     packed: &[u8],
@@ -36,7 +41,8 @@ pub fn generate_row(
     scratch: &mut [u32],
 ) -> Result<()> {
     if packed.len() != 64
-        || !valid(galois, row)
+        || !valid(galois)
+        || row >= ROWS
         || error.len() != 256
         || output.len() != ROW_WORDS
         || scratch.len() != SCRATCH_WORDS
@@ -45,9 +51,10 @@ pub fn generate_row(
     }
     let (secret, rest) = scratch.split_at_mut(256);
     let (tw, message) = rest.split_at_mut(256);
-    for (li, p) in PS.primes.iter().enumerate() {
-        // Only the selected RNS component carries the gadget message.
-        let gadget = li == row / 8;
+    let (c0s, c1s) = output.split_at_mut(LIMBS.len() * 256);
+    for (li, p) in LIMBS.iter().enumerate() {
+        // The gadget message lives only in limb q_row; P*m vanishes mod P.
+        let gadget = li == row;
         ntt::gen_twiddles_fwd(256, p, tw)?;
         if galois == 0 {
             rlwe::secret_ntt_limb(packed, p, tw, secret)?;
@@ -66,14 +73,14 @@ pub fn generate_row(
             }
             ntt::ntt(secret, tw, p)?;
         }
-        let (c0, c1) = output.split_at_mut(512);
-        let c0 = &mut c0[li * 256..(li + 1) * 256];
-        let c1 = &mut c1[li * 256..(li + 1) * 256];
+        let c0 = &mut c0s[li * 256..(li + 1) * 256];
+        let c1 = &mut c1s[li * 256..(li + 1) * 256];
         c0.fill(0);
         sample::sample_uniform(prg, p.q, c1);
         rlwe::encrypt_limb_in_place(c0, error, c1, secret, p, tw)?;
         if gadget {
-            let factor = arith::to_mont(1 << (4 * (row % 8)), p);
+            // P < q_row, so P mod q_row is P itself.
+            let factor = arith::to_mont(PS_AUX.q, p);
             for (c, &m) in c0.iter_mut().zip(message.iter()) {
                 *c = arith::add_mod(*c, arith::mont_mul(factor, m, p.q, p.q_inv_neg), p.q);
             }
@@ -87,10 +94,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn descriptor_rule() {
-        assert!(valid(0, 0) && valid(5, 15) && valid(511, 7));
-        for (g, row) in [(1, 0), (2, 0), (512, 0), (0, ROWS), (5, ROWS)] {
-            assert!(!valid(g, row), "g={g} row={row}");
+    fn galois_rule() {
+        assert!(valid(0) && valid(5) && valid(511));
+        for g in [1, 2, 512] {
+            assert!(!valid(g), "g={g}");
         }
     }
 
@@ -120,7 +127,14 @@ mod tests {
                 squared[(i + j) % 256] += signed[i] * signed[j] * if i + j < 256 { 1 } else { -1 };
             }
         }
-        for g in [0u32, 5, 25, 511] {
+        // Relinearization, conjugation, and every rotation step 2^i (g = 5^(2^i)).
+        let mut galois = vec![0u32, 511];
+        let mut g = 5u32;
+        for _ in 0..7 {
+            galois.push(g);
+            g = g * g % 512;
+        }
+        for g in galois {
             for row in 0..ROWS {
                 let mut error = [0i8; 256];
                 sample::sample_cbd(&mut prg, &mut error);
@@ -128,16 +142,24 @@ mod tests {
                 let mut scratch = [0u32; SCRATCH_WORDS];
                 generate_row(&packed, g, row, &mut prg, &error, &mut output, &mut scratch).unwrap();
                 if let Some(dir) = &fixture {
-                    std::fs::write(
-                        dir.join(format!("key_{g}_{row}.bin")),
-                        output
-                            .iter()
-                            .flat_map(|v| v.to_le_bytes())
-                            .collect::<Vec<_>>(),
-                    )
-                    .unwrap();
+                    // Production format: one file per key, rows in order.
+                    use std::io::Write;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(row > 0)
+                        .write(true)
+                        .truncate(row == 0)
+                        .open(dir.join(format!("key_{g}.bin")))
+                        .unwrap()
+                        .write_all(
+                            &output
+                                .iter()
+                                .flat_map(|v| v.to_le_bytes())
+                                .collect::<Vec<_>>(),
+                        )
+                        .unwrap();
                 }
-                for (li, p) in PS.primes.iter().enumerate() {
+                for (li, p) in LIMBS.iter().enumerate() {
                     let mut transformed = [0u32; 256];
                     // Independently apply sigma_g to s; it must decrypt every row.
                     for i in 0..256 {
@@ -152,7 +174,7 @@ mod tests {
                     let mut result = [0u32; 256];
                     rlwe::decrypt_limb(
                         &output[li * 256..(li + 1) * 256],
-                        &output[(li + 2) * 256..(li + 3) * 256],
+                        &output[(li + LIMBS.len()) * 256..(li + LIMBS.len() + 1) * 256],
                         &transformed,
                         p,
                         &tw,
@@ -161,11 +183,7 @@ mod tests {
                     .unwrap();
                     for i in 0..256 {
                         let message = if g == 0 { squared[i] } else { signed[i] };
-                        let gadget = if li == row / 8 {
-                            1i64 << (4 * (row % 8))
-                        } else {
-                            0
-                        };
+                        let gadget = if li == row { PS_AUX.q as i64 } else { 0 };
                         let expected =
                             (message * gadget + error[i] as i64).rem_euclid(p.q as i64) as u32;
                         assert_eq!(

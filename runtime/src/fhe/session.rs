@@ -37,6 +37,8 @@ const IDS: [u32; 7] = [
 ];
 /// Workspace base in mailbox words: inputs start right after the command.
 const BASE: usize = COMMAND_LEN / 4;
+/// Bytes of one evaluation key: every row, as one key command exports them.
+const KEY_BYTES: usize = evalkey::ROWS * evalkey::ROW_WORDS * 4;
 /// Mailbox words used and scrubbed: input, plaintext/output, 2-KiB scratch.
 const WORK: usize = BASE + 2 * 1024 + 512;
 const fn blob(body: usize) -> usize {
@@ -174,23 +176,23 @@ impl Request {
             2 => (blob(2048), 4096),
             3 => (4096, blob(2048)),
             4 => (blob(196), blob(40)),
-            6 | 7 => (0, 4096),
+            6 | 7 => (0, KEY_BYTES),
             _ => (0, 0),
         };
         let mode = word(b, 4);
         let src = (u64::from(word(b, 6)) << 32) | u64::from(word(b, 5));
         let dst = (u64::from(word(b, 8)) << 32) | u64::from(word(b, 7));
         let arg = word(b, 11);
-        // Key rows: arg = galois << 8 | row; op 6 needs galois != 0, op 7 galois = 0.
-        let key_row = op >= 6;
-        let arg_ok = if key_row {
-            (op == 7) == (arg >> 8 == 0) && evalkey::valid(arg >> 8, (arg & 255) as usize)
+        // Keys: arg is the Galois element; op 6 needs one, op 7 (relin) uses 0.
+        let key = op >= 6;
+        let arg_ok = if key {
+            (op == 7) == (arg == 0) && evalkey::valid(arg)
         } else {
             arg == 0
         };
         if mode > 1
             || !arg_ok
-            || (key_row && mode != 1)
+            || (key && mode != 1)
             || word(b, 9) as usize != input
             || word(b, 10) as usize != output
         {
@@ -386,31 +388,37 @@ fn kernel(
     }
     Ok(())
 }
-/// Generate one public evaluation-key row in DCCM and DMA it out from there;
-/// neither the row nor any secret intermediate touches mailbox SRAM.
+/// Generate one public evaluation key, row by row, in DCCM and DMA each row
+/// out from there to consecutive addresses; neither the rows nor any secret
+/// intermediate touch mailbox SRAM. Cycles include every row's DMA.
 #[cfg(feature = "fhe-eval-keys")]
 #[inline(never)]
-fn key_row(d: &mut Drivers, r: &Request, header: &mut [u8], start: u64) -> CaliptraResult<()> {
+fn key(d: &mut Drivers, r: &Request, header: &mut [u8], start: u64) -> CaliptraResult<()> {
     let mut work = Zeroizing::new([0u32; evalkey::ROW_WORDS + evalkey::SCRATCH_WORDS]);
     let (row, scratch) = work.split_at_mut(evalkey::ROW_WORDS);
     let mut prg = fresh_prg(d)?;
     let mut error = Zeroizing::new([0i8; 256]);
-    sample::sample_cbd(&mut prg, &mut error[..]);
-    evalkey::generate_row(
-        &d.fhe_session.secret,
-        r.arg >> 8,
-        (r.arg & 255) as usize,
-        &mut prg,
-        &error[..],
-        row,
-        scratch,
-    )
-    .map_err(|_| INVALID)?;
+    for i in 0..evalkey::ROWS {
+        // A fresh error and mask per row, from the same per-key TRNG seed.
+        sample::sample_cbd(&mut prg, &mut error[..]);
+        evalkey::generate_row(
+            &d.fhe_session.secret,
+            r.arg,
+            i,
+            &mut prg,
+            &error[..],
+            row,
+            scratch,
+        )
+        .map_err(|_| INVALID)?;
+        let dst = r.dst + (i * evalkey::ROW_WORDS * 4) as u64;
+        d.fhe_session
+            .transport
+            .with_fifo(&mut d.dma, |t| t.write(dst, row))
+            .map_err(|_| CaliptraError::RUNTIME_FHE_ENCRYPT_FAILED)?;
+    }
     header[8..16].copy_from_slice(&cycles().wrapping_sub(start).to_le_bytes());
-    d.fhe_session
-        .transport
-        .with_fifo(&mut d.dma, |t| t.write(r.dst, row))
-        .map_err(|_| CaliptraError::RUNTIME_FHE_ENCRYPT_FAILED)
+    Ok(())
 }
 /// Run one plain scheduler command. Returns the word offset of its output in
 /// `work`, which is always the `plain` buffer.
@@ -437,7 +445,7 @@ fn command(
     }
     #[cfg(feature = "fhe-eval-keys")]
     if op >= 6 {
-        key_row(d, r, &mut header[..], start)?;
+        key(d, r, &mut header[..], start)?;
         return Ok(0);
     }
     let (input, rest) = work[BASE..].split_at_mut(1024);
@@ -490,7 +498,7 @@ pub fn execute(d: &mut Drivers, r: Request) -> CaliptraResult<MboxStatusE> {
     // buffers of 4 KiB each, then 2-KiB polynomial scratch: WORK < 16 KiB.
     let work = unsafe { core::slice::from_raw_parts_mut(MBOX_ORG as *mut u32, WORK) };
     let open = r.op == 0;
-    // Key rows stay in DCCM; their mailbox use ends at the command header.
+    // Keys stay in DCCM; their mailbox use ends at the command header.
     let used = if cfg!(feature = "fhe-eval-keys") && r.op >= 6 {
         COMMAND_LEN / 4
     } else {

@@ -174,8 +174,11 @@ fn run_python(cmd: &mut std::process::Command) -> Vec<u8> {
     );
     unhex(String::from_utf8(out.stdout).unwrap().trim())
 }
-/// P-S RNS primes.
+/// P-S RNS primes and the auxiliary key-switching prime (fhe-core PS_AUX).
 const PS_Q: [u32; 2] = [1073738753, 1073732609];
+const PS_AUX: u32 = 0x3fffd601;
+/// One hybrid evaluation key: 2 rows x 2 polynomials x 3 limbs x 256 words.
+const KEY_BYTES: usize = 2 * 2 * 3 * 256 * 4;
 /// P-S decryption must stay within the CBD error support of the plaintext.
 fn ps_close(dec: &[u8], pt: &[u8]) -> bool {
     PS_Q.into_iter().enumerate().all(|(limb, q)| {
@@ -202,6 +205,8 @@ fn mailbox_scrubbed(m: &mut DefaultHwModel, from: usize) -> bool {
 }
 
 const OPEN: u32 = 0x4648534f;
+/// Relay job frame ("FJOB"): the scheduler builds the command.
+const JOB: u32 = 0x424f4a46;
 const IDS: [u32; 7] = [
     0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485254, 0x4648524c,
 ];
@@ -214,7 +219,7 @@ fn lengths(op: u32) -> (usize, usize) {
         2 => (2084, 4096),
         3 => (4096, 2084),
         4 => (232, 76),
-        6 | 7 => (0, 4096),
+        6 | 7 => (0, KEY_BYTES),
         _ => (0, 0),
     }
 }
@@ -584,6 +589,19 @@ fn testkey_evalkey_host_demo() {
         false,
     );
 }
+/// Packed MNIST: one rotation key, two ingress per image, one egress.
+#[test]
+fn testkey_packed_host_demo() {
+    run_host_demo(
+        &firmware::APP_FHE_TEST_KEY_EVAL_KEYS,
+        "packed_demo.py",
+        false,
+    );
+}
+#[test]
+fn packed_host_demo() {
+    run_host_demo(&firmware::APP_FHE_EVAL_KEYS, "packed_demo.py", false);
+}
 #[test]
 fn evalkey_host_demo() {
     run_host_demo(&firmware::APP_FHE_EVAL_KEYS, "evalkey_demo.py", false);
@@ -688,6 +706,7 @@ fn run_host_demo_fixture(
         cmd.arg("--transport").arg(transport);
     }
     let mut user = cmd.spawn().unwrap();
+    let mut session = 0;
     for i in 0..1000 {
         let file = dir.join(format!("req-{i}"));
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -701,6 +720,8 @@ fn run_host_demo_fixture(
         }
         let data = fs::read(file).unwrap();
         // Relay frame: command, request bytes, external input, external output.
+        // A job frame (op, mode, arg) is scheduled here exactly as Rocket's
+        // protected-demo.c does: this harness builds the plain command.
         let id = word(&data, 0);
         if id == 0 {
             assert!(user.wait().unwrap().success());
@@ -716,26 +737,49 @@ fn run_host_demo_fixture(
         }
         let len = word(&data, 1) as usize;
         let ext = word(&data, 2) as usize;
-        let outlen = word(&data, 3) as usize;
-        if mailbox_only {
+        let body = &data[16 + len..16 + len + ext];
+        let (id, h, payload, outlen) = if id == JOB {
+            let (op, mode, arg) = (word(&data, 4), word(&data, 5), word(&data, 6));
+            let outlen = if mode == 1 { lengths(op).1 } else { 0 };
+            assert_eq!(len, 12, "malformed job {i}");
             assert_eq!(
-                ext + outlen,
-                0,
-                "mailbox-only request {i} used an external buffer"
+                (ext, word(&data, 3) as usize),
+                (lengths(op).0, outlen),
+                "job {i} lengths"
             );
-        }
-        let h = &data[16..16 + len];
-        if ext > 0 {
-            m.soc_dram_mut().unwrap()[..ext].copy_from_slice(&data[16 + len..]);
-        }
-        // Key rows must never touch mailbox SRAM past the command header.
-        let key_row = IDS[5..].contains(&id);
-        if key_row {
+            if mailbox_only {
+                assert_eq!(mode, 0, "mailbox-only job {i} used an external buffer");
+            }
+            if mode == 1 {
+                m.soc_dram_mut().unwrap()[..ext].copy_from_slice(body);
+            }
+            let payload = if mode == 1 { &[][..] } else { body };
+            (
+                IDS[(op - 1) as usize],
+                command(session, op, mode == 1, arg),
+                payload,
+                outlen,
+            )
+        } else {
+            // Raw frames (open, certificates) carry no external data.
+            assert_eq!(
+                (ext, word(&data, 3)),
+                (0, 0),
+                "raw frame {i} with external data"
+            );
+            (id, data[16..16 + len].to_vec(), &[][..], 0)
+        };
+        // Keys must never touch mailbox SRAM past the command header.
+        let key = IDS[5..].contains(&id);
+        if key {
             m.limit_direct_mailbox_access(Some(48));
         }
-        let result = send(&mut m, CommandId::from(id), h, &[]);
-        if key_row {
+        let result = send(&mut m, CommandId::from(id), &h, payload);
+        if key {
             m.limit_direct_mailbox_access(None);
+        }
+        if id == OPEN {
+            session = word(&result, 2);
         }
         let mut packet = words(&[result.len() as u32, outlen as u32]);
         packet.extend(result);

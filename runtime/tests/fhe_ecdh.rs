@@ -151,57 +151,53 @@ fn ecdh_without_clear_reference() {
     erased(&mut m);
 }
 
-/// Row commands are pointer-only plain commands; rows are public, fresh per
-/// request, fully reduced, and never staged in mailbox SRAM.
+/// Key commands are pointer-only plain commands. Each returns one whole public
+/// hybrid key (two rows over q0, q1 and P), fresh per request, fully reduced,
+/// and never staged in mailbox SRAM.
 #[test]
-fn evaluation_key_rows() {
+fn evaluation_keys() {
     let mut m = boot(&firmware::APP_FHE_EVAL_KEYS);
     let mut u = open(&mut m);
-    let row = |id, op, arg| command(id, op, true, arg);
-    u.reject(&mut m, 6, &row(u.id, 6, 5 << 8), &[]); // before keygen
+    let key = |id, op, arg| command(id, op, true, arg);
+    u.reject(&mut m, 6, &key(u.id, 6, 5), &[]); // before keygen
     u.call(&mut m, 1, &[], false);
-    // Galois element must be odd, non-identity, < 512; row < 16; op 7 needs g = 0.
-    for (op, arg) in [
-        (6, 16),
-        (6, 0),
-        (6, 1 << 8),
-        (6, 2 << 8),
-        (6, 512 << 8),
-        (7, 5 << 8),
-        (7, 16),
-    ] {
-        u.reject(&mut m, op, &row(u.id, op, arg), &[]);
+    // The Galois element must be odd, non-identity and < 512; op 7 needs 0.
+    for (op, arg) in [(6, 0), (6, 1), (6, 2), (6, 512), (7, 5)] {
+        u.reject(&mut m, op, &key(u.id, op, arg), &[]);
     }
-    u.reject(&mut m, 6, &command(u.id, 6, false, 5 << 8), &[]); // mailbox mode
+    u.reject(&mut m, 6, &command(u.id, 6, false, 5), &[]); // mailbox mode
     for dst in [0x7fff_f000u64, 0x1_8000_0000 - 4, 0x1_0000_8001_0000] {
-        let mut h = row(u.id, 6, 5 << 8);
+        let mut h = key(u.id, 6, 5);
         h[28..36].copy_from_slice(&dst.to_le_bytes());
         u.reject(&mut m, 6, &h, &[]);
     }
-    let mut rows = Vec::new();
+    let mut keys = Vec::new();
     for _ in 0..2 {
         m.limit_direct_mailbox_access(Some(48));
-        let response = send(&mut m, CommandId::from(IDS[5]), &row(u.id, 6, 5 << 8), &[]);
+        let response = send(&mut m, CommandId::from(IDS[5]), &key(u.id, 6, 5), &[]);
         m.limit_direct_mailbox_access(None);
         assert_eq!(response.len(), 16);
-        rows.push(m.soc_dram_mut().unwrap()[0x10000..0x11000].to_vec());
+        keys.push(m.soc_dram_mut().unwrap()[0x10000..0x10000 + KEY_BYTES].to_vec());
     }
-    assert_ne!(rows[0], rows[1], "rows must use fresh randomness");
-    for (i, q) in [PS_Q, PS_Q].concat().into_iter().enumerate() {
+    assert_ne!(keys[0], keys[1], "keys must use fresh randomness");
+    // Per row: [c0 q0, c0 q1, c0 P, c1 q0, c1 q1, c1 P].
+    let limbs = [PS_Q[0], PS_Q[1], PS_AUX];
+    for (i, q) in limbs.iter().cycle().take(12).enumerate() {
         assert!(
-            (0..256).all(|j| word(&rows[0], i * 256 + j) < q),
-            "unreduced residue"
+            (0..256).all(|j| word(&keys[0], i * 256 + j) < *q),
+            "unreduced residue in limb {i}"
         );
     }
     m.limit_direct_mailbox_access(Some(48));
-    send(&mut m, CommandId::from(IDS[6]), &row(u.id, 7, 15), &[]);
+    send(&mut m, CommandId::from(IDS[6]), &key(u.id, 7, 0), &[]);
     m.limit_direct_mailbox_access(None);
-    // A partial DMA write poisons transport: only close runs afterwards.
+    // Row 0 fits, row 1 runs past emulator RAM: the partial DMA write poisons
+    // transport, and only close runs afterwards.
     let end = m.soc_dram_mut().unwrap().len() as u64;
-    let mut h = row(u.id, 7, 0);
-    h[28..36].copy_from_slice(&(0x8000_0000 + end - 4).to_le_bytes());
+    let mut h = key(u.id, 7, 0);
+    h[28..36].copy_from_slice(&(0x8000_0000 + end - (KEY_BYTES as u64) / 2).to_le_bytes());
     u.reject(&mut m, 7, &h, &[]);
-    u.reject(&mut m, 7, &row(u.id, 7, 0), &[]);
+    u.reject(&mut m, 7, &key(u.id, 7, 0), &[]);
     u.call(&mut m, 5, &[], false);
     erased(&mut m);
     reject_open(&mut m, &u.open_request);
