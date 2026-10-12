@@ -160,6 +160,11 @@ fn stream(
                 }
                 return Ok(());
             }
+            // Normal completion exposes READY and VALID together. ZEROIZE/reset
+            // instead leaves READY without VALID/ERROR: the command was cancelled.
+            if status & STATUS_READY != 0 {
+                return Err(FAILED);
+            }
             continue;
         }
         let left = rd(REG_STREAM_LEFT) as usize;

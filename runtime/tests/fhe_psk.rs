@@ -140,6 +140,7 @@ const IDS: [u32; 6] = [
 /// Authenticated parameter-set ID of the Aloha N=256 profile.
 #[cfg(feature = "fhe-aloha")]
 const ALOHA_PROFILE: u32 = 0xa108;
+const DEMO_PSK_HEX: &str = "a7b1c3d5e7f9012436485a6c7e90a2b4c6d8eaf10315274961738597a9bbcddf";
 struct User {
     open_request: Vec<u8>,
     id: u32,
@@ -151,29 +152,33 @@ struct User {
 }
 impl User {
     fn opening(policy: [u32; 5]) -> Vec<u8> {
-        let mut req = words(&[0, 3]);
+        let mut req = words(&[0, if policy[2] == 0xa108 { 6 } else { 3 }]);
         req.extend(words(&policy));
         req.extend([0x36; 32]);
         let mut transcript = words(&[0]);
         transcript.extend(&req[4..]);
-        let psk = unhex("a7b1c3d5e7f9012436485a6c7e90a2b4c6d8eaf10315274961738597a9bbcddf");
+        let psk = unhex(DEMO_PSK_HEX);
         req.extend(crypto("mac", &psk, &transcript, &[], &[]));
         req
     }
     fn open(m: &mut DefaultHwModel, policy: [u32; 5]) -> Self {
         let req = Self::opening(policy);
         let response = send(m, CommandId::FHE_SESSION_OPEN, &req, &[]);
-        assert_eq!(response.len(), 28);
+        let aloha = policy[2] == 0xa108;
+        assert_eq!(response.len(), if aloha { 60 } else { 28 });
         let id = word(&response, 2);
         let mut transcript = req[4..60].to_vec();
         transcript.extend(words(&[id]));
-        let psk = unhex("a7b1c3d5e7f9012436485a6c7e90a2b4c6d8eaf10315274961738597a9bbcddf");
+        if aloha {
+            transcript.extend(&response[12..44]);
+        }
+        let psk = unhex(DEMO_PSK_HEX);
         let k = |i| {
             let mut b = words(&[i]);
             b.extend(&transcript);
             crypto("mac", &psk, &b, &[], &[])
         };
-        assert_eq!(&response[12..], k(5));
+        assert_eq!(&response[if aloha { 44 } else { 12 }..], k(5));
         let mut rx = k(1);
         rx.extend(k(2));
         let mut tx = k(3);
@@ -348,7 +353,12 @@ fn protected_flow_and_security() {
 /// same directory protocol is used by the Rocket HTIF relay; no simulator here.
 #[test]
 fn protected_host_demo() {
-    run_host_demo(&firmware::APP_FHE_PSK_ML_CLEAR, "protected_demo.py", false);
+    run_host_demo(
+        &firmware::APP_FHE_PSK_ML_CLEAR,
+        "protected_demo.py",
+        false,
+        false,
+    );
 }
 
 /// Requires a local-stream N=256 RTL RPC executable and initialized table cwd.
@@ -356,11 +366,83 @@ fn protected_host_demo() {
 #[cfg(feature = "fhe-aloha")]
 #[ignore = "requires FHE_ALOHA_RTL and FHE_ALOHA_RTL_CWD"]
 fn protected_aloha_host_demo() {
-    run_host_demo(&firmware::APP_FHE_ALOHA, "aloha_demo.py", true);
+    run_host_demo(&firmware::APP_FHE_ALOHA, "aloha_demo.py", true, false);
+}
+
+/// Replaying the identical authenticated open after warm reset must not
+/// recreate transport keys, even when the firmware session ID restarts at one.
+#[test]
+#[cfg(feature = "fhe-aloha")]
+#[ignore = "requires FHE_ALOHA_RTL and FHE_ALOHA_RTL_CWD"]
+fn protected_aloha_open_freshness() {
+    let mut m = boot(&firmware::APP_FHE_ALOHA);
+    // A correctly MACed legacy Aloha open must not permit a downgrade.
+    let mut legacy = User::opening([0x4e, 64, 0, 2, 0]);
+    legacy[16..20].copy_from_slice(&ALOHA_PROFILE.to_le_bytes());
+    let mut auth = words(&[0]);
+    auth.extend(&legacy[4..60]);
+    let psk = unhex(DEMO_PSK_HEX);
+    legacy[60..76].copy_from_slice(&crypto("mac", &psk, &auth, &[], &[]));
+    let open_id: u32 = CommandId::FHE_SESSION_OPEN.into();
+    assert!(m
+        .mailbox_execute(open_id, &wire(open_id, &legacy, &[]))
+        .is_err());
+    let old = User::open(&mut m, [0x4e, 64, ALOHA_PROFILE, 2, 0]);
+    let (old_packet, old_body) = old.packet(1, &[], false);
+    // Let runtime finish the open command and enter idle before warm reset.
+    for _ in 0..10000 {
+        m.step();
+    }
+    m.warm_reset_flow().unwrap();
+    let mut ready = false;
+    for _ in 0..20_000_000 {
+        assert_eq!(m.soc_ifc().cptra_fw_error_fatal().read(), 0);
+        if m.soc_ifc().cptra_flow_status().read().ready_for_runtime() {
+            ready = true;
+            break;
+        }
+        m.step();
+    }
+    assert!(ready, "warm reset did not reboot");
+    let mut fresh = User::open(&mut m, [0x4e, 64, ALOHA_PROFILE, 2, 0]);
+    assert_eq!(old.open_request, fresh.open_request);
+    assert_eq!(old.id, fresh.id, "test must exercise repeated session ID");
+    assert_ne!(old.rx, fresh.rx);
+    assert_ne!(old.tx, fresh.tx);
+    // Metadata and sequence match: only fresh traffic keys prevent replay.
+    old.reject(&mut m, 1, &old_packet, &old_body);
+    fresh.call(&mut m, 1, &[], false);
+    fresh.call(&mut m, 5, &[], false);
+}
+
+/// Validate the SoC negative client quickly before a long full-SoC run.
+#[test]
+#[cfg(feature = "fhe-aloha")]
+#[ignore = "requires FHE_ALOHA_RTL and FHE_ALOHA_RTL_CWD"]
+fn protected_aloha_negative_host_demo() {
+    run_host_demo(
+        &firmware::APP_FHE_ALOHA,
+        "aloha_soc_validation.py",
+        false,
+        false,
+    );
+}
+
+/// Point FHE_ALOHA_RTL to an RPC launcher adding +RPC_ZEROIZE_REFRESH.
+#[test]
+#[cfg(feature = "fhe-aloha")]
+#[ignore = "requires RTL RPC with +RPC_ZEROIZE_REFRESH injection"]
+fn interrupted_aloha_host_demo() {
+    run_host_demo(
+        &firmware::APP_FHE_ALOHA,
+        "aloha_soc_validation.py",
+        false,
+        true,
+    );
 }
 
 /// `mnist_data` forwards FHE_MNIST_DATA as the client's cached --data-dir.
-fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool) {
+fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool, interrupt: bool) {
     use std::{
         fs,
         process::Command,
@@ -380,16 +462,20 @@ fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool) {
         [0x80000000u64.to_le_bytes(), 0x80010000u64.to_le_bytes()].concat(),
     )
     .unwrap();
+    let negative = script == "aloha_soc_validation.py";
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fhe")
         .join(script);
     let mut cmd = Command::new("python3");
     cmd.arg(script).arg(&dir).arg("--timeout").arg("120");
-    if std::env::var_os("FHE_FULL_DEMO").is_some() {
+    if interrupt {
+        cmd.arg("--interrupt-only");
+    }
+    if !negative && std::env::var_os("FHE_FULL_DEMO").is_some() {
         cmd.arg("--full");
     }
     if mnist_data {
-        // Exercise the refresh client in both transport modes.
+        // Exercise the same refresh client used by the full-SoC relay.
         cmd.arg("--refresh");
         if let Some(path) = std::env::var_os("FHE_MNIST_DATA") {
             cmd.arg("--data-dir").arg(path);
@@ -419,7 +505,27 @@ fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool) {
         if ext > 0 {
             m.soc_dram_mut().unwrap()[..ext].copy_from_slice(&data[12 + len..]);
         }
-        let result = send(&mut m, CommandId::from(id), h, &[]);
+        if negative {
+            m.soc_dram_mut().unwrap()[0x10000..0x12000].fill(0xa5);
+        }
+        let result = if !negative {
+            send(&mut m, CommandId::from(id), h, &[])
+        } else {
+            match m.mailbox_execute(id, &wire(id, h, &[])) {
+                Ok(Some(result)) => result,
+                Err(caliptra_hw_model::ModelError::MailboxCmdFailed(code)) => {
+                    assert!(
+                        m.soc_dram_mut().unwrap()[0x10000..0x12000]
+                            .iter()
+                            .all(|&value| value == 0xa5),
+                        "rejection changed output"
+                    );
+                    fs::write(dir.join(format!("resp-{i}")), words(&[0xffffffff, code])).unwrap();
+                    continue;
+                }
+                other => panic!("unexpected relay response: {other:?}"),
+            }
+        };
         let outlen = if ext > 0 { word(h, 16) as usize } else { 0 };
         let mut packet = words(&[result.len() as u32, outlen as u32]);
         packet.extend(result);

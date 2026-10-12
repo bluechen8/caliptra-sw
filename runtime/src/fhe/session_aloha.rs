@@ -1,5 +1,5 @@
 // Licensed under the Apache-2.0 license
-//! Aloha PSK protocol v3 plus v4 scale/refresh; compiled only with fhe-aloha.
+//! Aloha PSK open v6, command v3/v4; compiled only with fhe-aloha.
 //! Kept separate from session.rs because the legacy firmware embeds panic line
 //! numbers: any shared-file edit changes its image. Security/protocol fixes
 //! must be reviewed in both service implementations.
@@ -112,13 +112,13 @@ impl Request {
     pub fn parse(id: u32, b: &[u8]) -> CaliptraResult<Self> {
         let open = id == OPEN;
         let len = if open { 76 } else { 88 };
-        if b.len() < len || !matches!(word(b, 1), 3 | 4) {
+        if b.len() < len {
             return Err(INVALID);
         }
         let mut bytes = [0; 88];
         bytes[..len].copy_from_slice(&b[..len]);
         if open {
-            if b.len() != 76 || word(b, 1) != 3 {
+            if b.len() != 76 || word(b, 1) != 6 {
                 return Err(INVALID);
             }
             return Ok(Self {
@@ -130,6 +130,9 @@ impl Request {
                 dst: 0,
                 pointer: false,
             });
+        }
+        if !matches!(word(b, 1), 3 | 4) {
+            return Err(INVALID);
         }
         let op = word(b, 2);
         if !(1..=6).contains(&op) || IDS[(op - 1) as usize] != id {
@@ -190,8 +193,9 @@ fn open(d: &mut Drivers, r: &Request, header: &mut [u8; 100]) -> CaliptraResult<
     if s.active || s.transport.is_poisoned() {
         return Err(INVALID);
     }
-    // WIP single-flight open: authenticates policy, but has no server freshness.
-    let mut transcript = Zeroizing::new([0u8; 64]);
+    // Domain-separated v6 request, session ID and fresh server nonce are all
+    // authenticated by the confirmation and bound into both traffic keys.
+    let mut transcript = Zeroizing::new([0u8; 96]);
     transcript[4..60].copy_from_slice(&r.bytes[4..60]);
     let tag = d.aes.cmac(AesKey::Array(&PSK), &transcript[..60])?;
     if !constant_time_eq::constant_time_eq(&tag, &r.bytes[60..76]) {
@@ -212,6 +216,13 @@ fn open(d: &mut Drivers, r: &Request, header: &mut [u8; 100]) -> CaliptraResult<
     s.erase();
     s.id = s.id.checked_add(1).ok_or(INVALID)?;
     put(&mut transcript[..], 15, s.id);
+    for chunk in transcript[64..96].chunks_exact_mut(16) {
+        let (a, b, c, e) = d.trng.generate4()?;
+        for (dest, value) in chunk.chunks_exact_mut(4).zip([a, b, c, e]) {
+            dest.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    header[12..44].copy_from_slice(&transcript[64..96]);
     for i in 1..=4 {
         put(&mut transcript[..], 0, i);
         let mut key = d.aes.cmac(AesKey::Array(&PSK), &transcript[..])?;
@@ -225,12 +236,11 @@ fn open(d: &mut Drivers, r: &Request, header: &mut [u8; 100]) -> CaliptraResult<
         key.zeroize();
     }
     put(&mut transcript[..], 0, 5);
-    header[12..28].copy_from_slice(&d.aes.cmac(AesKey::Array(&PSK), &transcript[..])?);
+    header[44..60].copy_from_slice(&d.aes.cmac(AesKey::Array(&PSK), &transcript[..])?);
     put(header, 2, s.id);
     s.policy.copy_from_slice(&r.bytes[8..28]);
     s.active = true;
-    caliptra_drivers::cprintln!("FHE PSK WIP: NO OPEN REPLAY PROTECTION");
-    Ok(28)
+    Ok(60)
 }
 fn kernel(
     d: &mut Drivers,
