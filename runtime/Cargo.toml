@@ -94,7 +94,7 @@ fhe = ["dep:caliptra-fhe-core"]
 fhe-debug = ["fhe"]
 fhe-psk = ["fhe"]
 # N=256 hardware client with private AHB stream; distinct authenticated profile.
-fhe-aloha = ["fhe-psk"]
+fhe-aloha = ["fhe-psk", "no-mldsa"]
 # Reference classifier for comparing clear and encrypted inference; off by default.
 ml-clear = ["fhe-psk", "caliptra-api/ml-clear"]
 fhe-pl = ["fhe"]

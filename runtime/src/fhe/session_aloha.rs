@@ -253,7 +253,8 @@ fn kernel(
     match op {
         1 if keyed => Err(INVALID),
         1 => {
-            crate::fhe_aloha::keygen(&mut d.trng)?;
+            let rt_cdi = Drivers::get_key_id_rt_cdi(d)?;
+            crate::fhe_aloha::keygen(&mut d.hmac, &mut d.trng, &mut d.key_vault, rt_cdi)?;
             d.fhe_session.keyed = true;
             Ok(())
         }
@@ -273,9 +274,9 @@ fn kernel(
             Ok(())
         }
         2 | 3 | 6 if !keyed => Err(INVALID),
-        2 => crate::fhe_aloha::encrypt(&mut d.trng, plain),
+        2 => crate::fhe_aloha::encrypt(plain),
         3 => crate::fhe_aloha::decrypt_with_scale(plain, input, log_scale),
-        6 => crate::fhe_aloha::refresh(&mut d.trng, plain),
+        6 => crate::fhe_aloha::refresh(plain),
         // Op 5: erasure follows authenticated response generation. Parse
         // rejects op 4 without ml-clear.
         _ => Ok(()),

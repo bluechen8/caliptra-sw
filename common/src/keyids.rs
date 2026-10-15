@@ -39,6 +39,10 @@ pub const KEY_ID_RT_CDI: KeyId = KeyId::KeyId4;
 pub const KEY_ID_RT_ECDSA_PRIV_KEY: KeyId = KeyId::KeyId5;
 #[cfg(feature = "fmc")]
 pub const KEY_ID_RT_MLDSA_KEYPAIR_SEED: KeyId = KeyId::KeyId9;
+/// FHE (Aloha) KEYGEN seed. Slot 9 is unused when ML-DSA is compiled out:
+/// FMC skips the runtime ML-DSA derivation under `no-mldsa`.
+#[cfg(feature = "no-mldsa")]
+pub const KEY_ID_FHE_SEED: KeyId = KeyId::KeyId9;
 #[cfg(feature = "runtime")]
 pub const KEY_ID_DPE_CDI: KeyId = KeyId::KeyId10;
 #[cfg(feature = "runtime")]
