@@ -6,9 +6,9 @@
     feature = "fpga_realtime",
     feature = "fpga_subsystem"
 )))]
-// Exercise the same integer reconstruction source used by the Aloha backend.
+// Integer reconstruction of Aloha residues, used to check ciphertexts.
 #[cfg(feature = "fhe-aloha")]
-#[path = "../src/fhe/recovery.rs"]
+#[path = "aloha_recovery/mod.rs"]
 mod coefficient_recovery;
 
 use caliptra_api::{mailbox::CommandId, SocManager};
@@ -18,13 +18,14 @@ use caliptra_image_types::FwVerificationPqcKeyType;
 use zerocopy::IntoBytes;
 
 fn boot(fwid: &'static FwId<'static>) -> DefaultHwModel {
-    let rom = caliptra_builder::build_firmware_rom(&firmware::ROM_WITH_UART_NO_MLDSA).unwrap();
+    boot_with(&firmware::ROM_WITH_UART_NO_MLDSA, &firmware::FMC_WITH_UART_NO_MLDSA, fwid)
+}
+fn boot_with(rom: &FwId<'static>, fmc: &FwId<'static>, fwid: &'static FwId<'static>) -> DefaultHwModel {
+    let rom = caliptra_builder::build_firmware_rom(rom).unwrap();
     let mut opts = ImageOptions::default();
     opts.pqc_key_type = FwVerificationPqcKeyType::LMS;
     opts.vendor_config.pl0_pauser = Some(1);
-    let image =
-        caliptra_builder::build_and_sign_image(&firmware::FMC_WITH_UART_NO_MLDSA, fwid, opts)
-            .unwrap();
+    let image = caliptra_builder::build_and_sign_image(fmc, fwid, opts).unwrap();
     fn hash_words(bytes: &[u8]) -> [u32; 12] {
         use sha2::{Digest, Sha384};
         let hash = Sha384::digest(bytes);
@@ -272,6 +273,116 @@ impl User {
         assert!(m.mailbox_execute(id, &wire(id, h, body)).is_err());
     }
 }
+
+/// Aloha v5 client (docs/fhe/16 "Session protocol on the DMA path"). Headers
+/// are in clear; only the ENCRYPT message and the DECRYPT output are sealed.
+/// Buffers live in the RTL testbench memory, the only memory Aloha's DMA reaches.
+#[cfg(feature = "fhe-aloha")]
+mod v5 {
+    use super::*;
+    pub const SRC: u64 = super::DRAM_BASE;
+    pub const DST: u64 = super::DRAM_BASE + 0x1_0000;
+    pub const CT: usize = 8192;
+    pub const Q0: usize = 4096;
+    pub const MSG: usize = 2048;
+    /// ERR_CAUSE values firmware reports in the response status word.
+    pub const BAD_INPUT: u32 = 8;
+    pub const ABORTED: u32 = 11;
+    pub fn lengths(op: u32) -> (usize, usize) {
+        match op {
+            2 => (MSG, CT),
+            3 => (Q0, MSG),
+            6 => (Q0, CT),
+            _ => (0, 0),
+        }
+    }
+    /// One decoded response.
+    pub struct Reply {
+        pub status: u32,
+        pub tag: Vec<u8>,
+    }
+    impl User {
+        /// The request header; `tag` is the ENCRYPT message tag.
+        pub fn header(&self, op: u32, tag: &[u8], log_scale: u32) -> Vec<u8> {
+            let (input, output) = lengths(op);
+            let (src, dst) = if input == 0 { (0, 0) } else { (SRC, DST) };
+            let mut h = words(&[
+                0,
+                5,
+                op,
+                self.id,
+                self.seq,
+                src as u32,
+                (src >> 32) as u32,
+                dst as u32,
+                (dst >> 32) as u32,
+                input as u32,
+                output as u32,
+                log_scale,
+            ]);
+            h.extend(tag);
+            h.resize(64, 0);
+            h
+        }
+        /// Seals an ENCRYPT message for the next sequence number.
+        pub fn seal(&self, msg: &[u8]) -> (Vec<u8>, Vec<u8>) {
+            let ct = crypto("encrypt", &self.rx, msg, &[], &words(&[0, self.seq, 0]));
+            let (body, tag) = ct.split_at(ct.len() - 16);
+            (body.to_vec(), tag.to_vec())
+        }
+        /// Sends a header; the response must be for this session and sequence.
+        pub fn send5(&mut self, m: &mut DefaultHwModel, h: &[u8]) -> Reply {
+            let op = word(h, 2);
+            let r = send(m, CommandId::from(IDS[(op - 1) as usize]), h, &[]);
+            assert_eq!(r.len(), 44);
+            assert_eq!((word(&r, 2), word(&r, 3)), (self.id, word(h, 4)));
+            self.seq += 1;
+            Reply {
+                status: word(&r, 4),
+                tag: r[28..44].to_vec(),
+            }
+        }
+        pub fn keygen(&mut self, m: &mut DefaultHwModel) {
+            let h = self.header(1, &[], 0);
+            assert_eq!(self.send5(m, &h).status, 0);
+        }
+        pub fn close(&mut self, m: &mut DefaultHwModel) {
+            let h = self.header(5, &[], 0);
+            assert_eq!(self.send5(m, &h).status, 0);
+        }
+        /// ENCRYPT; returns the status and, on success, the 8 KiB ciphertext.
+        pub fn encrypt5(&mut self, m: &mut DefaultHwModel, msg: &[u8]) -> (u32, Vec<u8>) {
+            let (body, tag) = self.seal(msg);
+            dram_write(m, SRC, &body);
+            let h = self.header(2, &tag, 0);
+            let r = self.send5(m, &h);
+            (r.status, dram_read(m, DST, CT))
+        }
+        /// DECRYPT c0, c1 limb 0 (4 KiB); returns the status and the opened slots.
+        pub fn decrypt5(&mut self, m: &mut DefaultHwModel, q0: &[u8], log_scale: u32) -> (u32, Vec<u8>) {
+            dram_write(m, SRC, q0);
+            let h = self.header(3, &[], log_scale);
+            let seq = self.seq;
+            let r = self.send5(m, &h);
+            if r.status != 0 {
+                return (r.status, Vec::new());
+            }
+            let mut body = dram_read(m, DST, MSG);
+            body.extend(&r.tag);
+            (0, crypto("decrypt", &self.tx, &body, &[], &words(&[1, seq, 0])))
+        }
+        pub fn refresh5(&mut self, m: &mut DefaultHwModel, q0: &[u8], log_scale: u32) -> (u32, Vec<u8>) {
+            dram_write(m, SRC, q0);
+            let h = self.header(6, &[], log_scale);
+            let r = self.send5(m, &h);
+            (r.status, dram_read(m, DST, CT))
+        }
+    }
+    /// c0, c1 limb 0 of a full ciphertext.
+    pub fn q0(ct: &[u8]) -> Vec<u8> {
+        [&ct[..2048], &ct[4096..6144]].concat()
+    }
+}
 #[test]
 fn protected_flow_and_security() {
     let mut m = boot(&firmware::APP_FHE_PSK_ML_CLEAR);
@@ -387,9 +498,12 @@ fn protected_aloha_open_freshness() {
     assert!(m
         .mailbox_execute(open_id, &wire(open_id, &legacy, &[]))
         .is_err());
-    let old = User::open(&mut m, [0x4e, 64, ALOHA_PROFILE, 2, 0]);
-    let (old_packet, old_body) = old.packet(1, &[], false);
-    // Let runtime finish the open command and enter idle before warm reset.
+    let mut old = User::open(&mut m, [0x4e, 64, ALOHA_PROFILE, 2, 0]);
+    old.keygen(&mut m);
+    // A message sealed under the old session's request key, for seq 2.
+    let (old_body, old_tag) = old.seal(&[0; v5::MSG]);
+    let old_header = old.header(2, &old_tag, 0);
+    // Let runtime finish the command and enter idle before warm reset.
     for _ in 0..10000 {
         m.step();
     }
@@ -409,10 +523,59 @@ fn protected_aloha_open_freshness() {
     assert_eq!(old.id, fresh.id, "test must exercise repeated session ID");
     assert_ne!(old.rx, fresh.rx);
     assert_ne!(old.tx, fresh.tx);
-    // Metadata and sequence match: only fresh traffic keys prevent replay.
-    old.reject(&mut m, 1, &old_packet, &old_body);
-    fresh.call(&mut m, 1, &[], false);
-    fresh.call(&mut m, 5, &[], false);
+    fresh.keygen(&mut m);
+    // Session ID and sequence match the replay: only the fresh request key
+    // stops it. The tag fails at COMMIT_WAIT, so Aloha aborts and writes nothing.
+    assert_eq!(word(&old_header, 4), fresh.seq);
+    dram_write(&mut m, v5::SRC, &old_body);
+    dram_write(&mut m, v5::DST, &[0xa5; v5::CT]);
+    assert_eq!(fresh.send5(&mut m, &old_header).status, v5::ABORTED);
+    assert!(dram_read(&mut m, v5::DST, v5::CT).iter().all(|&v| v == 0xa5));
+    fresh.close(&mut m);
+}
+
+/// Quick boot (fake ROM and fake FMC, as the SoC smoke bundle uses) skips the
+/// key ladder; KEYGEN still needs a usable RT CDI in KeyVault.
+#[test]
+#[cfg(feature = "fhe-aloha")]
+#[ignore = "requires FHE_ALOHA_RTL and FHE_ALOHA_RTL_CWD"]
+fn protected_aloha_quick_boot_keygen() {
+    let mut m = boot_with(
+        &firmware::ROM_FAKE_WITH_UART_NO_MLDSA,
+        &firmware::FMC_FAKE_WITH_UART_NO_MLDSA,
+        &firmware::APP_FHE_ALOHA,
+    );
+    let mut u = User::open(&mut m, [0x0e, 8, ALOHA_PROFILE, 2, 0]);
+    u.keygen(&mut m);
+    let (status, ct) = u.encrypt5(&mut m, &[0; v5::MSG]);
+    assert_eq!(status, 0);
+    assert_eq!(u.decrypt5(&mut m, &v5::q0(&ct), 25).0, 0);
+    u.close(&mut m);
+}
+
+/// After DisableAttestation the RT CDI is a public constant: KEYGEN is
+/// refused, while a key generated before it stays usable.
+#[test]
+#[cfg(feature = "fhe-aloha")]
+#[ignore = "requires FHE_ALOHA_RTL and FHE_ALOHA_RTL_CWD"]
+fn protected_aloha_keygen_after_disable_attestation() {
+    let mut m = boot(&firmware::APP_FHE_ALOHA);
+    let mut u = User::open(&mut m, [0x0e, 8, ALOHA_PROFILE, 2, 0]);
+    u.keygen(&mut m);
+    let disable: u32 = CommandId::DISABLE_ATTESTATION.into();
+    m.mailbox_execute(disable, &wire(disable, &[0; 4], &[])).unwrap();
+    let (status, ct) = u.encrypt5(&mut m, &[0; v5::MSG]);
+    assert_eq!(status, 0);
+    assert_eq!(u.decrypt5(&mut m, &v5::q0(&ct), 25).0, 0);
+    u.close(&mut m);
+    let u = User::open(&mut m, [0x0e, 8, ALOHA_PROFILE, 2, 0]);
+    let id: u32 = IDS[0];
+    match m.mailbox_execute(id, &wire(id, &u.header(1, &[], 0), &[])) {
+        Err(caliptra_hw_model::ModelError::MailboxCmdFailed(code)) => {
+            assert_eq!(code, 0x000e_0105) // RUNTIME_FHE_ATTESTATION_DISABLED
+        }
+        other => panic!("KEYGEN after DisableAttestation: {other:?}"),
+    }
 }
 
 /// Validate the SoC negative client quickly before a long full-SoC run.
@@ -439,6 +602,26 @@ fn interrupted_aloha_host_demo() {
         false,
         true,
     );
+}
+
+/// SoC DRAM, based at 0x8000_0000: the Aloha RTL's testbench memory when its
+/// link is up, else the model's SoC DRAM.
+const DRAM_BASE: u64 = 0x8000_0000;
+fn dram_write(m: &mut DefaultHwModel, addr: u64, data: &[u8]) {
+    #[cfg(feature = "fhe-aloha")]
+    if let Some(rtl) = m.fhe_rtl() {
+        return rtl.dram_write(addr, data);
+    }
+    let off = (addr - DRAM_BASE) as usize;
+    m.soc_dram_mut().unwrap()[off..off + data.len()].copy_from_slice(data);
+}
+fn dram_read(m: &mut DefaultHwModel, addr: u64, len: usize) -> Vec<u8> {
+    #[cfg(feature = "fhe-aloha")]
+    if let Some(rtl) = m.fhe_rtl() {
+        return rtl.dram_read(addr, len);
+    }
+    let off = (addr - DRAM_BASE) as usize;
+    m.soc_dram_mut().unwrap()[off..off + len].to_vec()
 }
 
 /// `mnist_data` forwards FHE_MNIST_DATA as the client's cached --data-dir.
@@ -503,10 +686,10 @@ fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool, i
         let ext = word(&data, 2) as usize;
         let h = &data[12..12 + len];
         if ext > 0 {
-            m.soc_dram_mut().unwrap()[..ext].copy_from_slice(&data[12 + len..]);
+            dram_write(&mut m, DRAM_BASE, &data[12 + len..]);
         }
         if negative {
-            m.soc_dram_mut().unwrap()[0x10000..0x12000].fill(0xa5);
+            dram_write(&mut m, DRAM_BASE + 0x10000, &[0xa5; 0x2000]);
         }
         let result = if !negative {
             send(&mut m, CommandId::from(id), h, &[])
@@ -515,7 +698,7 @@ fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool, i
                 Ok(Some(result)) => result,
                 Err(caliptra_hw_model::ModelError::MailboxCmdFailed(code)) => {
                     assert!(
-                        m.soc_dram_mut().unwrap()[0x10000..0x12000]
+                        dram_read(&mut m, DRAM_BASE + 0x10000, 0x2000)
                             .iter()
                             .all(|&value| value == 0xa5),
                         "rejection changed output"
@@ -526,11 +709,16 @@ fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool, i
                 other => panic!("unexpected relay response: {other:?}"),
             }
         };
-        let outlen = if ext > 0 { word(h, 16) as usize } else { 0 };
+        // Output bytes: request word 10 in v5, word 16 in v3/v4.
+        let outlen = match (ext, word(h, 1)) {
+            (0, _) => 0,
+            (_, 5) => word(h, 10) as usize,
+            _ => word(h, 16) as usize,
+        };
         let mut packet = words(&[result.len() as u32, outlen as u32]);
         packet.extend(result);
         if outlen > 0 {
-            packet.extend_from_slice(&m.soc_dram_mut().unwrap()[0x10000..0x10000 + outlen]);
+            packet.extend(dram_read(&mut m, DRAM_BASE + 0x10000, outlen));
         }
         fs::write(dir.join(format!("resp-{i}")), packet).unwrap();
     }
@@ -744,49 +932,66 @@ fn protected_without_clear_reference() {
     assert!(m.mailbox_execute(id, &wire(id, &req, &[])).is_err());
 }
 
-/// Bad authentication leaves external output untouched and consumes no sequence;
-/// authenticated non-canonical ciphertext is rejected.
+/// A forged ENCRYPT message is caught at COMMIT_WAIT: Aloha aborts, writes
+/// nothing and drops the resident key; the session needs a new KEYGEN. Bad
+/// input words (ciphertext residues, non-finite slots) fail only their command.
 #[test]
 #[cfg(feature = "fhe-aloha")]
 #[ignore = "requires FHE_ALOHA_RTL and FHE_ALOHA_RTL_CWD"]
 fn protected_aloha_bad_tag() {
     let mut m = boot(&firmware::APP_FHE_ALOHA);
     m.paint_runtime_stack_canary();
-    for pointer in [false, true] {
-        let mut u = User::open(&mut m, [0x0e, 8, ALOHA_PROFILE, 2, 0]);
-        u.call(&mut m, 1, &[], false);
-        let (h, ct) = u.packet(2, &[0; 2048], pointer);
-        let mut bad = h.clone();
-        bad[72] ^= 1;
-        m.soc_dram_mut().unwrap()[0x10000..0x12000].fill(0xa5);
-        if pointer {
-            m.soc_dram_mut().unwrap()[..ct.len()].copy_from_slice(&ct);
-        }
-        u.reject(&mut m, 2, &bad, if pointer { &[] } else { &ct });
-        assert!(m.soc_dram_mut().unwrap()[0x10000..0x12000]
-            .iter()
-            .all(|v| *v == 0xa5));
-        // A valid retry succeeds, then replay is rejected.
-        assert_eq!(u.call(&mut m, 2, &[0; 2048], pointer).len(), 8192);
-        u.reject(&mut m, 2, &h, if pointer { &[] } else { &ct });
-        u.call(&mut m, 5, &[], false);
-    }
-    // An authenticated but non-canonical residue is rejected before Aloha runs,
-    // including in limb 1, which decryption does not otherwise consume.
     let mut u = User::open(&mut m, [0x0e, 8, ALOHA_PROFILE, 2, 0]);
-    u.call(&mut m, 1, &[], false);
-    let mut ct = u.call(&mut m, 2, &[0; 2048], false);
-    assert_eq!(u.call(&mut m, 3, &ct, false).len(), 2048);
-    // c0 limb 0, c0 limb 1, c1 limb 0, c1 limb 1: 2048 bytes each.
-    let q1 = (1u64 << 47) - (1 << 24) + 1;
-    ct[3 * 2048..3 * 2048 + 8].copy_from_slice(&q1.to_le_bytes());
-    let (h, body) = u.packet(3, &ct, false);
-    u.reject(&mut m, 3, &h, &body);
+    u.keygen(&mut m);
+    let (body, tag) = u.seal(&[0; v5::MSG]);
+    let mut forged = tag.clone();
+    forged[0] ^= 1;
+    dram_write(&mut m, v5::SRC, &body);
+    dram_write(&mut m, v5::DST, &[0xa5; v5::CT]);
+    let h = u.header(2, &forged, 0);
+    assert_eq!(u.send5(&mut m, &h).status, v5::ABORTED);
+    assert!(dram_read(&mut m, v5::DST, v5::CT).iter().all(|&v| v == 0xa5));
+    // The key is gone: ENCRYPT is refused without consuming the sequence.
+    let (_, tag) = u.seal(&[0; v5::MSG]);
+    u.reject(&mut m, 2, &u.header(2, &tag, 0), &[]);
+    // Replaying the forged command's sequence number is refused too.
+    let mut replay = h.clone();
+    replay[48..64].copy_from_slice(&tag);
+    u.reject(&mut m, 2, &replay, &[]);
+    u.keygen(&mut m);
+    let (status, ct) = u.encrypt5(&mut m, &[0; v5::MSG]);
+    assert_eq!(status, 0);
+    let (status, slots) = u.decrypt5(&mut m, &v5::q0(&ct), 25);
+    assert_eq!(status, 0);
+    assert!(slots.chunks_exact(8).all(|b| f64::from_le_bytes(b.try_into().unwrap()).abs() < 0.01));
+    // A non-canonical residue: the command fails and writes nothing; the
+    // session and the key survive.
+    let mut bad = v5::q0(&ct);
+    bad[..8].copy_from_slice(&coefficient_recovery::Q[0].to_le_bytes());
+    dram_write(&mut m, v5::DST, &[0xa5; v5::MSG]);
+    assert_eq!(u.decrypt5(&mut m, &bad, 25).0, v5::BAD_INPUT);
+    assert!(dram_read(&mut m, v5::DST, v5::MSG).iter().all(|&v| v == 0xa5));
+    // A NaN slot is reported only after the tag check commits the message.
+    let mut nan = vec![0u8; v5::MSG];
+    nan[16..24].copy_from_slice(&f64::NAN.to_le_bytes());
+    assert_eq!(u.encrypt5(&mut m, &nan).0, v5::BAD_INPUT);
+    assert_eq!(u.decrypt5(&mut m, &v5::q0(&ct), 25).0, 0);
+    // Malformed headers are refused without consuming the sequence.
+    let mut h = u.header(3, &[], 25);
+    h[44..48].copy_from_slice(&41u32.to_le_bytes());
+    u.reject(&mut m, 3, &h, &[]);
+    let mut h = u.header(3, &[], 25);
+    h[20..24].copy_from_slice(&(v5::SRC as u32 + 8).to_le_bytes());
+    u.reject(&mut m, 3, &h, &[]);
+    let mut h = u.header(3, &[], 25);
+    h[48] = 1; // tag on a DECRYPT request
+    u.reject(&mut m, 3, &h, &[]);
+    u.close(&mut m);
     assert!(m.runtime_stack_canary_used() < caliptra_common::memory_layout::STACK_SIZE as usize);
 }
 
-/// Real RV32 firmware + Aloha RTL: retain coefficients and scale while restoring
-/// the two-prime chain. AES/DMA/mailbox remain emulator models.
+/// Real RV32 firmware + Aloha RTL, AES and DMA: retain coefficients and scale
+/// while restoring the two-prime chain. The mailbox remains an emulator model.
 #[test]
 #[cfg(feature = "fhe-aloha")]
 #[ignore = "requires FHE_ALOHA_RTL and FHE_ALOHA_RTL_CWD"]
@@ -803,79 +1008,59 @@ fn protected_aloha_level_refresh() {
         })
         .collect();
     let pt: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let drop_to_q0 = |ct: &[u8]| [ct[..2048].to_vec(), ct[4096..6144].to_vec()].concat();
-    for pointer in [false, true] {
-        let mut u = User::open(&mut m, [0x4e, 8, ALOHA_PROFILE, 2, 0]);
-        u.call(&mut m, 1, &[], false);
-        let mut ct = u.call(&mut m, 2, &pt, pointer);
-        // A real numerical scale change: multiply the integer polynomial AND
-        // scale by two. Merely relabeling the metadata would change the value.
-        for (li, block) in ct.chunks_exact_mut(2048).enumerate() {
-            let q = coefficient_recovery::Q[li % 2];
-            for v in block.chunks_exact_mut(8) {
-                let x = u64::from_le_bytes(v.try_into().unwrap());
-                v.copy_from_slice(&((2 * x) % q).to_le_bytes());
-            }
+    let mut u = User::open(&mut m, [0x4e, 8, ALOHA_PROFILE, 2, 0]);
+    u.keygen(&mut m);
+    let (status, mut ct) = u.encrypt5(&mut m, &pt);
+    assert_eq!(status, 0);
+    // A real numerical scale change: multiply the integer polynomial AND
+    // scale by two. Merely relabeling the metadata would change the value.
+    for (li, block) in ct.chunks_exact_mut(2048).enumerate() {
+        let q = coefficient_recovery::Q[li % 2];
+        for v in block.chunks_exact_mut(8) {
+            let x = u64::from_le_bytes(v.try_into().unwrap());
+            v.copy_from_slice(&((2 * x) % q).to_le_bytes());
         }
-        let mut single = drop_to_q0(&ct);
-        u.log_scale = Some(26);
-        let (h, encrypted) = u.packet(6, &single, pointer);
-        let mut bad = h.clone();
-        // Authenticated exponent is bound to the GCM tag.
-        bad[68..72].copy_from_slice(&27u32.to_le_bytes());
-        if pointer {
-            m.soc_dram_mut().unwrap()[..encrypted.len()].copy_from_slice(&encrypted);
-        }
-        m.soc_dram_mut().unwrap()[0x10000..0x12000].fill(0xa5);
-        u.reject(&mut m, 6, &bad, if pointer { &[] } else { &encrypted });
-        assert!(m.soc_dram_mut().unwrap()[0x10000..0x12000]
-            .iter()
-            .all(|v| *v == 0xa5));
-        for invalid in [0, 41] {
-            u.log_scale = Some(invalid);
-            let (h, b) = u.packet(6, &single, false);
-            u.reject(&mut m, 6, &h, &b);
-        }
-        u.log_scale = Some(26);
-        let mut previous = Vec::new();
-        for iteration in 0..2 {
-            let refreshed = u.call(&mut m, 6, &single, pointer);
-            assert_eq!(refreshed.len(), 8192);
-            if iteration == 0 {
-                u.reject(&mut m, 6, &h, if pointer { &[] } else { &encrypted });
-            } else {
-                assert_ne!(
-                    &refreshed[4096..],
-                    &previous[4096..],
-                    "refresh repeated uniform a"
-                );
-            }
-            let decoded = u.call(&mut m, 3, &refreshed, pointer);
-            let max_error = decoded
-                .chunks_exact(8)
-                .zip(&values)
-                .map(|(b, v)| (f64::from_le_bytes(b.try_into().unwrap()) - v).abs())
-                .fold(0.0, f64::max);
-            assert!(
-                max_error < 0.001,
-                "refresh scale/precision mismatch: {max_error}"
-            );
-            println!("refresh pointer={pointer} iteration={iteration} log_scale=26 max_error={max_error}");
-            single = drop_to_q0(&refreshed);
-            previous = refreshed;
-        }
-        // An authenticated out-of-range source residue must never reach RTL.
-        single[..8].copy_from_slice(&coefficient_recovery::Q[0].to_le_bytes());
-        let (h, b) = u.packet(6, &single, false);
-        u.reject(&mut m, 6, &h, &b);
-        // Backend failure erases the session; the next iteration opens afresh.
     }
-    // Refresh needs an explicit policy grant, even for an authenticated caller.
+    for invalid in [0, 41] {
+        u.reject(&mut m, 6, &u.header(6, &[], invalid), &[]);
+    }
+    let mut single = v5::q0(&ct);
+    let mut previous = Vec::new();
+    for iteration in 0..2 {
+        let (status, refreshed) = u.refresh5(&mut m, &single, 26);
+        assert_eq!(status, 0);
+        if iteration > 0 {
+            assert_ne!(
+                &refreshed[4096..],
+                &previous[4096..],
+                "refresh repeated uniform a"
+            );
+        }
+        let (status, decoded) = u.decrypt5(&mut m, &v5::q0(&refreshed), 26);
+        assert_eq!(status, 0);
+        let max_error = decoded
+            .chunks_exact(8)
+            .zip(&values)
+            .map(|(b, v)| (f64::from_le_bytes(b.try_into().unwrap()) - v).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            max_error < 0.001,
+            "refresh scale/precision mismatch: {max_error}"
+        );
+        println!("refresh iteration={iteration} log_scale=26 max_error={max_error}");
+        single = v5::q0(&refreshed);
+        previous = refreshed;
+    }
+    // An out-of-range source residue fails the command; nothing is written.
+    single[..8].copy_from_slice(&coefficient_recovery::Q[0].to_le_bytes());
+    dram_write(&mut m, v5::DST, &[0xa5; v5::CT]);
+    assert_eq!(u.refresh5(&mut m, &single, 26).0, v5::BAD_INPUT);
+    assert!(dram_read(&mut m, v5::DST, v5::CT).iter().all(|&v| v == 0xa5));
+    u.close(&mut m);
+    // Refresh needs an explicit policy grant.
     let mut u = User::open(&mut m, [0x0e, 8, ALOHA_PROFILE, 2, 0]);
-    u.call(&mut m, 1, &[], false);
-    let (h, b) = u.packet(6, &[0; 4096], false);
-    u.reject(&mut m, 6, &h, &b);
-    u.seq += 1; // Authenticated policy rejection consumes its sequence.
-    u.call(&mut m, 5, &[], false);
+    u.keygen(&mut m);
+    u.reject(&mut m, 6, &u.header(6, &[], 26), &[]);
+    u.close(&mut m);
     assert!(m.runtime_stack_canary_used() < caliptra_common::memory_layout::STACK_SIZE as usize);
 }

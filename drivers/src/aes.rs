@@ -678,6 +678,36 @@ impl Aes {
         Ok(())
     }
 
+    /// Starts an AES-256-GCM operation whose text phase another engine client
+    /// drives (the DMA's AES route): mode, key, IV and AAD only. The caller
+    /// must not touch the engine again until the text phase has finished, then
+    /// call `aes_256_gcm_end`. Zeroize the engine on any failure in between.
+    #[cfg_attr(not(feature = "no-cfi"), cfi_impl_fn)]
+    pub fn aes_256_gcm_begin(
+        &mut self,
+        trng: &mut Trng,
+        iv: &[u8; AES_IV_SIZE_BYTES],
+        key: AesKey,
+        aad: &[u8],
+        op: AesOperation,
+    ) -> CaliptraResult<()> {
+        if aad.len() > AES_MAX_DATA_SIZE {
+            Err(CaliptraError::RUNTIME_DRIVER_AES_INVALID_SLICE)?;
+        }
+        self.initialize_aes_gcm(trng, iv.into(), key, aad, op)
+            .map(|_| ())
+    }
+
+    /// Finishes an operation started by `aes_256_gcm_begin` after `text_len`
+    /// bytes of text: returns the tag and clears the engine.
+    pub fn aes_256_gcm_end(
+        &mut self,
+        aad_len: usize,
+        text_len: usize,
+    ) -> CaliptraResult<[u8; AES_BLOCK_SIZE_BYTES]> {
+        self.compute_tag(aad_len, text_len)
+    }
+
     /// Initializes the AES engine for GCM mode and returns the IV used.
     #[cfg_attr(not(feature = "no-cfi"), cfi_impl_fn)]
     fn initialize_aes_gcm(

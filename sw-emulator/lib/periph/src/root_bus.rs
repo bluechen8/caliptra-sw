@@ -284,8 +284,13 @@ pub struct CaliptraRootBus {
     #[peripheral(offset = 0x1001_0000, len = 0xa14)]
     pub hmac: HmacSha,
 
+    #[cfg(not(feature = "fhe-aloha"))]
     #[peripheral(offset = 0x1001_1000, len = 0x8c)]
     pub aes: Aes,
+
+    #[cfg(feature = "fhe-aloha")]
+    #[peripheral(offset = 0x1001_1000, len = 0x8c)]
+    pub aes: crate::fhe_rtl::AesRoute,
 
     #[peripheral(offset = 0x1001_1800, len = 0x614)]
     pub aes_clp: AesClp,
@@ -381,10 +386,15 @@ impl CaliptraRootBus {
         let ml_dsa87 = Mldsa87::new(clock, key_vault.clone(), sha512.clone());
 
         let aes_key = Rc::new(RefCell::new(None));
+        #[cfg(feature = "fhe-aloha")]
+        let fhe = crate::fhe_rtl::FheRtl::new();
 
         Self {
             rom,
+            #[cfg(not(feature = "fhe-aloha"))]
             aes: Aes::new(aes_key.clone()),
+            #[cfg(feature = "fhe-aloha")]
+            aes: crate::fhe_rtl::AesRoute::new(Aes::new(aes_key.clone()), fhe.clone()),
             aes_clp: AesClp::new(clock, key_vault.clone(), aes_key),
             doe: Doe::new(clock, key_vault.clone(), soc_reg.clone()),
             ecc384: AsymEcc384::new(clock, key_vault.clone(), sha512.clone()),
@@ -403,7 +413,7 @@ impl CaliptraRootBus {
             sha512_acc,
             dma,
             #[cfg(feature = "fhe-aloha")]
-            fhe: crate::fhe_rtl::FheRtl::new(),
+            fhe,
             csrng: Csrng::new(itrng_nibbles.unwrap()),
             pic_regs: pic.mmio_regs(clock.clone()),
             mci,

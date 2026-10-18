@@ -2287,6 +2287,11 @@ impl CaliptraError {
             0x000e_0104,
             "Runtime Error: FHE encrypt stalled awaiting reseed and never released"
         ),
+        (
+            RUNTIME_FHE_ATTESTATION_DISABLED,
+            0x000e_0105,
+            "Runtime Error: FHE KEYGEN refused because attestation is disabled"
+        ),
     ];
 }
 

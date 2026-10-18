@@ -118,6 +118,11 @@ pub const FMC_FAKE_WITH_UART: FwId = FwId {
     features: &["emu", "fake-fmc"],
 };
 
+pub const FMC_FAKE_WITH_UART_NO_MLDSA: FwId = FwId {
+    features: &["emu", "fake-fmc", "no-mldsa"],
+    ..FMC_FAKE_WITH_UART
+};
+
 // TODO: delete this when AXI DMA is fixed in the FPGA
 pub const FMC_FPGA_WITH_UART: FwId = FwId {
     crate_name: "caliptra-fmc",
@@ -157,7 +162,7 @@ pub const APP_FHE_PSK: FwId = FwId {
 
 #[cfg(feature = "fhe-aloha")]
 pub const APP_FHE_ALOHA: FwId = FwId {
-    features: &["emu", "no-mldsa", "fhe-aloha", "ml-clear"],
+    features: &["emu", "no-mldsa", "fhe-aloha"],
     ..APP_FHE_PSK
 };
 
@@ -578,6 +583,7 @@ pub const REGISTERED_FW: &[&FwId] = &[
     &FMC_WITH_UART,
     &FMC_WITH_UART_NO_MLDSA,
     &FMC_FAKE_WITH_UART,
+    &FMC_FAKE_WITH_UART_NO_MLDSA,
     &FMC_FPGA_WITH_UART,
     &APP,
     &APP_WITH_UART,

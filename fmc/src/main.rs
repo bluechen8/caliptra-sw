@@ -24,7 +24,7 @@ use caliptra_cpu::{log_trap_record, TrapRecord};
 
 use caliptra_drivers::{
     hand_off::{DataStore, HandOffDataHandle},
-    ResetReason,
+    HmacData, HmacKey, HmacMode, KeyReadArgs, KeyUsage, KeyWriteArgs, ResetReason,
 };
 
 mod boot_status;
@@ -76,6 +76,18 @@ pub extern "C" fn entry_point() -> ! {
     if env.persistent_data.get().fht.is_valid() {
         // Set FHT fields and jump to RT for val-FMC for now
         if cfg!(feature = "fake-fmc") {
+            // The RT key ladder is skipped. Fill the RT CDI slot from the FMC
+            // CDI so runtime derivations keyed by the RT CDI (the FHE seed)
+            // still work; the value is a test stand-in, not a DICE CDI.
+            if let Err(e) = env.hmac.hmac(
+                HmacKey::Key(KeyReadArgs::new(HandOff::fmc_cdi(&env))),
+                HmacData::Slice(b"fake-fmc rt cdi"),
+                &mut env.trng,
+                KeyWriteArgs::new(KEY_ID_RT_CDI, KeyUsage::default().set_hmac_key_en()).into(),
+                HmacMode::Hmac512,
+            ) {
+                handle_fatal_error(e.into());
+            }
             env.persistent_data.get_mut().fht.rt_cdi_kv_hdl =
                 HandOffDataHandle::from(DataStore::KeyVaultSlot(KEY_ID_RT_CDI));
             env.persistent_data.get_mut().fht.rt_priv_key_kv_hdl =

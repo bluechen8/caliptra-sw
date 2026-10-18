@@ -179,6 +179,15 @@ impl ModelEmulated {
             .as_mut()
             .map(|ram| ram.data_mut())
     }
+
+    /// The Aloha RTL link, when one is configured (FHE_ALOHA_RTL). Aloha's
+    /// DMA reaches only the testbench memory, so the host's DRAM buffers for
+    /// Aloha commands live there, not in `soc_dram_mut`.
+    #[cfg(feature = "fhe-aloha")]
+    pub fn fhe_rtl(&mut self) -> Option<&mut caliptra_emu_periph::fhe_rtl::FheRtl> {
+        let rtl = &mut self.cpu.bus.bus.fhe;
+        rtl.active().then_some(rtl)
+    }
 }
 
 fn hash_slice(slice: &[u8]) -> u64 {
