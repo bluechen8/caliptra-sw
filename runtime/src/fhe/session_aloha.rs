@@ -10,7 +10,7 @@
 //! before Aloha commits it; the DECRYPT output is GCM-sealed under the
 //! response key by the DMA. FHE ciphertexts bypass AES. Bulk data stays in
 //! DRAM: VeeR never reads it.
-use crate::fhe_aloha::{Done, CIPHERTEXT_BYTES, MESSAGE_BYTES, Q0_BYTES};
+use crate::fhe_aloha::Done;
 use crate::Drivers;
 use caliptra_drivers::{AesKey, CaliptraError, CaliptraResult};
 use caliptra_registers::mbox::enums::MboxStatusE;
@@ -32,7 +32,8 @@ const ENCRYPT: u32 = 2;
 const DECRYPT: u32 = 3;
 const CLOSE: u32 = 5;
 const REFRESH: u32 = 6;
-const PARAM_ID: u32 = 0xa108;
+/// Aloha profile: 0xa100 | log2(N) of the engine's build.
+const PARAM_ID_BASE: u32 = 0xa100;
 const OPEN: u32 = 0x4648534f;
 const IDS: [u32; 6] = [
     0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485246,
@@ -113,6 +114,10 @@ pub struct Request {
     open: bool,
     src: u64,
     dst: u64,
+    /// ENCRYPT / REFRESH output level, chosen by the orchestrator (Rocket).
+    level: u32,
+    /// The engine's geometry, read once per request (unset for OPEN).
+    g: crate::fhe_aloha::Geometry,
 }
 impl Request {
     pub fn parse(id: u32, b: &[u8]) -> CaliptraResult<Self> {
@@ -132,17 +137,28 @@ impl Request {
                 open,
                 src: 0,
                 dst: 0,
+                level: 0,
+                g: Default::default(),
             });
         }
         let op = word(b, 2);
         if word(b, 1) != VERSION || !(1..=6).contains(&op) || IDS[(op - 1) as usize] != id {
             return Err(INVALID);
         }
+        // Word 11: [7:0] log2 of the decode scale (DECRYPT, REFRESH),
+        // [11:8] output level (ENCRYPT, REFRESH), the rest zero.
+        let g = crate::fhe_aloha::geometry().map_err(|_| INVALID)?;
+        let log_scale = word(b, 11) & 0xff;
+        let level = word(b, 11) >> 8;
+        let leveled = matches!(op, ENCRYPT | REFRESH);
+        if leveled != g.level_ok(level) || (!leveled && level != 0) {
+            return Err(INVALID);
+        }
         let (input, output) = match op {
             KEYGEN | CLOSE => (0, 0),
-            ENCRYPT => (MESSAGE_BYTES, CIPHERTEXT_BYTES),
-            DECRYPT => (Q0_BYTES, MESSAGE_BYTES),
-            REFRESH => (Q0_BYTES, CIPHERTEXT_BYTES),
+            ENCRYPT => (g.message_bytes(), g.ciphertext_bytes(level)),
+            DECRYPT => (g.q0_bytes(), g.message_bytes()),
+            REFRESH => (g.q0_bytes(), g.ciphertext_bytes(level)),
             _ => return Err(INVALID),
         };
         let src = (u64::from(word(b, 6)) << 32) | u64::from(word(b, 5));
@@ -150,8 +166,8 @@ impl Request {
         let scaled = matches!(op, DECRYPT | REFRESH);
         if word(b, 9) as usize != input
             || word(b, 10) as usize != output
-            || scaled != (1..=40).contains(&word(b, 11))
-            || (!scaled && word(b, 11) != 0)
+            || scaled != (1..=40).contains(&log_scale)
+            || (!scaled && log_scale != 0)
             || (op != ENCRYPT && b[48..64].iter().any(|&v| v != 0))
         {
             return Err(INVALID);
@@ -177,6 +193,8 @@ impl Request {
             open,
             src,
             dst,
+            level,
+            g,
         })
     }
 }
@@ -196,7 +214,7 @@ fn open(d: &mut Drivers, r: &Request, header: &mut [u8; OPEN_RESPONSE_BYTES]) ->
     // KEYGEN, ENCRYPT, DECRYPT, REFRESH.
     let supported = 0x4e;
     if word(&r.bytes, 2) & !supported != 0
-        || word(&r.bytes, 4) != PARAM_ID
+        || word(&r.bytes, 4) != PARAM_ID_BASE | crate::fhe_aloha::geometry()?.logn
         || word(&r.bytes, 5) != 2
         || word(&r.bytes, 6) != 0
     {
@@ -234,7 +252,7 @@ fn open(d: &mut Drivers, r: &Request, header: &mut [u8; OPEN_RESPONSE_BYTES]) ->
 /// Runs an authorized data command; `Ok` carries how the engine ended.
 fn kernel(d: &mut Drivers, r: &Request, op: u32, seq: u32) -> CaliptraResult<Done> {
     let s = &d.fhe_session;
-    let log_scale = word(&r.bytes, 11);
+    let log_scale = word(&r.bytes, 11) & 0xff;
     Ok(match op {
         KEYGEN => {
             // After DisableAttestation the RT CDI is a public constant, so a
@@ -243,22 +261,25 @@ fn kernel(d: &mut Drivers, r: &Request, op: u32, seq: u32) -> CaliptraResult<Don
                 return Err(CaliptraError::RUNTIME_FHE_ATTESTATION_DISABLED);
             }
             let rt_cdi = Drivers::get_key_id_rt_cdi(d)?;
-            crate::fhe_aloha::keygen(&mut d.hmac, &mut d.trng, &mut d.key_vault, rt_cdi)?;
+            crate::fhe_aloha::keygen(r.g, &mut d.hmac, &mut d.trng, &mut d.key_vault, rt_cdi)?;
             Done::ok(true)
         }
         ENCRYPT => {
             let tag: [u8; 16] = r.bytes[48..64].try_into().unwrap();
             crate::fhe_aloha::encrypt(
+                r.g,
                 &mut d.aes,
                 &mut d.trng,
                 &s.request_key,
                 &nonce(seq, 0),
                 &tag,
+                r.level,
                 r.src,
                 r.dst,
             )?
         }
         DECRYPT => crate::fhe_aloha::decrypt(
+            r.g,
             &mut d.aes,
             &mut d.trng,
             &s.response_key,
@@ -267,7 +288,7 @@ fn kernel(d: &mut Drivers, r: &Request, op: u32, seq: u32) -> CaliptraResult<Don
             r.src,
             r.dst,
         )?,
-        _ => crate::fhe_aloha::refresh(r.src, r.dst)?,
+        _ => crate::fhe_aloha::refresh(r.g, r.level, r.src, r.dst)?,
     })
 }
 

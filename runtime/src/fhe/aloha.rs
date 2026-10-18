@@ -1,17 +1,17 @@
 // Licensed under the Apache-2.0 license
-//! N=256 Aloha backend on the DMA stream: Aloha moves every buffer between
-//! DRAM and the engine through Caliptra's axi_dma, and VeeR never reads the
-//! data. VeeR sets up and finishes AES-GCM around the DMA's text phase.
-//! Profile 0xa108: 128 interleaved complex f64 slots; c0 then c1, two N-word
-//! residue limbs per component, each coefficient serialized as LE u64.
+//! Aloha backend on the DMA stream: Aloha moves every buffer between DRAM and
+//! the engine through Caliptra's axi_dma, and VeeR never reads the data. VeeR
+//! sets up and finishes AES-GCM around the DMA's text phase.
+//! The build fixes N and the largest level L_max (CAP); each ENCRYPT and
+//! REFRESH picks a level 1..=L_max. Message: N/2 interleaved complex f64 slots.
+//! Ciphertext: c0 then c1, `level` N-word residue limbs per component, each
+//! coefficient serialized as LE u64.
 use caliptra_common::keyids::KEY_ID_FHE_SEED;
 use caliptra_drivers::{
     hmac_kdf, Aes, AesKey, AesOperation, CaliptraError, CaliptraResult, Hmac, HmacMode, KeyId,
     KeyReadArgs, KeyUsage, KeyVault, KeyWriteArgs, Trng,
 };
 const BASE: usize = 0x1005_0000;
-const N: usize = 256;
-const LOGN: i32 = 8;
 const LOG_SCALE: i32 = 25;
 const POLL: usize = 20_000_000;
 const FAILED: CaliptraError = CaliptraError::RUNTIME_FHE_DECRYPT_FAILED;
@@ -27,10 +27,10 @@ const REG_KV_RD_SEED_STATUS: usize = 0x24;
 const REG_SLOT0: usize = 0x30;
 
 const NAME0: u32 = 0x534b4b43; // "CKKS"
-/// CAP fields firmware depends on: N, two limbs, DMA stream, map version 2.
+/// CAP fields: [15:0] N, [19:16] L_max, [24] DMA stream, [31:28] map version.
 /// Other capability bits (build options) are ignored.
-const CAP_CHECKED: u32 = 0xffff | 0xf << 16 | 1 << 24 | 0xf << 28;
-const CAP_EXPECTED: u32 = N as u32 | 2 << 16 | 1 << 24 | 2 << 28;
+const CAP_CHECKED: u32 = 1 << 24 | 0xf << 28;
+const CAP_EXPECTED: u32 = 1 << 24 | 2 << 28;
 const CMD_ENCRYPT: u32 = 1;
 const CMD_KEYGEN: u32 = 2;
 const CMD_DECRYPT: u32 = 4;
@@ -47,26 +47,43 @@ const STATUS_COMMIT_WAIT: u32 = 1 << 8;
 const KV_READ_EN: u32 = 1 << 0;
 const KV_STATUS_VALID: u32 = 1 << 1;
 const KV_STATUS_ERROR_SHIFT: u32 = 2;
-/// Both RNS limbs.
-const LIMBS: u32 = 2;
-/// 12-bit RNS encode scale field for 2^LOG_SCALE at this N; signed decode field.
-const RNS_SCALE: u32 = ((LOG_SCALE - 52 - 1023 - LOGN) & 0xfff) as u32;
 /// KDF label binding the derived seed to this use of the runtime CDI.
 const SEED_LABEL: &[u8] = b"ALOHA-FHE-SEED";
-/// One limb of one component: N LE u64 coefficients.
-const LIMB_BYTES: u64 = 8 * N as u64;
-/// The slot vector: N/2 complex f64.
-pub const MESSAGE_BYTES: usize = 8 * N;
-/// One component, both limbs.
-const COMPONENT_BYTES: u64 = LIMBS as u64 * LIMB_BYTES;
-/// Ciphertext, both limbs of c0 then c1.
-pub const CIPHERTEXT_BYTES: usize = 2 * COMPONENT_BYTES as usize;
-/// c0 and c1 limb 0.
-pub const Q0_BYTES: usize = 2 * LIMB_BYTES as usize;
-
-/// CONFIG = {SCALE[27:16], LOGN[7:4], L[3:0]}.
-fn config(limbs: u32, scale: u32) {
-    wr(REG_CONFIG, (scale & 0xfff) << 16 | (LOGN as u32) << 4 | (limbs & 0xf));
+/// The engine's build: ring dimension N = 2^logn and largest level L_max.
+#[derive(Clone, Copy, Default)]
+pub struct Geometry {
+    pub logn: u32,
+    pub l_max: u32,
+}
+impl Geometry {
+    /// One limb of one component: N LE u64 coefficients.
+    fn limb_bytes(self) -> u64 {
+        8 << self.logn
+    }
+    /// The slot vector: N/2 complex f64, the same size as a limb.
+    pub fn message_bytes(self) -> usize {
+        self.limb_bytes() as usize
+    }
+    /// c0 and c1, `level` limbs each.
+    pub fn ciphertext_bytes(self, level: u32) -> usize {
+        2 * level as usize * self.limb_bytes() as usize
+    }
+    /// c0 and c1 limb 0.
+    pub fn q0_bytes(self) -> usize {
+        self.ciphertext_bytes(1)
+    }
+    /// A level an ENCRYPT or REFRESH can produce.
+    pub fn level_ok(self, level: u32) -> bool {
+        (1..=self.l_max).contains(&level)
+    }
+    /// 12-bit RNS encode scale field for 2^LOG_SCALE at this N.
+    fn rns_scale(self) -> u32 {
+        ((LOG_SCALE - 52 - 1023 - self.logn as i32) & 0xfff) as u32
+    }
+    /// CONFIG = {SCALE[27:16], LOGN[7:4], L[3:0]}.
+    fn config(self, limbs: u32, scale: u32) {
+        wr(REG_CONFIG, (scale & 0xfff) << 16 | self.logn << 4 | (limbs & 0xf));
+    }
 }
 
 fn rd(off: usize) -> u32 {
@@ -78,11 +95,23 @@ fn wr(off: usize, value: u32) {
 pub fn clear() {
     wr(REG_CTRL, CTRL_ZEROIZE);
 }
-fn present() -> CaliptraResult<()> {
-    if rd(REG_NAME0) != NAME0 || rd(REG_CAP) & CAP_CHECKED != CAP_EXPECTED {
+/// The engine's geometry, if it is present and speaks map v2 on the DMA stream.
+pub fn geometry() -> CaliptraResult<Geometry> {
+    let cap = rd(REG_CAP);
+    let n = cap & 0xffff;
+    let g = Geometry {
+        logn: n.trailing_zeros(),
+        l_max: cap >> 16 & 0xf,
+    };
+    if rd(REG_NAME0) != NAME0
+        || cap & CAP_CHECKED != CAP_EXPECTED
+        || !n.is_power_of_two()
+        || !(128..=16384).contains(&n)
+        || !(1..=8).contains(&g.l_max)
+    {
         return Err(CaliptraError::RUNTIME_FHE_ABSENT);
     }
-    Ok(())
+    Ok(g)
 }
 /// Polls `reg` until a bit of `mask` is set; returns the register value.
 fn poll(reg: usize, mask: u32) -> CaliptraResult<u32> {
@@ -128,9 +157,15 @@ impl Done {
 
 /// Configures and starts one command. Slot bases come from the caller's
 /// validated DRAM ranges; hardware checks only alignment and wraparound.
-fn start(cmd: u32, limbs: u32, scale: u32, slots: &[(usize, u64)]) -> CaliptraResult<()> {
+fn start(
+    g: Geometry,
+    cmd: u32,
+    limbs: u32,
+    scale: u32,
+    slots: &[(usize, u64)],
+) -> CaliptraResult<()> {
     ready()?;
-    config(limbs, scale);
+    g.config(limbs, scale);
     for &(slot, base) in slots {
         wr(REG_SLOT0 + 8 * slot, base as u32);
         wr(REG_SLOT0 + 8 * slot + 4, (base >> 32) as u32);
@@ -154,12 +189,12 @@ fn discard_gcm() {
 /// through Adams Bridge's ML-DSA seed client, free when ML-DSA is absent.
 /// VeeR sees the nonce, never the seed. The slot is cleared afterwards.
 pub fn keygen(
+    g: Geometry,
     hmac: &mut Hmac,
     trng: &mut Trng,
     key_vault: &mut KeyVault,
     rt_cdi: KeyId,
 ) -> CaliptraResult<()> {
-    present()?;
     clear();
     ready()?;
     let result = (|| {
@@ -179,7 +214,8 @@ pub fn keygen(
         if status >> KV_STATUS_ERROR_SHIFT & 0xff != 0 {
             return Err(FAILED);
         }
-        start(CMD_KEYGEN, LIMBS, RNS_SCALE, &[])?;
+        // KEYGEN fills every installed limb.
+        start(g, CMD_KEYGEN, g.l_max, g.rns_scale(), &[])?;
         let status = wait(STATUS_VALID)?;
         if status & (STATUS_ERROR | STATUS_KEY_VALID) != STATUS_KEY_VALID {
             return Err(FAILED);
@@ -190,27 +226,31 @@ pub fn keygen(
     let erased = key_vault.erase_key(KEY_ID_FHE_SEED);
     result.and(erased)
 }
-/// ENCRYPT the sealed slot vector at `src` into c0, c1 at `dst` (8 KiB,
-/// component-major). The DMA GCM-decrypts the message into Aloha under `key`
-/// and `iv`; at COMMIT_WAIT the tag decides INPUT_COMMIT or ZEROIZE, so no
-/// arithmetic sees an unauthenticated message. The ciphertext bypasses AES.
+/// ENCRYPT the sealed slot vector at `src` into c0, c1 at `dst`, `level`
+/// limbs each (component-major); `level` is checked by the caller and the engine. The DMA GCM-decrypts the message into Aloha
+/// under `key` and `iv`; at COMMIT_WAIT the tag decides INPUT_COMMIT or
+/// ZEROIZE, so no arithmetic sees an unauthenticated message. The ciphertext
+/// bypasses AES.
+#[allow(clippy::too_many_arguments)]
 pub fn encrypt(
+    g: Geometry,
     aes: &mut Aes,
     trng: &mut Trng,
     key: &[u8; 32],
     iv: &[u8; 12],
     tag: &[u8; 16],
+    level: u32,
     src: u64,
     dst: u64,
 ) -> CaliptraResult<Done> {
-    present()?;
     aes.aes_256_gcm_begin(trng, iv, AesKey::Array(key), &[], AesOperation::Decrypt)?;
     // a and e0 continue the resident key's sampling stream: no seed here.
     start(
+        g,
         CMD_ENCRYPT,
-        LIMBS,
-        RNS_SCALE,
-        &[(0, src), (2, dst), (3, dst + COMPONENT_BYTES)],
+        level,
+        g.rns_scale(),
+        &[(0, src), (2, dst), (3, dst + level as u64 * g.limb_bytes())],
     )?;
     let status = wait(STATUS_VALID | STATUS_COMMIT_WAIT)?;
     if status & STATUS_VALID != 0 {
@@ -218,15 +258,16 @@ pub fn encrypt(
         discard_gcm();
         return Ok(Done::new(status));
     }
-    let computed = aes.aes_256_gcm_end(0, MESSAGE_BYTES)?;
+    let computed = aes.aes_256_gcm_end(0, g.message_bytes())?;
     let commit = constant_time_eq::constant_time_eq(&computed, tag);
     wr(REG_CTRL, if commit { CTRL_INPUT_COMMIT } else { CTRL_ZEROIZE });
     wait(STATUS_VALID).map(Done::new)
 }
-/// DECRYPT c0, c1 limb 0 at `src` (4 KiB) into the slot vector at `dst`,
+/// DECRYPT c0 and c1 limb 0 at `src` (2N words) into the slot vector at `dst`,
 /// GCM-encrypted by the DMA under `key` and `iv`; returns the tag. Decode uses
 /// the power-of-two scale exponent; the evaluator supplies the actual scale.
 pub fn decrypt(
+    g: Geometry,
     aes: &mut Aes,
     trng: &mut Trng,
     key: &[u8; 32],
@@ -235,17 +276,18 @@ pub fn decrypt(
     src: u64,
     dst: u64,
 ) -> CaliptraResult<Done> {
-    present()?;
     if !(1..=40).contains(&log_scale) {
         return Err(FAILED);
     }
     aes.aes_256_gcm_begin(trng, iv, AesKey::Array(key), &[], AesOperation::Encrypt)?;
     let scale = (-(log_scale as i32)) as u32;
+    // DECRYPT reads limb 0 only.
     start(
+        g,
         CMD_DECRYPT,
-        LIMBS,
+        1,
         scale,
-        &[(0, src), (1, src + LIMB_BYTES), (2, dst)],
+        &[(0, src), (1, src + g.limb_bytes()), (2, dst)],
     )?;
     let mut done = Done::new(wait(STATUS_VALID)?);
     if done.cause != 0 {
@@ -253,19 +295,21 @@ pub fn decrypt(
         discard_gcm();
         return Ok(done);
     }
-    done.tag = aes.aes_256_gcm_end(0, MESSAGE_BYTES)?;
+    done.tag = aes.aes_256_gcm_end(0, g.message_bytes())?;
     Ok(done)
 }
-/// Trusted q0 -> q0*q1 level refresh, with no slot decode/re-encode: c0, c1
-/// at q0 from `src` (4 KiB), both limbs to `dst` (8 KiB). Call only after
-/// authorizing refresh. The output keeps the input's scale. No AES.
-pub fn refresh(src: u64, dst: u64) -> CaliptraResult<Done> {
-    present()?;
+/// Trusted level refresh from q0 to `level` limbs, with no slot
+/// decode/re-encode: c0, c1 limb 0 from `src`, `level` limbs each to `dst`.
+/// Call only after authorizing refresh; `level` is checked by the caller and
+/// the engine. The output keeps the input's scale. No AES.
+pub fn refresh(g: Geometry, level: u32, src: u64, dst: u64) -> CaliptraResult<Done> {
+    let limb = g.limb_bytes();
     start(
+        g,
         CMD_REFRESH,
-        LIMBS,
+        level,
         0,
-        &[(0, src), (1, src + LIMB_BYTES), (2, dst), (3, dst + COMPONENT_BYTES)],
+        &[(0, src), (1, src + limb), (2, dst), (3, dst + level as u64 * limb)],
     )?;
     wait(STATUS_VALID).map(Done::new)
 }

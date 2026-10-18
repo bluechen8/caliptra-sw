@@ -16,7 +16,6 @@
 
 const DRAM_START: u64 = 0x8000_0000;
 const DRAM_END: u64 = 0x1_8000_0000;
-const MAX_BYTES: u64 = 256 * 1024;
 const CHUNK_WORDS: usize = 64;
 const FIFO_WORDS: usize = 128;
 
@@ -34,7 +33,7 @@ pub enum Error {
 pub fn validate_range(addr: u64, bytes: u64) -> Result<(), Error> {
     let end = addr.checked_add(bytes).ok_or(Error::InvalidRange)?;
     if bytes == 0
-        || bytes > MAX_BYTES
+        || bytes > u32::MAX as u64 // the DMA byte count register
         || (addr | bytes) & 3 != 0
         || addr < DRAM_START
         || end > DRAM_END

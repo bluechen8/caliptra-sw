@@ -282,17 +282,26 @@ mod v5 {
     use super::*;
     pub const SRC: u64 = super::DRAM_BASE;
     pub const DST: u64 = super::DRAM_BASE + 0x1_0000;
-    pub const CT: usize = 8192;
-    pub const Q0: usize = 4096;
-    pub const MSG: usize = 2048;
+    /// The RTL link's build: N = 256, L_max = 2.
+    pub const L_MAX: u32 = 2;
+    pub const LIMB: usize = 8 * 256;
+    /// c0 and c1 at `level` limbs each.
+    pub const fn ct(level: u32) -> usize {
+        2 * level as usize * LIMB
+    }
+    pub const CT: usize = ct(L_MAX);
+    pub const Q0: usize = ct(1);
+    /// N/2 complex f64, the size of a limb.
+    pub const MSG: usize = LIMB;
     /// ERR_CAUSE values firmware reports in the response status word.
     pub const BAD_INPUT: u32 = 8;
     pub const ABORTED: u32 = 11;
-    pub fn lengths(op: u32) -> (usize, usize) {
+    /// Input and output bytes; ENCRYPT and REFRESH output a ciphertext at `level`.
+    pub fn lengths(op: u32, level: u32) -> (usize, usize) {
         match op {
-            2 => (MSG, CT),
+            2 => (MSG, ct(level)),
             3 => (Q0, MSG),
-            6 => (Q0, CT),
+            6 => (Q0, ct(level)),
             _ => (0, 0),
         }
     }
@@ -302,9 +311,11 @@ mod v5 {
         pub tag: Vec<u8>,
     }
     impl User {
-        /// The request header; `tag` is the ENCRYPT message tag.
+        /// The request header; `tag` is the ENCRYPT message tag. ENCRYPT and
+        /// REFRESH output at L_max; `set_level` picks another level.
         pub fn header(&self, op: u32, tag: &[u8], log_scale: u32) -> Vec<u8> {
-            let (input, output) = lengths(op);
+            let level = if matches!(op, 2 | 6) { L_MAX } else { 0 };
+            let (input, output) = lengths(op, level);
             let (src, dst) = if input == 0 { (0, 0) } else { (SRC, DST) };
             let mut h = words(&[
                 0,
@@ -318,7 +329,7 @@ mod v5 {
                 (dst >> 32) as u32,
                 input as u32,
                 output as u32,
-                log_scale,
+                log_scale | level << 8,
             ]);
             h.extend(tag);
             h.resize(64, 0);
@@ -350,13 +361,14 @@ mod v5 {
             let h = self.header(5, &[], 0);
             assert_eq!(self.send5(m, &h).status, 0);
         }
-        /// ENCRYPT; returns the status and, on success, the 8 KiB ciphertext.
-        pub fn encrypt5(&mut self, m: &mut DefaultHwModel, msg: &[u8]) -> (u32, Vec<u8>) {
+        /// ENCRYPT at `level`; returns the status and the ciphertext.
+        pub fn encrypt5(&mut self, m: &mut DefaultHwModel, msg: &[u8], level: u32) -> (u32, Vec<u8>) {
             let (body, tag) = self.seal(msg);
             dram_write(m, SRC, &body);
-            let h = self.header(2, &tag, 0);
+            let mut h = self.header(2, &tag, 0);
+            set_level(&mut h, level);
             let r = self.send5(m, &h);
-            (r.status, dram_read(m, DST, CT))
+            (r.status, dram_read(m, DST, lengths(2, level).1))
         }
         /// DECRYPT c0, c1 limb 0 (4 KiB); returns the status and the opened slots.
         pub fn decrypt5(&mut self, m: &mut DefaultHwModel, q0: &[u8], log_scale: u32) -> (u32, Vec<u8>) {
@@ -371,16 +383,32 @@ mod v5 {
             body.extend(&r.tag);
             (0, crypto("decrypt", &self.tx, &body, &[], &words(&[1, seq, 0])))
         }
-        pub fn refresh5(&mut self, m: &mut DefaultHwModel, q0: &[u8], log_scale: u32) -> (u32, Vec<u8>) {
+        /// REFRESH a q0 ciphertext to `level`; returns the status and the ciphertext.
+        pub fn refresh5(
+            &mut self,
+            m: &mut DefaultHwModel,
+            q0: &[u8],
+            log_scale: u32,
+            level: u32,
+        ) -> (u32, Vec<u8>) {
             dram_write(m, SRC, q0);
-            let h = self.header(6, &[], log_scale);
+            let mut h = self.header(6, &[], log_scale);
+            set_level(&mut h, level);
             let r = self.send5(m, &h);
-            (r.status, dram_read(m, DST, CT))
+            (r.status, dram_read(m, DST, lengths(6, level).1))
         }
     }
-    /// c0, c1 limb 0 of a full ciphertext.
+    /// As the orchestrator (Rocket): set an ENCRYPT / REFRESH header's output
+    /// level (word 11 [11:8]) and length (word 10).
+    pub fn set_level(h: &mut [u8], level: u32) {
+        let scale = word(h, 11) & 0xff;
+        h[40..44].copy_from_slice(&(ct(level) as u32).to_le_bytes());
+        h[44..48].copy_from_slice(&(scale | level << 8).to_le_bytes());
+    }
+    /// c0, c1 limb 0 of a ciphertext at any level.
     pub fn q0(ct: &[u8]) -> Vec<u8> {
-        [&ct[..2048], &ct[4096..6144]].concat()
+        let c1 = ct.len() / 2;
+        [&ct[..LIMB], &ct[c1..c1 + LIMB]].concat()
     }
 }
 #[test]
@@ -547,7 +575,7 @@ fn protected_aloha_quick_boot_keygen() {
     );
     let mut u = User::open(&mut m, [0x0e, 8, ALOHA_PROFILE, 2, 0]);
     u.keygen(&mut m);
-    let (status, ct) = u.encrypt5(&mut m, &[0; v5::MSG]);
+    let (status, ct) = u.encrypt5(&mut m, &[0; v5::MSG], v5::L_MAX);
     assert_eq!(status, 0);
     assert_eq!(u.decrypt5(&mut m, &v5::q0(&ct), 25).0, 0);
     u.close(&mut m);
@@ -564,7 +592,7 @@ fn protected_aloha_keygen_after_disable_attestation() {
     u.keygen(&mut m);
     let disable: u32 = CommandId::DISABLE_ATTESTATION.into();
     m.mailbox_execute(disable, &wire(disable, &[0; 4], &[])).unwrap();
-    let (status, ct) = u.encrypt5(&mut m, &[0; v5::MSG]);
+    let (status, ct) = u.encrypt5(&mut m, &[0; v5::MSG], v5::L_MAX);
     assert_eq!(status, 0);
     assert_eq!(u.decrypt5(&mut m, &v5::q0(&ct), 25).0, 0);
     u.close(&mut m);
@@ -576,6 +604,53 @@ fn protected_aloha_keygen_after_disable_attestation() {
         }
         other => panic!("KEYGEN after DisableAttestation: {other:?}"),
     }
+}
+
+/// The orchestrator picks the level: ENCRYPT and REFRESH at every level up to
+/// L_max decrypt correctly; level 0, a level above L_max and an output length
+/// that does not match the level are refused.
+#[test]
+#[cfg(feature = "fhe-aloha")]
+#[ignore = "requires FHE_ALOHA_RTL and FHE_ALOHA_RTL_CWD"]
+fn protected_aloha_levels() {
+    let mut m = boot(&firmware::APP_FHE_ALOHA);
+    let values: Vec<f64> = (0..256)
+        .map(|i| if i % 2 == 1 { 0.0 } else { (i as f64 - 128.0) / 64.0 })
+        .collect();
+    let pt: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let max_error = |slots: &[u8]| {
+        slots
+            .chunks_exact(8)
+            .zip(&values)
+            .map(|(b, v)| (f64::from_le_bytes(b.try_into().unwrap()) - v).abs())
+            .fold(0.0, f64::max)
+    };
+    let mut u = User::open(&mut m, [0x4e, 8, ALOHA_PROFILE, 2, 0]);
+    u.keygen(&mut m);
+    for level in 1..=v5::L_MAX {
+        let (status, ct) = u.encrypt5(&mut m, &pt, level);
+        assert_eq!(status, 0);
+        let (status, slots) = u.decrypt5(&mut m, &v5::q0(&ct), 25);
+        assert_eq!(status, 0);
+        assert!(max_error(&slots) < 0.001, "level {level} ENCRYPT");
+        let (status, refreshed) = u.refresh5(&mut m, &v5::q0(&ct), 25, level);
+        assert_eq!(status, 0);
+        let (status, slots) = u.decrypt5(&mut m, &v5::q0(&refreshed), 25);
+        assert_eq!(status, 0);
+        assert!(max_error(&slots) < 0.001, "level {level} REFRESH");
+    }
+    let (_, tag) = u.seal(&pt);
+    for level in [0, v5::L_MAX + 1] {
+        for (op, mut h) in [(2, u.header(2, &tag, 0)), (6, u.header(6, &[], 25))] {
+            v5::set_level(&mut h, level);
+            u.reject(&mut m, op, &h, &[]);
+        }
+    }
+    // Level 1 with a level-2 output length.
+    let mut h = u.header(6, &[], 25);
+    v5::set_level(&mut h, 1);
+    h[40..44].copy_from_slice(&(v5::ct(2) as u32).to_le_bytes());
+    u.reject(&mut m, 6, &h, &[]);
 }
 
 /// Validate the SoC negative client quickly before a long full-SoC run.
@@ -665,6 +740,8 @@ fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool, i
         }
     }
     let mut user = cmd.spawn().unwrap();
+    #[cfg(feature = "fhe-aloha")]
+    let mut leveled = 0u32;
     for i in 0..1000 {
         let file = dir.join(format!("req-{i}"));
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -684,7 +761,16 @@ fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool, i
         }
         let len = word(&data, 1) as usize;
         let ext = word(&data, 2) as usize;
-        let h = &data[12..12 + len];
+        let mut h = data[12..12 + len].to_vec();
+        // As the Rocket relay (protected-demo.c next_level): the negative
+        // suite cycles ENCRYPT / REFRESH through levels 1, 2, ..., L_max.
+        #[cfg(feature = "fhe-aloha")]
+        if len >= 48 && word(&h, 1) == 5 && matches!(word(&h, 2), 2 | 6) {
+            let level = if negative { 1 + leveled % v5::L_MAX } else { v5::L_MAX };
+            leveled += 1;
+            v5::set_level(&mut h, level);
+        }
+        let h = &h[..];
         if ext > 0 {
             dram_write(&mut m, DRAM_BASE, &data[12 + len..]);
         }
@@ -959,7 +1045,7 @@ fn protected_aloha_bad_tag() {
     replay[48..64].copy_from_slice(&tag);
     u.reject(&mut m, 2, &replay, &[]);
     u.keygen(&mut m);
-    let (status, ct) = u.encrypt5(&mut m, &[0; v5::MSG]);
+    let (status, ct) = u.encrypt5(&mut m, &[0; v5::MSG], v5::L_MAX);
     assert_eq!(status, 0);
     let (status, slots) = u.decrypt5(&mut m, &v5::q0(&ct), 25);
     assert_eq!(status, 0);
@@ -974,7 +1060,7 @@ fn protected_aloha_bad_tag() {
     // A NaN slot is reported only after the tag check commits the message.
     let mut nan = vec![0u8; v5::MSG];
     nan[16..24].copy_from_slice(&f64::NAN.to_le_bytes());
-    assert_eq!(u.encrypt5(&mut m, &nan).0, v5::BAD_INPUT);
+    assert_eq!(u.encrypt5(&mut m, &nan, v5::L_MAX).0, v5::BAD_INPUT);
     assert_eq!(u.decrypt5(&mut m, &v5::q0(&ct), 25).0, 0);
     // Malformed headers are refused without consuming the sequence.
     let mut h = u.header(3, &[], 25);
@@ -1010,7 +1096,7 @@ fn protected_aloha_level_refresh() {
     let pt: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     let mut u = User::open(&mut m, [0x4e, 8, ALOHA_PROFILE, 2, 0]);
     u.keygen(&mut m);
-    let (status, mut ct) = u.encrypt5(&mut m, &pt);
+    let (status, mut ct) = u.encrypt5(&mut m, &pt, v5::L_MAX);
     assert_eq!(status, 0);
     // A real numerical scale change: multiply the integer polynomial AND
     // scale by two. Merely relabeling the metadata would change the value.
@@ -1027,7 +1113,7 @@ fn protected_aloha_level_refresh() {
     let mut single = v5::q0(&ct);
     let mut previous = Vec::new();
     for iteration in 0..2 {
-        let (status, refreshed) = u.refresh5(&mut m, &single, 26);
+        let (status, refreshed) = u.refresh5(&mut m, &single, 26, v5::L_MAX);
         assert_eq!(status, 0);
         if iteration > 0 {
             assert_ne!(
@@ -1054,7 +1140,7 @@ fn protected_aloha_level_refresh() {
     // An out-of-range source residue fails the command; nothing is written.
     single[..8].copy_from_slice(&coefficient_recovery::Q[0].to_le_bytes());
     dram_write(&mut m, v5::DST, &[0xa5; v5::CT]);
-    assert_eq!(u.refresh5(&mut m, &single, 26).0, v5::BAD_INPUT);
+    assert_eq!(u.refresh5(&mut m, &single, 26, v5::L_MAX).0, v5::BAD_INPUT);
     assert!(dram_read(&mut m, v5::DST, v5::CT).iter().all(|&v| v == 0xa5));
     u.close(&mut m);
     // Refresh needs an explicit policy grant.

@@ -83,6 +83,8 @@ fn range_boundaries_and_high_bit_aliases() {
         (0x1_7fff_fffc, 4),
         (0xffff_fffc, 8),
         (0x8000_0000, 262144),
+        (0x8000_0000, 2 << 20),
+        (0x8000_0000, 0xffff_fffc),
     ] {
         assert_eq!(transport::validate_range(addr, bytes), Ok(()));
     }
@@ -97,7 +99,7 @@ fn range_boundaries_and_high_bit_aliases() {
         (0x8000_0000, 0),
         (0x8000_0001, 4),
         (0x8000_0000, 3),
-        (0x8000_0000, 262148),
+        (0x8000_0000, 1 << 32),
     ] {
         assert_eq!(
             transport::validate_range(addr, bytes),
