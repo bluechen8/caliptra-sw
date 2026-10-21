@@ -249,6 +249,13 @@ impl Drivers {
                 return Err(CaliptraError::RUNTIME_UNKNOWN_RESET_FLOW);
             }
         }
+        // Every boot, before any mailbox command: zeroize the FHE engine and
+        // install this image's CROM table (docs/fhe/19). A failure leaves FHE
+        // requests refused, not the boot.
+        #[cfg(feature = "fhe-aloha")]
+        {
+            self.fhe_session.tables = crate::fhe_aloha::install_tables().is_ok();
+        }
 
         Ok(())
     }

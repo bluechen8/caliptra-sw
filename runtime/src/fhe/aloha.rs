@@ -25,6 +25,9 @@ const REG_CAP: usize = 0x1c;
 const REG_KV_RD_SEED_CTRL: usize = 0x20;
 const REG_KV_RD_SEED_STATUS: usize = 0x24;
 const REG_SLOT0: usize = 0x30;
+/// CROM window (docs/fhe/19): word w, lane k at REG_CROM + 16*w + 4*k. The
+/// lane-3 store writes the word; stores are taken only while the engine is idle.
+const REG_CROM: usize = 0x4000;
 
 const NAME0: u32 = 0x534b4b43; // "CKKS"
 /// CAP fields: [15:0] N, [19:16] L_max, [24] DMA stream, [31:28] map version.
@@ -49,6 +52,14 @@ const KV_STATUS_VALID: u32 = 1 << 1;
 const KV_STATUS_ERROR_SHIFT: u32 = 2;
 /// KDF label binding the derived seed to this use of the runtime CDI.
 const SEED_LABEL: &[u8] = b"ALOHA-FHE-SEED";
+/// The CROM table this image carries, from gen_aloha_tables.py: a 16-byte
+/// manifest ("FHE2", layout 2, catalog 1, log2 N, L_max, word count, 0), then
+/// the 128-bit words as LE u32 lanes, low lane first.
+static CROM_IMAGE: &[u8] = include_bytes!(env!("FHE_CROM"));
+const CROM_MAGIC: u32 = 0x4648_4532; // "FHE2"
+const CROM_LAYOUT: u8 = 2;
+const CROM_CATALOG: u8 = 1;
+
 /// The engine's build: ring dimension N = 2^logn and largest level L_max.
 #[derive(Clone, Copy, Default)]
 pub struct Geometry {
@@ -112,6 +123,35 @@ pub fn geometry() -> CaliptraResult<Geometry> {
         return Err(CaliptraError::RUNTIME_FHE_ABSENT);
     }
     Ok(g)
+}
+/// Runtime boot (every reset flow): ZEROIZE drops the key and any state an
+/// earlier image left, since an update reset does not reset the engine. Then
+/// this image's table is copied into the CROM. Fails, leaving FHE unusable,
+/// if the engine is absent or the table was built for another geometry.
+pub fn install_tables() -> CaliptraResult<()> {
+    let g = geometry()?;
+    // gen_aloha_tables.py checked the word count against (log2 N, L_max).
+    let (manifest, table) = CROM_IMAGE.split_at(CROM_IMAGE.len().min(16));
+    if manifest.len() != 16
+        || le32(manifest, 0) != CROM_MAGIC
+        || manifest[4] != CROM_LAYOUT
+        || manifest[5] != CROM_CATALOG
+        || u32::from(manifest[6]) != g.logn
+        || u32::from(manifest[7]) != g.l_max
+        || table.len() != le32(manifest, 8) as usize * 16
+    {
+        return Err(CaliptraError::RUNTIME_FHE_ABSENT);
+    }
+    clear();
+    ready()?;
+    for i in 0..table.len() / 4 {
+        wr(REG_CROM + 4 * i, le32(table, 4 * i));
+    }
+    Ok(())
+}
+/// The LE u32 at byte offset `i`.
+fn le32(b: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
 }
 /// Polls `reg` until a bit of `mask` is set; returns the register value.
 fn poll(reg: usize, mask: u32) -> CaliptraResult<u32> {

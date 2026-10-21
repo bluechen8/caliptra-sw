@@ -20,12 +20,15 @@ use zerocopy::IntoBytes;
 fn boot(fwid: &'static FwId<'static>) -> DefaultHwModel {
     boot_with(&firmware::ROM_WITH_UART_NO_MLDSA, &firmware::FMC_WITH_UART_NO_MLDSA, fwid)
 }
-fn boot_with(rom: &FwId<'static>, fmc: &FwId<'static>, fwid: &'static FwId<'static>) -> DefaultHwModel {
-    let rom = caliptra_builder::build_firmware_rom(rom).unwrap();
+fn image_options() -> ImageOptions {
     let mut opts = ImageOptions::default();
     opts.pqc_key_type = FwVerificationPqcKeyType::LMS;
     opts.vendor_config.pl0_pauser = Some(1);
-    let image = caliptra_builder::build_and_sign_image(fmc, fwid, opts).unwrap();
+    opts
+}
+fn boot_with(rom: &FwId<'static>, fmc: &FwId<'static>, fwid: &'static FwId<'static>) -> DefaultHwModel {
+    let rom = caliptra_builder::build_firmware_rom(rom).unwrap();
+    let image = caliptra_builder::build_and_sign_image(fmc, fwid, image_options()).unwrap();
     fn hash_words(bytes: &[u8]) -> [u32; 12] {
         use sha2::{Digest, Sha384};
         let hash = Sha384::digest(bytes);
@@ -651,6 +654,53 @@ fn protected_aloha_levels() {
     v5::set_level(&mut h, 1);
     h[40..44].copy_from_slice(&(v5::ct(2) as u32).to_le_bytes());
     u.reject(&mut m, 6, &h, &[]);
+}
+
+/// An update reset restarts only VeeR, not the engine: the new runtime zeroizes
+/// the engine and copies its CROM table again before serving commands
+/// (docs/fhe/19). The old session ends with the old runtime.
+#[test]
+#[cfg(feature = "fhe-aloha")]
+#[ignore = "requires FHE_ALOHA_RTL and FHE_ALOHA_RTL_CWD"]
+fn protected_aloha_update_reset() {
+    let mut m = boot(&firmware::APP_FHE_ALOHA);
+    let mut u = User::open(&mut m, [0x0e, 8, ALOHA_PROFILE, 2, 0]);
+    u.keygen(&mut m);
+    let image = caliptra_builder::build_and_sign_image(
+        &firmware::FMC_WITH_UART_NO_MLDSA,
+        &firmware::APP_FHE_ALOHA,
+        image_options(),
+    )
+    .unwrap()
+    .to_bytes()
+    .unwrap();
+    m.mailbox_execute(u32::from(CommandId::FIRMWARE_LOAD), &image)
+        .unwrap();
+    let (_, tag) = u.seal(&[0; v5::MSG]);
+    u.reject(&mut m, 2, &u.header(2, &tag, 0), &[]);
+    let mut u = User::open(&mut m, [0x0e, 8, ALOHA_PROFILE, 2, 0]);
+    u.keygen(&mut m);
+    let (status, ct) = u.encrypt5(&mut m, &[0; v5::MSG], v5::L_MAX);
+    assert_eq!(status, 0);
+    assert_eq!(u.decrypt5(&mut m, &v5::q0(&ct), 25).0, 0);
+    u.close(&mut m);
+}
+
+/// A runtime built with a CROM table for another geometry (FHE_CROM) boots,
+/// installs nothing and refuses every FHE request.
+#[test]
+#[cfg(feature = "fhe-aloha")]
+#[ignore = "requires FHE_ALOHA_RTL, FHE_ALOHA_RTL_CWD and FHE_CROM built for another N or L_max"]
+fn protected_aloha_wrong_table() {
+    let mut m = boot(&firmware::APP_FHE_ALOHA);
+    let open: u32 = CommandId::FHE_SESSION_OPEN.into();
+    let req = User::opening([0x0e, 8, ALOHA_PROFILE, 2, 0]);
+    match m.mailbox_execute(open, &wire(open, &req, &[])) {
+        Err(caliptra_hw_model::ModelError::MailboxCmdFailed(code)) => {
+            assert_eq!(code, 0x000e_0100) // RUNTIME_FHE_ABSENT
+        }
+        other => panic!("OPEN with a mismatched CROM table: {other:?}"),
+    }
 }
 
 /// Validate the SoC negative client quickly before a long full-SoC run.

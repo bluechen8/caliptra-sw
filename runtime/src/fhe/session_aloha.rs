@@ -75,6 +75,8 @@ pub struct State {
     next: u32,
     egress: u32,
     keyed: bool,
+    /// The boot flow installed this image's CROM table (fhe_aloha::install_tables).
+    pub tables: bool,
 }
 impl State {
     pub fn new() -> Self {
@@ -87,6 +89,7 @@ impl State {
             next: 1,
             egress: 0,
             keyed: false,
+            tables: false,
         }
     }
     fn erase(&mut self) {
@@ -296,6 +299,9 @@ pub fn execute(d: &mut Drivers, r: Request) -> CaliptraResult<MboxStatusE> {
     let start = cycles();
     let mut header = Zeroizing::new([0u8; OPEN_RESPONSE_BYTES]);
     let result = (|| {
+        if !d.fhe_session.tables {
+            return Err(CaliptraError::RUNTIME_FHE_ABSENT);
+        }
         if r.open {
             return open(d, &r, &mut header);
         }

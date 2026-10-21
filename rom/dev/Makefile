@@ -41,6 +41,11 @@ FHE_PSK ?= 0
 FHE_ALOHA ?= 0
 ifeq ($(FHE_ALOHA),1)
 override FHE_PSK := 1
+# The runtime embeds the CROM table it installs at boot (gen_aloha_tables.py).
+ifeq ($(wildcard $(FHE_CROM)),)
+$(error FHE_ALOHA=1 needs FHE_CROM=<crom.bin from gen_aloha_tables.py>)
+endif
+export FHE_CROM := $(abspath $(FHE_CROM))
 endif
 # Optional clear-reference model/command for FHE comparisons.
 ML_CLEAR ?= 0
