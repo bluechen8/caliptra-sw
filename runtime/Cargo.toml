@@ -108,6 +108,8 @@ ml-clear = ["caliptra-api/ml-clear"]
 fhe-pl = ["fhe"]
 fhe-pleq = ["fhe"]
 fhe-p16 = ["fhe"]
+# Simulation-only N=1024, L=7 set for logistic-regression training; protocol v5 only.
+fhe-plr = ["fhe"]
 no-cfi = [
     "caliptra-image-verify/no-cfi",
     "caliptra-drivers/no-cfi",

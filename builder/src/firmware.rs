@@ -190,6 +190,17 @@ pub const APP_FHE_TEST_KEY_EVAL_KEYS_P16: FwId = FwId {
     ],
     ..APP_FHE_DEBUG
 };
+/// N=1024, L=7 (simulation only): logistic-regression training with REFRESH.
+pub const APP_FHE_TEST_KEY_EVAL_KEYS_PLR: FwId = FwId {
+    features: &[
+        "emu",
+        "no-mldsa",
+        "fhe-test-key",
+        "fhe-eval-keys",
+        "fhe-plr",
+    ],
+    ..APP_FHE_DEBUG
+};
 /// N=8192, L=4: per-limb streaming at the deepest generated set.
 pub const APP_FHE_TEST_KEY_PLEQ: FwId = FwId {
     features: &["emu", "no-mldsa", "fhe-test-key", "fhe-pleq"],
@@ -621,6 +632,7 @@ pub const REGISTERED_FW: &[&FwId] = &[
     &APP_FHE_TEST_KEY_ML_CLEAR,
     &APP_FHE_TEST_KEY_EVAL_KEYS,
     &APP_FHE_TEST_KEY_EVAL_KEYS_P16,
+    &APP_FHE_TEST_KEY_EVAL_KEYS_PLR,
     &APP_FHE_TEST_KEY_PLEQ,
     #[cfg(feature = "fhe-aloha")]
     &APP_FHE_ALOHA,

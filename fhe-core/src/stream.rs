@@ -6,7 +6,7 @@
 //! ciphertext (or key row) without being stored: each limb re-draws it from
 //! the same 32-byte error seed. The uniform mask is drawn in chunks and handed
 //! to `emit(offset, chunk)` as soon as it is used, so `c1` never needs a buffer.
-use crate::arith::{add_mod, from_i32, mont_mul, sub_mod, to_mont};
+use crate::arith::{add_mod, from_i32, mont_mul, neg_mod, sub_mod, to_mont};
 use crate::ntt::{intt_staged, ntt_staged};
 use crate::params::PrimeParams;
 use crate::prg::ChaCha20Prg;
@@ -23,16 +23,19 @@ pub fn lift_limb(m0: &[u32], q0: u32, p: &PrimeParams, out: &mut [u32]) -> Resul
     if m0.len() != out.len() {
         return Err(Error::BadLength);
     }
+    // A rescaling prime below q0/2 needs a real (32-bit) remainder; any other
+    // prime already exceeds |m|, and from_i32 alone is a select.
+    let small = 2 * p.q <= q0;
     for (o, &v) in out.iter_mut().zip(m0) {
         if v >= q0 {
             return Err(Error::NotReduced);
         }
         let signed = if v > q0 / 2 {
-            v as i64 - q0 as i64
+            v as i32 - q0 as i32
         } else {
-            v as i64
+            v as i32
         };
-        *o = from_i32(signed as i32, p.q);
+        *o = from_i32(if small { signed % p.q as i32 } else { signed }, p.q);
     }
     Ok(())
 }
@@ -157,14 +160,15 @@ pub fn key_limb(
     }
     c0.fill(0);
     add_error(error_seed, c0, p.q);
-    // P < q_row, so P mod q_row is P itself. A rotation key's message s is
-    // added before the (linear) NTT, which saves recomputing NTT(s).
+    // P mod q_row: P may exceed a smaller rescaling prime. A rotation key's
+    // message s is added before the (linear) NTT, saving a second NTT(s).
+    let aux = aux % p.q;
     if gadget && galois != 0 {
         for (j, c) in c0.iter_mut().enumerate() {
             let m = match unpack_ternary(packed, j) {
                 0 => 0,
                 1 => aux,
-                _ => p.q - aux,
+                _ => neg_mod(aux, p.q),
             };
             *c = add_mod(*c, m, p.q);
         }
@@ -237,6 +241,22 @@ mod tests {
                 assert_eq!(c0, want, "{} q={}", ps.name, p.q);
             }
         }
+    }
+
+    /// A rescaling prime below q0/2 still receives the exact centered value.
+    #[test]
+    fn lift_into_smaller_prime() {
+        let (q0, q1) = (params::PLR.primes[0].q, params::PLR.primes[1].q);
+        let mut out = [0u32; 2];
+        lift_limb(
+            &[1 << 28, q0 - (1 << 28)],
+            q0,
+            &params::PLR.primes[1],
+            &mut out,
+        )
+        .unwrap();
+        let m = (1i64 << 28).rem_euclid(q1 as i64) as u32;
+        assert_eq!(out, [m, q1 - m]);
     }
 
     #[test]

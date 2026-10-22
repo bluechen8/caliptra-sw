@@ -146,7 +146,7 @@ fn ecdh_without_clear_reference() {
     let pixels = u.seal(4, &[0; 196]);
     u.reject(&mut m, 4, &command(u.id, 4, false, 0), &pixels);
     let ct = u.call(&mut m, 2, PT0, false);
-    assert!(ps_close(&u.call(&mut m, 3, &ct, false), PT));
+    assert!(ps_close(&u.decrypt(&mut m, &ct, false), PT));
     u.call(&mut m, 5, &[], false);
     erased(&mut m);
 }
@@ -159,22 +159,22 @@ fn evaluation_keys() {
     let mut m = boot(&firmware::APP_FHE_EVAL_KEYS);
     let mut u = open(&mut m);
     let key = |id, op, arg| command(id, op, true, arg);
-    u.reject(&mut m, 6, &key(u.id, 6, 5), &[]); // before keygen
+    u.reject(&mut m, 7, &key(u.id, 7, 5), &[]); // before keygen
     u.call(&mut m, 1, &[], false);
-    // The Galois element must be odd, non-identity and < 512; op 7 needs 0.
-    for (op, arg) in [(6, 0), (6, 1), (6, 2), (6, 512), (7, 5)] {
+    // The Galois element must be odd, non-identity and < 512; op 8 needs 0.
+    for (op, arg) in [(7, 0), (7, 1), (7, 2), (7, 512), (8, 5)] {
         u.reject(&mut m, op, &key(u.id, op, arg), &[]);
     }
-    u.reject(&mut m, 6, &command(u.id, 6, false, 5), &[]); // mailbox mode
+    u.reject(&mut m, 7, &command(u.id, 7, false, 5), &[]); // mailbox mode
     for dst in [0x7fff_f000u64, 0x1_8000_0000 - 4, 0x1_0000_8001_0000] {
-        let mut h = key(u.id, 6, 5);
+        let mut h = key(u.id, 7, 5);
         h[28..36].copy_from_slice(&dst.to_le_bytes());
-        u.reject(&mut m, 6, &h, &[]);
+        u.reject(&mut m, 7, &h, &[]);
     }
     let mut keys = Vec::new();
     for _ in 0..2 {
-        m.limit_direct_mailbox_access(Some(footprint(6, true) as u32));
-        let response = send(&mut m, CommandId::from(IDS[5]), &key(u.id, 6, 5), &[]);
+        m.limit_direct_mailbox_access(Some(footprint(7, true) as u32));
+        let response = send(&mut m, CommandId::from(IDS[6]), &key(u.id, 7, 5), &[]);
         m.limit_direct_mailbox_access(None);
         assert_eq!(response.len(), 16);
         keys.push(m.soc_dram_mut().unwrap()[OUT..OUT + KEY_BYTES].to_vec());
@@ -188,16 +188,16 @@ fn evaluation_keys() {
             "unreduced residue in limb {i}"
         );
     }
-    m.limit_direct_mailbox_access(Some(footprint(6, true) as u32));
-    send(&mut m, CommandId::from(IDS[6]), &key(u.id, 7, 0), &[]);
+    m.limit_direct_mailbox_access(Some(footprint(7, true) as u32));
+    send(&mut m, CommandId::from(IDS[7]), &key(u.id, 8, 0), &[]);
     m.limit_direct_mailbox_access(None);
     // Row 0 fits, row 1 runs past emulator RAM: the partial DMA write poisons
     // transport, and only close runs afterwards.
     let end = m.soc_dram_mut().unwrap().len() as u64;
-    let mut h = key(u.id, 7, 0);
+    let mut h = key(u.id, 8, 0);
     h[28..36].copy_from_slice(&(0x8000_0000 + end - (KEY_BYTES as u64) / 2).to_le_bytes());
-    u.reject(&mut m, 7, &h, &[]);
-    u.reject(&mut m, 7, &key(u.id, 7, 0), &[]);
+    u.reject(&mut m, 8, &h, &[]);
+    u.reject(&mut m, 8, &key(u.id, 8, 0), &[]);
     u.call(&mut m, 5, &[], false);
     erased(&mut m);
     reject_open(&mut m, &u.open_request);
@@ -208,6 +208,6 @@ fn evaluation_keys_are_gated() {
     let mut m = boot(&firmware::APP_FHE_ECDH);
     let mut u = open(&mut m);
     u.call(&mut m, 1, &[], false);
-    u.reject(&mut m, 7, &command(u.id, 7, true, 0), &[]);
+    u.reject(&mut m, 8, &command(u.id, 8, true, 0), &[]);
     u.call(&mut m, 5, &[], false);
 }

@@ -71,8 +71,8 @@ $(error FHE_DEBUG requires FHE_PARAMS=ps, pl or pleq)
 endif
 endif
 ifneq ($(filter 1,$(FHE) $(FHE_DEBUG) $(FHE_TEST_KEY) $(FHE_ALOHA)),)
-ifeq ($(filter $(FHE_PARAMS),ps pl pleq p16),)
-$(error FHE_PARAMS must be ps, pl, pleq or p16)
+ifeq ($(filter $(FHE_PARAMS),ps pl pleq p16 plr),)
+$(error FHE_PARAMS must be ps, pl, pleq, p16 or plr)
 endif
 ifneq ($(FHE_PARAMS),ps)
 FHE_FEATURE := $(FHE_FEATURE),fhe-$(FHE_PARAMS)

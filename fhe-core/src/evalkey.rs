@@ -133,7 +133,7 @@ mod tests {
     /// the gadget message plus the row's shared error.
     #[test]
     fn rows_decrypt_to_gadget_message_plus_error() {
-        for ps in [&params::PS, &params::PLEQ, &params::P16] {
+        for ps in [&params::PS, &params::PLEQ, &params::P16, &params::PLR] {
             check_rows(ps);
         }
     }

@@ -208,15 +208,23 @@ fn set_of(fwid: &FwId) -> &'static ParamSet {
 const fn poly_words(ps: &ParamSet) -> usize {
     2 * ps.n + ntt::stage_twiddle_words(ps.n)
 }
-/// P-S decryption must stay within the CBD error support of the plaintext.
-fn ps_close(dec: &[u8], pt: &[u8]) -> bool {
-    PS_Q.into_iter().enumerate().all(|(limb, q)| {
-        let q = i64::from(q);
-        (0..256).all(|i| {
-            let diff = (word(dec, limb * 256 + i) as i64 - word(pt, limb * 256 + i) as i64 + q) % q;
-            diff <= 20 || diff >= q - 20
-        })
+/// A limb-0 decryption must stay within `bound` of the limb-0 plaintext: the
+/// CBD error support (20), or twice that after a refresh adds a fresh error.
+fn close_to(q: u32, dec: &[u8], pt: &[u8], bound: i64) -> bool {
+    let q = i64::from(q);
+    (0..pt.len() / 4).all(|i| {
+        let diff = (word(dec, i) as i64 - word(pt, i) as i64).rem_euclid(q);
+        diff <= bound || diff >= q - bound
     })
+}
+fn ps_close(dec: &[u8], pt: &[u8]) -> bool {
+    close_to(PS_Q[0], dec, &pt[..1024], 20)
+}
+/// Limb 0 of a ciphertext (c0 then c1), as the server leaves it after
+/// rescaling: what DECRYPT and REFRESH read.
+fn limb0(ps: &ParamSet, ct: &[u8]) -> Vec<u8> {
+    let (n, half) = (ps.n * 4, ct.len() / 2);
+    [&ct[..n], &ct[half..half + n]].concat()
 }
 fn words(w: &[u32]) -> Vec<u8> {
     w.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -231,10 +239,14 @@ fn footprint(op: u32, pointer: bool) -> usize {
     footprint_for(&params::PS, op, pointer)
 }
 fn footprint_for(ps: &ParamSet, op: u32, pointer: bool) -> usize {
-    let (input, output) = lengths_for(ps, op);
-    let input = if pointer && op == 3 { 0 } else { input };
+    let (input, output) = lengths_for(ps, op, ps.level);
+    let input = match (pointer, op) {
+        (true, 3) => 0,
+        (true, 6) => ps.n * 4,
+        _ => input,
+    };
     let output = if pointer { 0 } else { output };
-    let poly = if matches!(op, 2 | 3 | 6 | 7) {
+    let poly = if matches!(op, 2 | 3 | 6 | 7 | 8) {
         4 * poly_words(ps)
     } else {
         0
@@ -250,8 +262,9 @@ fn scrubbed_to(m: &mut DefaultHwModel, from: usize, to: usize) -> bool {
 const OPEN: u32 = 0x4648534f;
 /// Relay job frame ("FJOB"): the scheduler builds the command.
 const JOB: u32 = 0x424f4a46;
-const IDS: [u32; 7] = [
-    0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485254, 0x4648524c,
+/// Ops 1..8: KEYGEN, ENCRYPT, DECRYPT, clear ref., CLOSE, REFRESH, keys.
+const IDS: [u32; 8] = [
+    0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485246, 0x46485254, 0x4648524c,
 ];
 /// Both P-S limbs of the golden plaintext; ingress sends limb 0 (`PT0`) and
 /// Caliptra lifts it into limb 1, which matches `PT` because |m| < q0/2.
@@ -262,24 +275,33 @@ const SRC: u64 = 0x8000_0000;
 const OUT: usize = 0x40000;
 const DST: u64 = SRC + OUT as u64;
 /// (input, output) wire lengths; sealed blobs add a 20-B header and 16-B tag.
-fn lengths_for(ps: &ParamSet, op: u32) -> (usize, usize) {
+/// ENCRYPT and REFRESH output `level` limbs; DECRYPT and REFRESH read limb 0.
+fn lengths_for(ps: &ParamSet, op: u32, level: usize) -> (usize, usize) {
+    let limb = ps.n * 4;
     match op {
-        2 => (36 + ps.n * 4, ps.ct_bytes()),
-        3 => (ps.ct_bytes(), 36 + ps.pt_bytes()),
+        2 => (36 + limb, 2 * level * limb),
+        3 => (2 * limb, 36 + limb),
         4 => (232, 76),
-        6 | 7 => (0, key_bytes(ps)),
+        6 => (2 * limb, 2 * level * limb),
+        7 | 8 => (0, key_bytes(ps)),
         _ => (0, 0),
     }
 }
-fn lengths(op: u32) -> (usize, usize) {
-    lengths_for(&params::PS, op)
+/// ENCRYPT and REFRESH default to the full level (arg [11:8]).
+fn arg_for(ps: &ParamSet, op: u32, arg: u32) -> u32 {
+    if matches!(op, 2 | 6) && arg == 0 {
+        (ps.level as u32) << 8
+    } else {
+        arg
+    }
 }
 /// Plain 48-byte P-S scheduler command.
 fn command(id: u32, op: u32, pointer: bool, arg: u32) -> Vec<u8> {
     command_for(&params::PS, id, op, pointer, arg)
 }
 fn command_for(ps: &ParamSet, id: u32, op: u32, pointer: bool, arg: u32) -> Vec<u8> {
-    let (input, output) = lengths_for(ps, op);
+    let arg = arg_for(ps, op, arg);
+    let (input, output) = lengths_for(ps, op, (arg >> 8) as usize);
     let src = if pointer && input > 0 { SRC } else { 0 };
     let dst = if pointer && output > 0 { DST } else { 0 };
     words(&[
@@ -371,7 +393,7 @@ impl Client {
         pointer: bool,
         arg: u32,
     ) -> Vec<u8> {
-        let (_, output) = lengths_for(self.ps, op);
+        let (_, output) = lengths_for(self.ps, op, (arg_for(self.ps, op, arg) >> 8) as usize);
         if pointer {
             m.soc_dram_mut().unwrap()[..data.len()].copy_from_slice(data);
         }
@@ -394,11 +416,16 @@ impl Client {
             response[16..].to_vec()
         }
     }
+    /// DECRYPT a ciphertext of any level through its limb 0, as the server
+    /// sends it once the value fits q0/2.
+    fn decrypt(&mut self, m: &mut DefaultHwModel, ct: &[u8], pointer: bool) -> Vec<u8> {
+        let limb = limb0(self.ps, ct);
+        self.call(m, 3, &limb, pointer)
+    }
     fn call(&mut self, m: &mut DefaultHwModel, op: u32, body: &[u8], pointer: bool) -> Vec<u8> {
-        let data = if op == 2 || op == 4 {
-            self.seal(op, body)
-        } else {
-            body.to_vec()
+        let data = match op {
+            2 | 4 => self.seal(op, body),
+            _ => body.to_vec(),
         };
         let output = self.exec(m, op, &data, pointer);
         if op == 3 || op == 4 {
@@ -440,8 +467,19 @@ fn flow_and_lifecycle(fwid: &'static FwId<'static>, open: Open) {
     for pointer in [false, true] {
         let ct = u.call(&mut m, 2, PT0, pointer);
         assert_eq!(ct.len(), 4096);
-        assert!(ps_close(&u.call(&mut m, 3, &ct, pointer), PT));
+        assert!(ps_close(&u.decrypt(&mut m, &ct, pointer), PT));
         assert_ne!(u.call(&mut m, 2, PT0, pointer), ct, "fresh encryption");
+        // REFRESH limb 0 to each level, and ENCRYPT at level 1.
+        for level in [1, 2] {
+            let fresh = u.exec_arg(&mut m, 6, &limb0(&params::PS, &ct), pointer, level << 8);
+            assert_eq!(fresh.len(), 2048 * level as usize);
+            let dec = u.decrypt(&mut m, &fresh, pointer);
+            assert!(close_to(PS_Q[0], &dec, &PT[..1024], 40));
+        }
+        let blob = u.seal(2, PT0);
+        let low = u.exec_arg(&mut m, 2, &blob, pointer, 1 << 8);
+        assert_eq!(low.len(), 2048);
+        assert!(ps_close(&u.decrypt(&mut m, &low, pointer), PT));
         let pixels: Vec<u8> = (0..196).map(|i| (i % 16) as u8).collect();
         check_logits(&pixels, &u.call(&mut m, 4, &pixels, pointer));
     }
@@ -449,7 +487,7 @@ fn flow_and_lifecycle(fwid: &'static FwId<'static>, open: Open) {
     let first = u.exec(&mut m, 2, &blob, false);
     let second = u.exec(&mut m, 2, &blob, false);
     assert_ne!(first, second);
-    assert!(ps_close(&u.call(&mut m, 3, &second, false), PT));
+    assert!(ps_close(&u.decrypt(&mut m, &second, false), PT));
     // Close is a plain scheduler command; nothing survives it.
     u.call(&mut m, 5, &[], false);
     u.reject(&mut m, 1, &command(u.id, 1, false, 0), &[]);
@@ -458,7 +496,7 @@ fn flow_and_lifecycle(fwid: &'static FwId<'static>, open: Open) {
     v.reject(&mut m, 3, &command(v.id, 3, false, 0), &first);
     v.call(&mut m, 1, &[], false);
     assert!(
-        !ps_close(&v.call(&mut m, 3, &first, false), PT),
+        !ps_close(&v.decrypt(&mut m, &first, false), PT),
         "old secret survived"
     );
     v.reject(&mut m, 2, &command(v.id, 2, false, 0), &blob); // old session's blob
@@ -523,9 +561,20 @@ fn validation(fwid: &'static FwId<'static>, open: Open) {
         u.reject(&mut m, 2, &bad, &[]);
     }
     u.reject(&mut m, 5, &command(u.id, 5, true, 0), &[]);
+    // ENCRYPT and REFRESH levels must be 1..=L with no other arg bits.
+    let ct = u.exec(&mut m, 2, &blob, false);
+    for arg in [3 << 8, 0x201] {
+        u.reject(
+            &mut m,
+            6,
+            &command(u.id, 6, false, arg),
+            &limb0(&params::PS, &ct),
+        );
+        u.reject(&mut m, 2, &command(u.id, 2, false, arg), &blob);
+    }
     // The session and result counter are untouched by all of the above.
     let ct = u.exec(&mut m, 2, &blob, false);
-    assert!(ps_close(&u.call(&mut m, 3, &ct, false), PT));
+    assert!(ps_close(&u.decrypt(&mut m, &ct, false), PT));
     assert_eq!(u.results, 2);
     u.call(&mut m, 5, &[], false);
 }
@@ -537,11 +586,11 @@ fn failed_write_and_poison(fwid: &'static FwId<'static>, open: Open) {
     let mut u = open(&mut m);
     u.call(&mut m, 1, &[], false);
     let ct = u.call(&mut m, 2, PT0, false);
-    assert!(ps_close(&u.call(&mut m, 3, &ct, false), PT));
+    assert!(ps_close(&u.decrypt(&mut m, &ct, false), PT));
     let end = m.soc_dram_mut().unwrap().len();
     let mut h = command(u.id, 3, true, 0);
     h[28..32].copy_from_slice(&(0x80000000u32 + end as u32 - 16).to_le_bytes());
-    m.soc_dram_mut().unwrap()[..4096].copy_from_slice(&ct);
+    m.soc_dram_mut().unwrap()[..2048].copy_from_slice(&limb0(&params::PS, &ct));
     m.soc_dram_mut().unwrap()[end - 16..].fill(0xa5);
     u.reject(&mut m, 3, &h, &[]);
     // The first 16 bytes are the clear result header, with counter 2 consumed.
@@ -609,7 +658,7 @@ fn snapshot_and_cleanup(fwid: &'static FwId<'static>, open: Open) {
     assert_eq!(m.finish_mailbox_execute().unwrap().unwrap().len(), 16);
     assert!(scrubbed_to(&mut m, 16, footprint(2, true)));
     let ct = m.soc_dram_mut().unwrap()[OUT..OUT + 0x1000].to_vec();
-    assert!(ps_close(&u.call(&mut m, 3, &ct, false), PT));
+    assert!(ps_close(&u.decrypt(&mut m, &ct, false), PT));
     if fwid.features.contains(&"ml-clear") {
         // Authenticated but invalid pixels are refused and scrubbed.
         let bad = u.seal(4, &[16; 196]);
@@ -720,22 +769,35 @@ fn large_set(fwid: &'static FwId<'static>) {
             .collect::<Vec<_>>(),
     );
     let blob = u.seal(2, &body);
-    u.reject(&mut m, 2, &command_for(ps, u.id, 2, false, 0), &blob);
+    // Mailbox mode works only while the whole command fits the 256-KiB mailbox.
+    if footprint_for(ps, 2, false) > caliptra_common::memory_layout::MBOX_SIZE as usize {
+        u.reject(&mut m, 2, &command_for(ps, u.id, 2, false, 0), &blob);
+    } else {
+        assert_eq!(u.exec(&mut m, 2, &blob, false).len(), ps.ct_bytes());
+    }
     let ct = u.call(&mut m, 2, &body, true);
     assert_eq!(ct.len(), ps.ct_bytes());
     assert!(scrubbed_to(&mut m, 16, footprint_for(ps, 2, true)));
-    let dec = u.call(&mut m, 3, &ct, true);
-    assert_eq!(dec.len(), ps.pt_bytes());
-    for (li, p) in ps.primes.iter().enumerate() {
-        let q = i64::from(p.q);
+    let close = |dec: &[u8], bound: i64| {
+        let q = i64::from(q0);
+        assert_eq!(dec.len(), n * 4);
         for (i, v) in plain.iter().enumerate() {
-            let diff = (i64::from(word(&dec, li * n + i)) - v).rem_euclid(q);
-            assert!(diff <= 20 || diff >= q - 20, "limb {li} coefficient {i}");
+            let diff = (i64::from(word(dec, i)) - v).rem_euclid(q);
+            assert!(diff <= bound || diff >= q - bound, "coefficient {i}");
         }
+    };
+    close(&u.decrypt(&mut m, &ct, true), 20);
+    assert!(scrubbed_to(&mut m, 16, footprint_for(ps, 2, true)));
+    // REFRESH limb 0 back to every level; each output decrypts to m + e + e'.
+    for level in 1..=ps.level {
+        let arg = (level as u32) << 8;
+        let fresh = u.exec_arg(&mut m, 6, &limb0(ps, &ct), true, arg);
+        assert_eq!(fresh.len(), 2 * level * n * 4);
+        close(&u.decrypt(&mut m, &fresh, true), 40);
     }
     assert!(scrubbed_to(&mut m, 16, footprint_for(ps, 2, true)));
     if fwid.features.contains(&"fhe-eval-keys") {
-        let key = u.exec_arg(&mut m, 6, &[], true, 5);
+        let key = u.exec_arg(&mut m, 7, &[], true, 5);
         assert_eq!(key.len(), key_bytes(ps));
         let limbs = ps.level + 1;
         for (i, chunk) in key.chunks(n * 4).enumerate() {
@@ -760,6 +822,24 @@ fn testkey_p16_evalkey_host_demo() {
     run_host_demo(
         &firmware::APP_FHE_TEST_KEY_EVAL_KEYS_P16,
         "evalkey_demo.py",
+        false,
+    );
+}
+
+/// Mixed 30/25-bit primes: lifting into smaller primes and REFRESH to all seven levels.
+#[test]
+fn testkey_plr_streaming() {
+    large_set(&firmware::APP_FHE_TEST_KEY_EVAL_KEYS_PLR);
+}
+/// Encrypted logistic-regression training at P-LR: Caliptra encrypts each
+/// batch, exports 13 keys and REFRESHes the weights between server steps.
+/// FHE_LR_STEPS sets the number of steps (default 4).
+#[test]
+#[ignore = "about 8 minutes, mostly key generation; run with --ignored"]
+fn testkey_lr_host_demo() {
+    run_host_demo(
+        &firmware::APP_FHE_TEST_KEY_EVAL_KEYS_PLR,
+        "lr_demo.py",
         false,
     );
 }
@@ -832,6 +912,9 @@ fn run_host_demo_fixture(
     if ps.name != "ps" {
         cmd.arg("--params").arg(ps.name);
     }
+    if let (Some(steps), "lr_demo.py") = (std::env::var_os("FHE_LR_STEPS"), script_name) {
+        cmd.arg("--steps").arg(steps);
+    }
     if std::env::var_os("FHE_FULL_DEMO").is_some() && script_name == "protected_demo.py" {
         cmd.arg("--full");
     }
@@ -884,11 +967,12 @@ fn run_host_demo_fixture(
         let body = &data[16 + len..16 + len + ext];
         let (id, h, payload, outlen) = if id == JOB {
             let (op, mode, arg) = (word(&data, 4), word(&data, 5), word(&data, 6));
-            let outlen = if mode == 1 { lengths_for(ps, op).1 } else { 0 };
+            let lens = lengths_for(ps, op, (arg >> 8) as usize);
+            let outlen = if mode == 1 { lens.1 } else { 0 };
             assert_eq!(len, 12, "malformed job {i}");
             assert_eq!(
                 (ext, word(&data, 3) as usize),
-                (lengths_for(ps, op).0, outlen),
+                (lens.0, outlen),
                 "job {i} lengths"
             );
             if mailbox_only {
@@ -914,9 +998,9 @@ fn run_host_demo_fixture(
             (id, data[16..16 + len].to_vec(), &[][..], 0)
         };
         // Keys use only the command header and one limb of polynomial work.
-        let key = IDS[5..].contains(&id);
+        let key = IDS[6..].contains(&id);
         if key {
-            m.limit_direct_mailbox_access(Some(footprint_for(ps, 6, true) as u32));
+            m.limit_direct_mailbox_access(Some(footprint_for(ps, 7, true) as u32));
         }
         let result = send(&mut m, CommandId::from(id), &h, payload);
         if key {

@@ -6,7 +6,7 @@
 use crate::{fhe_transport::Transport, Drivers};
 use caliptra_drivers::memory_layout::{MBOX_ORG, MBOX_SIZE};
 use caliptra_drivers::{Aes, AesGcmContext, AesKey, CaliptraError, CaliptraResult, Dma, Trng};
-use caliptra_fhe_core::{evalkey, format, ntt, params, prg::ChaCha20Prg, rlwe, stream};
+use caliptra_fhe_core::{evalkey, ntt, params, prg::ChaCha20Prg, rlwe, stream};
 use caliptra_registers::mbox::enums::MboxStatusE;
 use zerocopy::IntoBytes;
 use zeroize::{Zeroize, Zeroizing};
@@ -38,14 +38,17 @@ const REQUEST_LEN: usize = if OPEN_LEN > COMMAND_LEN {
 const BLOB_HEADER: usize = 20;
 const TAG: usize = 16;
 const OPEN: u32 = 0x4648534f;
-const IDS: [u32; 7] = [
-    0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485254, 0x4648524c,
+/// Ops 1..8, numbered as the Aloha accelerator's commands (KEYGEN, ENCRYPT,
+/// DECRYPT, -, CLOSE, REFRESH), then this client's clear reference (4) and
+/// key exports (7, 8).
+const IDS: [u32; 8] = [
+    0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485246, 0x46485254, 0x4648524c,
 ];
 /// Workspace base in mailbox words: inputs start right after the command.
 const BASE: usize = COMMAND_LEN / 4;
 const MBOX_WORDS: usize = MBOX_SIZE as usize / 4;
-/// Ingress plaintext is limb 0 only (`|m| < q0/2`); results carry every limb.
-const INGRESS_BYTES: usize = N * 4;
+/// One limb: ingress plaintext and decrypt results are limb-0 residues (`|m| < q0/2`).
+const LIMB_BYTES: usize = N * 4;
 const KEY_BYTES: usize = evalkey::key_words(PARAMS) * 4;
 /// Per-limb polynomial work: A and B (N words each), then stage twiddles.
 const POLY_WORDS: usize = 2 * N + ntt::stage_twiddle_words(N);
@@ -54,13 +57,15 @@ const AES_WORDS: usize = 256;
 const fn blob(body: usize) -> usize {
     BLOB_HEADER + body + TAG
 }
-/// (input, output) wire lengths of op 1..7.
-const fn lengths(op: u32) -> (usize, usize) {
+/// (input, output) wire lengths of op 1..8; ENCRYPT and REFRESH output
+/// `level` limbs, DECRYPT and REFRESH read limb 0 (the server rescales first).
+const fn lengths(op: u32, level: usize) -> (usize, usize) {
     match op {
-        2 => (blob(INGRESS_BYTES), PARAMS.ct_bytes()),
-        3 => (PARAMS.ct_bytes(), blob(PARAMS.pt_bytes())),
+        2 => (blob(LIMB_BYTES), 2 * level * LIMB_BYTES),
+        3 => (2 * LIMB_BYTES, blob(LIMB_BYTES)),
         4 => (blob(196), blob(40)),
-        6 | 7 => (0, KEY_BYTES),
+        6 => (2 * LIMB_BYTES, 2 * level * LIMB_BYTES),
+        7 | 8 => (0, KEY_BYTES),
         _ => (0, 0),
     }
 }
@@ -151,7 +156,7 @@ pub fn handles(id: u32) -> bool {
 /// Only owned metadata survives Packet; payload is copied after its references die.
 pub struct Request {
     bytes: [u8; REQUEST_LEN],
-    /// 0 for session open, else 1..7.
+    /// 0 for session open, else 1..8.
     op: u32,
     arg: u32,
     src: u64,
@@ -189,25 +194,28 @@ impl Request {
             };
         }
         let op = word(b, 2);
-        if !(1..=7).contains(&op)
+        if !(1..=8).contains(&op)
             || IDS[(op - 1) as usize] != id
             || (op == 4 && !cfg!(feature = "ml-clear"))
-            || (op >= 6 && !cfg!(feature = "fhe-eval-keys"))
+            || (op >= 7 && !cfg!(feature = "fhe-eval-keys"))
         {
             return Err(INVALID);
         }
-        let (input, output) = lengths(op);
         let mode = word(b, 4);
         let src = (u64::from(word(b, 6)) << 32) | u64::from(word(b, 5));
         let dst = (u64::from(word(b, 8)) << 32) | u64::from(word(b, 7));
+        // arg, as Aloha's header word 11: [11:8] output level for ENCRYPT and
+        // REFRESH; keys take the Galois element (0 for relinearization).
         let arg = word(b, 11);
-        // Keys: arg is the Galois element; op 6 needs one, op 7 (relin) uses 0.
-        let key = op >= 6;
-        let arg_ok = if key {
-            (op == 7) == (arg == 0) && evalkey::valid(arg, N)
-        } else {
-            arg == 0
+        let level = (arg >> 8) as usize;
+        let key = op >= 7;
+        let arg_ok = match op {
+            // Any bit above [11:8] makes the level exceed L.
+            2 | 6 => arg & 0xff == 0 && (1..=PARAMS.level).contains(&level),
+            7 | 8 => (op == 8) == (arg == 0) && evalkey::valid(arg, N),
+            _ => arg == 0,
         };
+        let (input, output) = lengths(op, level);
         if mode > 1
             || !arg_ok
             || (key && mode != 1)
@@ -237,11 +245,16 @@ impl Request {
                 return Err(INVALID);
             }
         }
-        // Pointer egress reads public limbs one at a time; every other input is
-        // snapshotted once. Polynomial ops add one limb of work after both.
+        // Pointer DECRYPT and REFRESH read their public limb once each, with no
+        // snapshot; REFRESH keeps the decrypted limb in its input area. Every
+        // other input is snapshotted once. Polynomial ops add one limb of work.
         let pointer = mode == 1;
         r.op = op;
-        r.in_words = if pointer && op == 3 { 0 } else { input / 4 };
+        r.in_words = match (pointer, op) {
+            (true, 3) => 0,
+            (true, 6) => N,
+            _ => input / 4,
+        };
         r.out_words = if pointer { 0 } else { output / 4 };
         if r.words() > MBOX_WORDS {
             return Err(INVALID);
@@ -252,9 +265,13 @@ impl Request {
         r.pointer = pointer;
         Ok(r)
     }
+    /// Output limbs of ENCRYPT and REFRESH (arg [11:8]).
+    fn level(&self) -> usize {
+        (self.arg >> 8) as usize
+    }
     /// Mailbox words this command uses and scrubs.
     fn words(&self) -> usize {
-        let poly = if matches!(self.op, 2 | 3 | 6 | 7) {
+        let poly = if matches!(self.op, 2 | 3 | 6 | 7 | 8) {
             POLY_WORDS
         } else {
             0
@@ -434,7 +451,68 @@ impl Seal {
         out.put(self.at, &last[..words + 4])
     }
 }
-/// Ingress: authenticate limb-0 residues, then encrypt and emit each limb.
+/// Encrypt limb-0 residues `m0` (|m| < q0/2) to `level` limbs and emit the
+/// ciphertext: c0 limbs, then c1 limbs. Each limb is checked as it is lifted,
+/// limb 0 before any output.
+fn encrypt_to(
+    trng: &mut Trng,
+    secret: &[u8],
+    m0: &[u32],
+    level: usize,
+    poly: &mut [u32],
+    out: &mut Sink,
+) -> CaliptraResult<()> {
+    let q0 = PARAMS.primes[0].q;
+    let mut prg = fresh_prg(trng)?;
+    let mut error = Zeroizing::new([0u8; 32]);
+    prg.fill(&mut error[..]);
+    let (a, b, tw) = limb_work(poly);
+    for (li, p) in PARAMS.primes[..level].iter().enumerate() {
+        kernel(stream::lift_limb(m0, q0, p, a))?;
+        kernel(stream::encrypt_limb(
+            secret,
+            &error,
+            &mut prg,
+            p,
+            a,
+            b,
+            tw,
+            |at, c1| out.emit((level + li) * N + at, c1),
+        ))?;
+        out.put(li * N, a)?;
+    }
+    Ok(())
+}
+/// Decrypt the limb-0 ciphertext (c0, c1 at q0) into the first polynomial of
+/// `poly`: from `input` in mode 0, else each limb read once by DMA and checked.
+fn decrypt0(
+    r: &Request,
+    input: &[u32],
+    secret: &[u8],
+    poly: &mut [u32],
+    out: &mut Sink,
+) -> CaliptraResult<()> {
+    let p = &PARAMS.primes[0];
+    let (a, b, tw) = limb_work(poly);
+    let mut limb = |at: usize, dst: &mut [u32], out: &mut Sink| -> CaliptraResult<()> {
+        if r.pointer {
+            let src = r.src + (at * 4) as u64;
+            out.transport
+                .with_fifo(&mut *out.dma, |t| t.read(src, dst))
+                .map_err(|_| READ_FAILED)?;
+        } else {
+            copy_words(dst, &input[at..at + N]);
+        }
+        kernel(stream::check_reduced(dst, p.q))
+    };
+    // b = c1 . NTT(s), then a = INTT(c0 + b).
+    limb(N, b, out)?;
+    kernel(stream::secret_ntt(secret, p, tw, a))?;
+    stream::mul_assign(b, a, p);
+    limb(0, a, out)?;
+    kernel(stream::decrypt_finish(a, b, p, tw))
+}
+/// ENCRYPT: authenticate limb-0 residues, then encrypt to the chosen level.
 #[inline(never)]
 fn ingress(
     d: &mut Drivers,
@@ -451,31 +529,10 @@ fn ingress(
         ..
     } = d;
     open_blob(aes, trng, s.id, 2, input)?;
-    let m0 = &input[5..5 + N];
-    let q0 = PARAMS.primes[0].q;
-    let mut prg = fresh_prg(trng)?;
-    let mut error = Zeroizing::new([0u8; 32]);
-    prg.fill(&mut error[..]);
-    let (a, b, tw) = limb_work(poly);
     let mut out = Sink::new(output, r, dma, &mut s.transport);
-    for (li, p) in PARAMS.primes.iter().enumerate() {
-        // Lifting limb 0 checks the whole retained input before any output.
-        kernel(stream::lift_limb(m0, q0, p, a))?;
-        kernel(stream::encrypt_limb(
-            &s.secret,
-            &error,
-            &mut prg,
-            p,
-            a,
-            b,
-            tw,
-            |at, c1| out.emit(format::c1_limb_off(PARAMS, li) + at, c1),
-        ))?;
-        out.put(format::c0_limb_off(PARAMS, li), a)?;
-    }
-    Ok(())
+    encrypt_to(trng, &s.secret, &input[5..5 + N], r.level(), poly, &mut out)
 }
-/// Egress: decrypt each limb and seal it to the user as one result blob.
+/// DECRYPT: decrypt limb 0 and seal its residues to the user.
 #[inline(never)]
 fn egress(
     d: &mut Drivers,
@@ -491,51 +548,33 @@ fn egress(
         fhe_session: s,
         ..
     } = d;
-    if !r.pointer {
-        // The whole ciphertext is resident: validate it before any output.
-        for (li, p) in PARAMS.primes.iter().enumerate() {
-            for at in [
-                format::c0_limb_off(PARAMS, li),
-                format::c1_limb_off(PARAMS, li),
-            ] {
-                kernel(stream::check_reduced(&input[at..at + N], p.q))?;
-            }
-        }
-    }
-    let (a, b, tw) = limb_work(poly);
-    let secret = &s.secret;
     let mut out = Sink::new(output, r, dma, &mut s.transport);
-    let mut seal = Seal::begin(
-        aes,
-        trng,
-        s.id,
-        &mut s.counter,
-        3,
-        PARAMS.pt_bytes(),
-        &mut out,
-    )?;
-    for (li, p) in PARAMS.primes.iter().enumerate() {
-        // b = c1 . NTT(s), then a = INTT(c0 + b); each limb is read once.
-        let mut limb = |at: usize, dst: &mut [u32], out: &mut Sink| -> CaliptraResult<()> {
-            if r.pointer {
-                let src = r.src + (at * 4) as u64;
-                out.transport
-                    .with_fifo(&mut *out.dma, |t| t.read(src, dst))
-                    .map_err(|_| READ_FAILED)?;
-                kernel(stream::check_reduced(dst, p.q))
-            } else {
-                copy_words(dst, &input[at..at + N]);
-                Ok(())
-            }
-        };
-        limb(format::c1_limb_off(PARAMS, li), b, &mut out)?;
-        kernel(stream::secret_ntt(secret, p, tw, a))?;
-        stream::mul_assign(b, a, p);
-        limb(format::c0_limb_off(PARAMS, li), a, &mut out)?;
-        kernel(stream::decrypt_finish(a, b, p, tw))?;
-        seal.update(aes, a, &mut out)?;
-    }
+    decrypt0(r, input, &s.secret, poly, &mut out)?;
+    let mut seal = Seal::begin(aes, trng, s.id, &mut s.counter, 3, LIMB_BYTES, &mut out)?;
+    seal.update(aes, &poly[..N], &mut out)?;
     seal.end(aes, &mut out)
+}
+/// REFRESH: decrypt limb 0 and re-encrypt it, at its scale, to the chosen
+/// level with fresh randomness; no plaintext leaves Caliptra.
+#[inline(never)]
+fn refresh(
+    d: &mut Drivers,
+    r: &Request,
+    input: &mut [u32],
+    output: &mut [u32],
+    poly: &mut [u32],
+) -> CaliptraResult<()> {
+    let Drivers {
+        trng,
+        dma,
+        fhe_session: s,
+        ..
+    } = d;
+    let mut out = Sink::new(output, r, dma, &mut s.transport);
+    decrypt0(r, input, &s.secret, poly, &mut out)?;
+    // The input area (c0 consumed, or reserved in pointer mode) holds m + e.
+    copy_words(&mut input[..N], &poly[..N]);
+    encrypt_to(trng, &s.secret, &input[..N], r.level(), poly, &mut out)
 }
 /// Clear-reference inference on authenticated pixels, sealed to the user.
 #[cfg(feature = "ml-clear")]
@@ -638,8 +677,8 @@ fn command(
     }
     let (input, rest) = work[BASE..].split_at_mut(r.in_words);
     let (output, poly) = rest.split_at_mut(r.out_words);
-    if r.pointer && r.in_words != 0 {
-        // Snapshot external input once; every later read uses this copy.
+    if r.pointer && matches!(op, 2 | 4) {
+        // Snapshot sealed input once; every later read uses this copy.
         s.transport
             .with_fifo(&mut d.dma, |t| t.read(r.src, input))
             .map_err(|_| READ_FAILED)?;
@@ -647,10 +686,11 @@ fn command(
     match op {
         2 => ingress(d, r, input, output, poly)?,
         3 => egress(d, r, input, output, poly)?,
+        6 => refresh(d, r, input, output, poly)?,
         #[cfg(feature = "ml-clear")]
         4 => clear_reference(d, r, input, output)?,
         #[cfg(feature = "fhe-eval-keys")]
-        6 | 7 => key(d, r, poly)?,
+        7 | 8 => key(d, r, poly)?,
         _ => return Err(INVALID),
     }
     header[8..16].copy_from_slice(&cycles().wrapping_sub(start).to_le_bytes());
