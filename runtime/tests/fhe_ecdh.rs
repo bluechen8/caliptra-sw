@@ -84,7 +84,7 @@ fn ecdh_freshness_and_key_erasure() {
     let mut m = boot(&firmware::APP_FHE_ECDH_ML_CLEAR);
     let mut u = open(&mut m);
     u.call(&mut m, 1, &[], false);
-    let old = u.seal(2, PT);
+    let old = u.seal(2, PT0);
     u.call(&mut m, 5, &[], false);
     erased(&mut m);
     let mut v = open(&mut m);
@@ -145,7 +145,7 @@ fn ecdh_without_clear_reference() {
     u.call(&mut m, 1, &[], false);
     let pixels = u.seal(4, &[0; 196]);
     u.reject(&mut m, 4, &command(u.id, 4, false, 0), &pixels);
-    let ct = u.call(&mut m, 2, PT, false);
+    let ct = u.call(&mut m, 2, PT0, false);
     assert!(ps_close(&u.call(&mut m, 3, &ct, false), PT));
     u.call(&mut m, 5, &[], false);
     erased(&mut m);
@@ -153,7 +153,7 @@ fn ecdh_without_clear_reference() {
 
 /// Key commands are pointer-only plain commands. Each returns one whole public
 /// hybrid key (two rows over q0, q1 and P), fresh per request, fully reduced,
-/// and never staged in mailbox SRAM.
+/// and uses only the command header and one limb of mailbox work.
 #[test]
 fn evaluation_keys() {
     let mut m = boot(&firmware::APP_FHE_EVAL_KEYS);
@@ -173,11 +173,11 @@ fn evaluation_keys() {
     }
     let mut keys = Vec::new();
     for _ in 0..2 {
-        m.limit_direct_mailbox_access(Some(48));
+        m.limit_direct_mailbox_access(Some(footprint(6, true) as u32));
         let response = send(&mut m, CommandId::from(IDS[5]), &key(u.id, 6, 5), &[]);
         m.limit_direct_mailbox_access(None);
         assert_eq!(response.len(), 16);
-        keys.push(m.soc_dram_mut().unwrap()[0x10000..0x10000 + KEY_BYTES].to_vec());
+        keys.push(m.soc_dram_mut().unwrap()[OUT..OUT + KEY_BYTES].to_vec());
     }
     assert_ne!(keys[0], keys[1], "keys must use fresh randomness");
     // Per row: [c0 q0, c0 q1, c0 P, c1 q0, c1 q1, c1 P].
@@ -188,7 +188,7 @@ fn evaluation_keys() {
             "unreduced residue in limb {i}"
         );
     }
-    m.limit_direct_mailbox_access(Some(48));
+    m.limit_direct_mailbox_access(Some(footprint(6, true) as u32));
     send(&mut m, CommandId::from(IDS[6]), &key(u.id, 7, 0), &[]);
     m.limit_direct_mailbox_access(None);
     // Row 0 fits, row 1 runs past emulator RAM: the partial DMA write poisons

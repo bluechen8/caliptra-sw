@@ -38,53 +38,214 @@ pub struct ParamSet {
     pub scale_bits: u32,
     /// The L primes, limb 0 first.
     pub primes: &'static [PrimeParams],
+    /// Auxiliary key-switching prime P, below every Q prime (keys only).
+    pub aux: PrimeParams,
 }
 
 impl ParamSet {
     /// Bytes in one RNS plaintext polynomial (`POLY_INT_32`).
-    pub const fn pt_bytes(&self) -> usize { self.level * self.n * 4 }
+    pub const fn pt_bytes(&self) -> usize {
+        self.level * self.n * 4
+    }
     /// Bytes in one ciphertext (`c0` limbs then `c1` limbs).
-    pub const fn ct_bytes(&self) -> usize { 2 * self.level * self.n * 4 }
+    pub const fn ct_bytes(&self) -> usize {
+        2 * self.level * self.n * 4
+    }
     /// `u32` words in one RNS plaintext polynomial.
-    pub const fn pt_words(&self) -> usize { self.level * self.n }
+    pub const fn pt_words(&self) -> usize {
+        self.level * self.n
+    }
     /// `u32` words in one ciphertext.
-    pub const fn ct_words(&self) -> usize { 2 * self.level * self.n }
+    pub const fn ct_words(&self) -> usize {
+        2 * self.level * self.n
+    }
 }
 
 /// P-S: N=256, L=2, 30-bit primes, log q = 60.
 pub const PS_PRIMES: [PrimeParams; 2] = [
-    PrimeParams { q: 0x3ffff401, root: 0x006a92e4, root_inv: 0x21331e0a, n_inv: 0x3fbff40d, q_inv_neg: 0x7f6ff3ff, r2: 0x08fe8010, r1: 0x00002ffc },
-    PrimeParams { q: 0x3fffdc01, root: 0x0041ccdd, root_inv: 0x2a9466b6, n_inv: 0x3fbfdc25, q_inv_neg: 0xfaefdbff, r2: 0x10fba40f, r1: 0x00008ffc },
+    PrimeParams {
+        q: 0x3ffff401,
+        root: 0x006a92e4,
+        root_inv: 0x21331e0a,
+        n_inv: 0x3fbff40d,
+        q_inv_neg: 0x7f6ff3ff,
+        r2: 0x08fe8010,
+        r1: 0x00002ffc,
+    },
+    PrimeParams {
+        q: 0x3fffdc01,
+        root: 0x0041ccdd,
+        root_inv: 0x2a9466b6,
+        n_inv: 0x3fbfdc25,
+        q_inv_neg: 0xfaefdbff,
+        r2: 0x10fba40f,
+        r1: 0x00008ffc,
+    },
 ];
 
 /// P-S auxiliary key-switching prime P (keys only).
-pub const PS_AUX: PrimeParams = PrimeParams { q: 0x3fffd601, root: 0x005920af, root_inv: 0x3198bce7, n_inv: 0x3fbfd62b, q_inv_neg: 0xd11bd5ff, r2: 0x2e3aea0f, r1: 0x0000a7fc };
+pub const PS_AUX: PrimeParams = PrimeParams {
+    q: 0x3fffd601,
+    root: 0x005920af,
+    root_inv: 0x3198bce7,
+    n_inv: 0x3fbfd62b,
+    q_inv_neg: 0xd11bd5ff,
+    r2: 0x2e3aea0f,
+    r1: 0x0000a7fc,
+};
 
 /// P-S parameter point.
-pub const PS: ParamSet = ParamSet { name: "ps", log_n: 8, n: 256, level: 2, scale_bits: 20, primes: &PS_PRIMES };
+pub const PS: ParamSet = ParamSet {
+    name: "ps",
+    log_n: 8,
+    n: 256,
+    level: 2,
+    scale_bits: 20,
+    primes: &PS_PRIMES,
+    aux: PS_AUX,
+};
 
 /// P-L: N=8192, L=2, 30-bit primes, log q = 60.
 pub const PL_PRIMES: [PrimeParams; 2] = [
-    PrimeParams { q: 0x3fff4001, root: 0x0000ceb9, root_inv: 0x0e92bdb4, n_inv: 0x3ffd4007, q_inv_neg: 0xafff3fff, r2: 0x0002ffec, r1: 0x0002fffc },
-    PrimeParams { q: 0x3ffe8001, root: 0x00017d0c, root_inv: 0x084745b1, n_inv: 0x3ffc800d, q_inv_neg: 0xfffe7fff, r2: 0x00a7ff80, r1: 0x0005fffc },
+    PrimeParams {
+        q: 0x3fff4001,
+        root: 0x0000ceb9,
+        root_inv: 0x0e92bdb4,
+        n_inv: 0x3ffd4007,
+        q_inv_neg: 0xafff3fff,
+        r2: 0x0002ffec,
+        r1: 0x0002fffc,
+    },
+    PrimeParams {
+        q: 0x3ffe8001,
+        root: 0x00017d0c,
+        root_inv: 0x084745b1,
+        n_inv: 0x3ffc800d,
+        q_inv_neg: 0xfffe7fff,
+        r2: 0x00a7ff80,
+        r1: 0x0005fffc,
+    },
 ];
 
+/// P-L auxiliary key-switching prime P (keys only).
+pub const PL_AUX: PrimeParams = PrimeParams {
+    q: 0x3ffc0001,
+    root: 0x00007d8a,
+    root_inv: 0x3daf52b4,
+    n_inv: 0x3ffa0021,
+    q_inv_neg: 0x3ffbffff,
+    r2: 0x0f7ffc10,
+    r1: 0x000ffffc,
+};
+
 /// P-L parameter point.
-pub const PL: ParamSet = ParamSet { name: "pl", log_n: 13, n: 8192, level: 2, scale_bits: 20, primes: &PL_PRIMES };
+pub const PL: ParamSet = ParamSet {
+    name: "pl",
+    log_n: 13,
+    n: 8192,
+    level: 2,
+    scale_bits: 20,
+    primes: &PL_PRIMES,
+    aux: PL_AUX,
+};
 
 /// P-L-eq: N=8192, L=4, 27-bit primes, log q = 108.
 pub const PLEQ_PRIMES: [PrimeParams; 4] = [
-    PrimeParams { q: 0x07fa8001, root: 0x0000182c, root_inv: 0x07cfeba1, n_inv: 0x07fa402d, q_inv_neg: 0xc7fa7fff, r2: 0x05275999, r1: 0x00afffe0 },
-    PrimeParams { q: 0x07f74001, root: 0x00007666, root_inv: 0x006e67f7, n_inv: 0x07f70047, q_inv_neg: 0x77f73fff, r2: 0x0773d1fd, r1: 0x0117ffe0 },
-    PrimeParams { q: 0x07f6c001, root: 0x00001318, root_inv: 0x078b8ea1, n_inv: 0x07f6804b, q_inv_neg: 0x77f6bfff, r2: 0x031dca59, r1: 0x0127ffe0 },
-    PrimeParams { q: 0x07f54001, root: 0x00003ec6, root_inv: 0x02d4c399, n_inv: 0x07f50057, q_inv_neg: 0x77f53fff, r2: 0x065b6dfe, r1: 0x0157ffe0 },
+    PrimeParams {
+        q: 0x07fa8001,
+        root: 0x0000182c,
+        root_inv: 0x07cfeba1,
+        n_inv: 0x07fa402d,
+        q_inv_neg: 0xc7fa7fff,
+        r2: 0x05275999,
+        r1: 0x00afffe0,
+    },
+    PrimeParams {
+        q: 0x07f74001,
+        root: 0x00007666,
+        root_inv: 0x006e67f7,
+        n_inv: 0x07f70047,
+        q_inv_neg: 0x77f73fff,
+        r2: 0x0773d1fd,
+        r1: 0x0117ffe0,
+    },
+    PrimeParams {
+        q: 0x07f6c001,
+        root: 0x00001318,
+        root_inv: 0x078b8ea1,
+        n_inv: 0x07f6804b,
+        q_inv_neg: 0x77f6bfff,
+        r2: 0x031dca59,
+        r1: 0x0127ffe0,
+    },
+    PrimeParams {
+        q: 0x07f54001,
+        root: 0x00003ec6,
+        root_inv: 0x02d4c399,
+        n_inv: 0x07f50057,
+        q_inv_neg: 0x77f53fff,
+        r2: 0x065b6dfe,
+        r1: 0x0157ffe0,
+    },
 ];
 
+/// P-L-eq auxiliary key-switching prime P (keys only).
+pub const PLEQ_AUX: PrimeParams = PrimeParams {
+    q: 0x07f14001,
+    root: 0x000017de,
+    root_inv: 0x02475a63,
+    n_inv: 0x07f10077,
+    q_inv_neg: 0x77f13fff,
+    r2: 0x027ef20a,
+    r1: 0x01d7ffe0,
+};
+
 /// P-L-eq parameter point.
-pub const PLEQ: ParamSet = ParamSet { name: "pleq", log_n: 13, n: 8192, level: 4, scale_bits: 18, primes: &PLEQ_PRIMES };
+pub const PLEQ: ParamSet = ParamSet {
+    name: "pleq",
+    log_n: 13,
+    n: 8192,
+    level: 4,
+    scale_bits: 18,
+    primes: &PLEQ_PRIMES,
+    aux: PLEQ_AUX,
+};
+
+/// P-16: N=16384, L=1, 30-bit primes, log q = 30.
+pub const P16_PRIMES: [PrimeParams; 1] = [PrimeParams {
+    q: 0x3ffe8001,
+    root: 0x0003a4fe,
+    root_inv: 0x0bedb48b,
+    n_inv: 0x3ffd8007,
+    q_inv_neg: 0xfffe7fff,
+    r2: 0x00a7ff80,
+    r1: 0x0005fffc,
+}];
+
+/// P-16 auxiliary key-switching prime P (keys only).
+pub const P16_AUX: PrimeParams = PrimeParams {
+    q: 0x3ffc0001,
+    root: 0x0000feca,
+    root_inv: 0x3edef896,
+    n_inv: 0x3ffb0011,
+    q_inv_neg: 0x3ffbffff,
+    r2: 0x0f7ffc10,
+    r1: 0x000ffffc,
+};
+
+/// P-16 parameter point.
+pub const P16: ParamSet = ParamSet {
+    name: "p16",
+    log_n: 14,
+    n: 16384,
+    level: 1,
+    scale_bits: 20,
+    primes: &P16_PRIMES,
+    aux: P16_AUX,
+};
 
 /// Every parameter point, in plan §2.3 order.
-pub const ALL: [&ParamSet; 3] = [&PS, &PL, &PLEQ];
+pub const ALL: [&ParamSet; 4] = [&PS, &PL, &PLEQ, &P16];
 
 /// Look up a parameter point by its short name.
 pub fn by_name(name: &str) -> Option<&'static ParamSet> {

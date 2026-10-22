@@ -16,7 +16,8 @@ Abstract:
     on VeeR (plan §3.2: the microcontroller may read *and* write mailbox SRAM
     while a SoC command is executing).
 
-    Scope: encrypt/decrypt and evaluation-key generation. There are no
+    Scope: encrypt/decrypt and evaluation-key generation; `stream` holds the
+    limb-at-a-time forms the protected runtime uses at every parameter set. There are no
     user-ciphertext evaluation operations here, no refresh, and no path that returns a decryption to the
     SoC in the clear -- that is the runtime's job, and only `FHE_EGRESS`
     (decrypt fused with AES-GCM to the user) may do it.
@@ -47,6 +48,8 @@ pub mod prg;
 pub mod rlwe;
 /// Ternary / centered-binomial / uniform samplers.
 pub mod sample;
+/// Limb-at-a-time kernels for the protected service.
+pub mod stream;
 
 pub use params::{ParamSet, PrimeParams};
 
@@ -65,6 +68,8 @@ pub enum Error {
     BadHeader,
     /// A blob's sequence number did not advance.
     StaleSeq,
+    /// The caller's output sink (DMA or mailbox) failed.
+    Sink,
 }
 
 /// Result alias for the kernels.

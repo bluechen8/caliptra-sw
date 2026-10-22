@@ -1409,3 +1409,278 @@ impl Aes {
         Aes::new(aes, aes_clp).zeroize_internal();
     }
 }
+
+/// Streaming AES-256-GCM with any key, including a KeyVault key, for the FHE
+/// protected service. The context does not hold the key: pass the same key to
+/// every call. Compiled only with `gcm-any-key`, so other builds are unchanged.
+#[cfg(feature = "gcm-any-key")]
+#[allow(clippy::too_many_arguments)]
+impl Aes {
+    /// Like [`Self::aes_256_gcm_init`] for any key.
+    pub fn aes_256_gcm_init_with_key(
+        &mut self,
+        trng: &mut Trng,
+        key: AesKey,
+        iv: AesGcmIv,
+        aad: &[u8],
+    ) -> CaliptraResult<AesGcmContext> {
+        if aad.len() > AES_MAX_DATA_SIZE {
+            Err(CaliptraError::RUNTIME_DRIVER_AES_INVALID_SLICE)?;
+        }
+        let iv = self.initialize_aes_gcm(
+            trng,
+            iv,
+            key,
+            aad,
+            AesOperation::Encrypt, // doesn't matter
+        )?;
+        let ghash_state = if aad.is_empty() {
+            // No AES operation has run, so there is no GHASH state to save.
+            [0; 16]
+        } else {
+            self.save()?
+        };
+        self.zeroize_internal();
+        Ok(AesGcmContext {
+            key: [0; 32],
+            iv,
+            aad_len: aad.len() as u32,
+            ghash_state,
+            buffer_len: 0,
+            buffer: [0; 16],
+            fips_valid: false.into(),
+            resreved: [0; 15],
+        })
+    }
+
+    /// [`Self::aes_256_gcm_encrypt_update`] with the context's key.
+    pub fn aes_256_gcm_encrypt_update_with_key(
+        &mut self,
+        key: AesKey,
+        context: &AesGcmContext,
+        plaintext: &[u8],
+        ciphertext: &mut [u8],
+    ) -> CaliptraResult<(usize, AesGcmContext)> {
+        self.gcm_update_with_key(key, context, plaintext, ciphertext, AesOperation::Encrypt)
+    }
+
+    /// [`Self::aes_256_gcm_decrypt_update`] with the context's key.
+    pub fn aes_256_gcm_decrypt_update_with_key(
+        &mut self,
+        key: AesKey,
+        context: &AesGcmContext,
+        ciphertext: &[u8],
+        plaintext: &mut [u8],
+    ) -> CaliptraResult<(usize, AesGcmContext)> {
+        self.gcm_update_with_key(key, context, ciphertext, plaintext, AesOperation::Decrypt)
+    }
+
+    /// [`Self::aes_256_gcm_encrypt_final`] with the context's key.
+    pub fn aes_256_gcm_encrypt_final_with_key(
+        &mut self,
+        key: AesKey,
+        context: &AesGcmContext,
+        plaintext: &[u8],
+        ciphertext: &mut [u8],
+    ) -> CaliptraResult<(usize, [u8; AES_BLOCK_SIZE_BYTES])> {
+        self.gcm_final_with_key(key, context, plaintext, ciphertext, AesOperation::Encrypt)
+    }
+
+    /// [`Self::aes_256_gcm_decrypt_final`] with the context's key; returns
+    /// whether the tags matched.
+    pub fn aes_256_gcm_decrypt_final_with_key(
+        &mut self,
+        key: AesKey,
+        context: &AesGcmContext,
+        ciphertext: &[u8],
+        plaintext: &mut [u8],
+        tag: &[u8],
+    ) -> CaliptraResult<(usize, [u8; AES_BLOCK_SIZE_BYTES], bool)> {
+        if tag.len() > AES_BLOCK_SIZE_BYTES {
+            Err(CaliptraError::RUNTIME_DRIVER_AES_INVALID_TAG_SIZE)?;
+        }
+        let (written, computed_tag) =
+            self.gcm_final_with_key(key, context, ciphertext, plaintext, AesOperation::Decrypt)?;
+        Ok((written, computed_tag, constant_time_eq(tag, &computed_tag)))
+    }
+
+    fn gcm_update_with_key(
+        &mut self,
+        key: AesKey,
+        context: &AesGcmContext,
+        mut input: &[u8],
+        mut output: &mut [u8],
+        op: AesOperation,
+    ) -> CaliptraResult<(usize, AesGcmContext)> {
+        let left = context.buffer_len as usize % AES_BLOCK_SIZE_BYTES;
+
+        if output.len() < input.len() + left {
+            Err(CaliptraError::RUNTIME_DRIVER_AES_INVALID_SLICE)?;
+        }
+
+        let mut len = context.buffer_len as usize;
+
+        if left + input.len() < AES_BLOCK_SIZE_BYTES {
+            // not enough bytes to do a block, so save in the buffer and return
+            let mut buffer = [0u8; AES_BLOCK_SIZE_BYTES];
+            buffer[..left].copy_from_slice(&context.buffer[..left]);
+            buffer[left..left + input.len()].copy_from_slice(input);
+            len += input.len();
+            self.zeroize_internal();
+            return Ok((
+                0,
+                AesGcmContext {
+                    key: context.key,
+                    iv: context.iv,
+                    aad_len: context.aad_len,
+                    ghash_state: context.ghash_state,
+                    buffer_len: len as u32,
+                    buffer,
+                    fips_valid: context.fips_valid,
+                    resreved: [0; 15],
+                },
+            ));
+        }
+
+        self.restore(
+            key,
+            &context.iv,
+            context.aad_len,
+            context.buffer_len,
+            &context.ghash_state,
+            op,
+        )?;
+
+        // check if we need to process the previous buffer
+        let mut written = 0;
+        if left > 0 {
+            // guaranteed to have at least one block to do
+            let mut buffer = [0u8; AES_BLOCK_SIZE_BYTES];
+            buffer[..left].copy_from_slice(&context.buffer[..left]);
+            let take = AES_BLOCK_SIZE_BYTES - left;
+            buffer[left..].copy_from_slice(&input[..take]);
+            input = &input[take..];
+            len += take;
+            self.read_write_data_gcm(&buffer, GcmPhase::Text, Some(output))?;
+            output = &mut output[AES_BLOCK_SIZE_BYTES..];
+            written += AES_BLOCK_SIZE_BYTES;
+        }
+
+        // Write blocks of input and read blocks of output.
+        while input.len() >= AES_BLOCK_SIZE_BYTES {
+            let take = AES_BLOCK_SIZE_BYTES;
+            // should be impossible but needed to prevent panic
+            if output.len() < take {
+                Err(CaliptraError::RUNTIME_DRIVER_AES_INVALID_SLICE)?;
+            }
+            self.read_write_data_gcm(&input[..take], GcmPhase::Text, Some(output))?;
+            written += take;
+            output = &mut output[take..];
+            input = &input[take..];
+            len += take;
+        }
+
+        // Save the remaining plaintext in the buffer.
+        len += input.len();
+        let mut buffer = [0u8; AES_BLOCK_SIZE_BYTES];
+        buffer[..input.len()].copy_from_slice(input);
+
+        let ghash_state = if context.aad_len == 0 && context.buffer_len == 0 {
+            // Edge case where we have not actually done any AES operations,
+            // so the GHASH state should not be saved.
+            [0; 16]
+        } else {
+            self.save()?
+        };
+        self.zeroize_internal();
+        Ok((
+            written,
+            AesGcmContext {
+                key: context.key,
+                iv: context.iv,
+                aad_len: context.aad_len,
+                ghash_state,
+                buffer_len: len as u32,
+                buffer,
+                fips_valid: context.fips_valid,
+                resreved: [0; 15],
+            },
+        ))
+    }
+
+    fn gcm_final_with_key(
+        &mut self,
+        key: AesKey,
+        context: &AesGcmContext,
+        mut input: &[u8],
+        mut output: &mut [u8],
+        op: AesOperation,
+    ) -> CaliptraResult<(usize, [u8; AES_BLOCK_SIZE_BYTES])> {
+        let left = context.buffer_len as usize % AES_BLOCK_SIZE_BYTES;
+
+        if output.len() < input.len() + left {
+            Err(CaliptraError::RUNTIME_DRIVER_AES_INVALID_SLICE)?;
+        }
+
+        self.restore(
+            key,
+            &context.iv,
+            context.aad_len,
+            context.buffer_len,
+            &context.ghash_state,
+            op,
+        )?;
+
+        // check if we need to process the previous buffer
+        let mut len = context.buffer_len as usize;
+        let mut written = 0;
+        let mut new_input = [0u8; AES_BLOCK_SIZE_BYTES];
+        let mut input = if left > 0 {
+            if left + input.len() >= AES_BLOCK_SIZE_BYTES {
+                let mut buffer = [0u8; AES_BLOCK_SIZE_BYTES];
+                buffer[..left].copy_from_slice(&context.buffer[..left]);
+                let take = AES_BLOCK_SIZE_BYTES - left;
+                buffer[left..].copy_from_slice(&input[..take]);
+                input = &input[take..];
+                len += take;
+                self.read_write_data_gcm(&buffer, GcmPhase::Text, Some(output))?;
+                output = &mut output[AES_BLOCK_SIZE_BYTES..];
+                written += AES_BLOCK_SIZE_BYTES;
+                input
+            } else {
+                // edge case where the buffer and input are not enough to do a block
+                len -= left; // correct the length, which is added again later
+                new_input[..left].copy_from_slice(&context.buffer[..left]);
+                new_input[left..left + input.len()].copy_from_slice(input);
+                &new_input[..left + input.len()]
+            }
+        } else {
+            input
+        };
+
+        // Write blocks of plaintext and read blocks of ciphertext out.
+        while input.len() >= AES_BLOCK_SIZE_BYTES {
+            let take = AES_BLOCK_SIZE_BYTES;
+            // should be impossible but needed to prevent panic
+            if take > output.len() {
+                Err(CaliptraError::RUNTIME_DRIVER_AES_INVALID_SLICE)?;
+            }
+            self.read_write_data_gcm(&input[..take], GcmPhase::Text, Some(output))?;
+            output = &mut output[take..];
+            input = &input[take..];
+            len += take;
+            written += take;
+        }
+
+        // Do the final block
+        if !input.is_empty() {
+            self.read_write_data_gcm(input, GcmPhase::Text, Some(output))?;
+            len += input.len();
+            written += input.len();
+        }
+
+        // Compute and return the tag
+        let tag = self.compute_tag(context.aad_len as usize, len)?;
+        Ok((written, tag))
+    }
+}

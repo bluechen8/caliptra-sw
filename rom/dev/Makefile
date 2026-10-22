@@ -59,14 +59,20 @@ FHE_FEATURE := $(if $(filter 1,$(FHE_ALOHA)),fhe-aloha,fhe-test-key)
 endif
 # Evaluated before params/ml-clear suffixes are comma-joined onto FHE_FEATURE.
 FHE_PROTECTED := $(filter fhe-test-key fhe-ecdh fhe-aloha,$(FHE_FEATURE))
-ifneq ($(FHE_PROTECTED),)
+ifeq ($(FHE_PROTECTED),fhe-aloha)
 ifneq ($(FHE_PARAMS),ps)
-$(error protected FHE builds currently support FHE_PARAMS=ps only)
+$(error the Aloha profile supports FHE_PARAMS=ps only)
+endif
+endif
+# Protocol v5 streams any set limb by limb; the raw debug kernels stop at N=8192.
+ifeq ($(FHE_DEBUG),1)
+ifeq ($(filter $(FHE_PARAMS),ps pl pleq),)
+$(error FHE_DEBUG requires FHE_PARAMS=ps, pl or pleq)
 endif
 endif
 ifneq ($(filter 1,$(FHE) $(FHE_DEBUG) $(FHE_TEST_KEY) $(FHE_ALOHA)),)
-ifeq ($(filter $(FHE_PARAMS),ps pl pleq),)
-$(error FHE_PARAMS must be ps, pl or pleq)
+ifeq ($(filter $(FHE_PARAMS),ps pl pleq p16),)
+$(error FHE_PARAMS must be ps, pl, pleq or p16)
 endif
 ifneq ($(FHE_PARAMS),ps)
 FHE_FEATURE := $(FHE_FEATURE),fhe-$(FHE_PARAMS)

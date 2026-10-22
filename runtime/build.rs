@@ -22,7 +22,12 @@ fn main() {
 
             let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-            fs::write(out_dir.join("memory.x"),gen_memory_x(caliptra_common::RUNTIME_ORG, caliptra_common::RUNTIME_SIZE)
+            let size = if env::var_os("CARGO_FEATURE_FHE").is_some() {
+                caliptra_common::FHE_RUNTIME_SIZE
+            } else {
+                caliptra_common::RUNTIME_SIZE
+            };
+            fs::write(out_dir.join("memory.x"),gen_memory_x(caliptra_common::RUNTIME_ORG, size)
             .as_bytes())
             .expect("Unable to generate memory.x");
 

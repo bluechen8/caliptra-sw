@@ -1,154 +1,198 @@
 // Licensed under the Apache-2.0 license
-//! P-S evaluation keys with hybrid key switching: an auxiliary prime P and
-//! RNS decomposition, compatible with Lattigo's default (dnum = 2) keys.
+//! Evaluation keys with hybrid key switching: an auxiliary prime P and RNS
+//! decomposition, compatible with Lattigo's default keys (one digit per Q prime).
 //!
 //! A key has one row per Q prime. Each row is a degree-one RLWE ciphertext mod
-//! P*Q (limbs q0, q1, P). Row j encrypts P*m only in limb q_j, the CRT gadget
-//! P*(Q/q_j)*[(Q/q_j)^-1]_{q_j}. Rotation keys use m = s under
+//! P*Q (limbs q_0..q_{L-1}, P). Row j encrypts P*m only in limb q_j, the CRT
+//! gadget P*(Q/q_j)*[(Q/q_j)^-1]_{q_j}. Rotation keys use m = s under
 //! sigma_g^-1(s); relinearization keys use m = s^2 under s. Outputs are
 //! standard (not Montgomery) bit-reversed NTT residues, like the other kernels.
-use crate::params::{PrimeParams, PS_AUX, PS_PRIMES};
-use crate::{arith, ntt, prg::ChaCha20Prg, rlwe, sample, Error, Result};
+//! Rows are generated limb by limb with `stream::key_limb`.
+use crate::params::{ParamSet, PrimeParams};
+use crate::prg::ChaCha20Prg;
+use crate::{stream, Result};
 
-/// Row limb primes: the Q primes, then the auxiliary key-switching prime P.
-pub const LIMBS: [PrimeParams; 3] = [PS_PRIMES[0], PS_PRIMES[1], PS_AUX];
 /// Rows in one evaluation key: one per Q prime.
-pub const ROWS: usize = 2;
-/// Serialized words per row: two polynomials, three limbs, 256 coefficients,
-/// laid out `[c0 q0, c0 q1, c0 P, c1 q0, c1 q1, c1 P]`.
-pub const ROW_WORDS: usize = 2 * LIMBS.len() * 256;
-/// Polynomial scratch words, to be erased by the caller after use.
-pub const SCRATCH_WORDS: usize = 768;
-
-/// Whether `galois` names a supported key: 0 is relinearization, otherwise a
-/// non-identity odd Galois element modulo 2N=512.
-pub const fn valid(galois: u32) -> bool {
-    galois == 0 || (galois > 1 && galois < 512 && galois & 1 == 1)
+pub const fn rows(ps: &ParamSet) -> usize {
+    ps.level
+}
+/// Limbs per row polynomial: the Q primes, then P.
+pub const fn limbs(ps: &ParamSet) -> usize {
+    ps.level + 1
+}
+/// Words per row, laid out `[c0 q_0.., c0 P, c1 q_0.., c1 P]`, N words each.
+pub const fn row_words(ps: &ParamSet) -> usize {
+    2 * limbs(ps) * ps.n
+}
+/// Words in one whole key.
+pub const fn key_words(ps: &ParamSet) -> usize {
+    rows(ps) * row_words(ps)
+}
+/// Prime of row limb `li`: a Q prime, or P for the last limb.
+pub fn limb_prime(ps: &ParamSet, li: usize) -> &PrimeParams {
+    ps.primes.get(li).unwrap_or(&ps.aux)
 }
 
-/// Generate row `row` of one evaluation key into caller-owned private memory.
-///
-/// The caller supplies fresh randomness and zeroizes output/scratch/errors on
-/// every exit. `error` must be shared across the three limbs of this row and
-/// independently sampled per row.
-pub fn generate_row(
+/// Stream row `row` of one key, limb by limb, to `emit(offset_in_row, words)`:
+/// each c1 chunk as it is drawn, then the limb's c0. `error` (shared by the
+/// row's limbs) and `prg` come from the caller's per-key seed; `s`, `c0` are
+/// N-word scratch and `tw` N/2 words, all erased by the caller.
+#[allow(clippy::too_many_arguments)]
+pub fn stream_row(
+    ps: &ParamSet,
     packed: &[u8],
     galois: u32,
     row: usize,
+    error: &[u8; 32],
     prg: &mut ChaCha20Prg,
-    error: &[i8],
-    output: &mut [u32],
-    scratch: &mut [u32],
+    s: &mut [u32],
+    c0: &mut [u32],
+    tw: &mut [u32],
+    mut emit: impl FnMut(usize, &[u32]) -> Result<()>,
 ) -> Result<()> {
-    if packed.len() != 64
-        || !valid(galois)
-        || row >= ROWS
-        || error.len() != 256
-        || output.len() != ROW_WORDS
-        || scratch.len() != SCRATCH_WORDS
-    {
-        return Err(Error::BadLength);
-    }
-    let (secret, rest) = scratch.split_at_mut(256);
-    let (tw, message) = rest.split_at_mut(256);
-    let (c0s, c1s) = output.split_at_mut(LIMBS.len() * 256);
-    for (li, p) in LIMBS.iter().enumerate() {
-        // The gadget message lives only in limb q_row; P*m vanishes mod P.
-        let gadget = li == row;
-        ntt::gen_twiddles_fwd(256, p, tw)?;
-        if galois == 0 {
-            rlwe::secret_ntt_limb(packed, p, tw, secret)?;
-            if gadget {
-                ntt::mul_pointwise(secret, secret, message, p)?;
-            }
-        } else {
-            if gadget {
-                rlwe::secret_ntt_limb(packed, p, tw, message)?;
-            }
-            // sigma_{g^-1}(s) has s[j*g mod 2N] at X^j, negated past N.
-            for (j, v) in secret.iter_mut().enumerate() {
-                let m = (j as u32 * galois) & 511;
-                let t = sample::unpack_ternary(packed, (m & 255) as usize);
-                *v = arith::from_i32(if m < 256 { t } else { -t }, p.q);
-            }
-            ntt::ntt(secret, tw, p)?;
-        }
-        let c0 = &mut c0s[li * 256..(li + 1) * 256];
-        let c1 = &mut c1s[li * 256..(li + 1) * 256];
-        c0.fill(0);
-        sample::sample_uniform(prg, p.q, c1);
-        rlwe::encrypt_limb_in_place(c0, error, c1, secret, p, tw)?;
-        if gadget {
-            // P < q_row, so P mod q_row is P itself.
-            let factor = arith::to_mont(PS_AUX.q, p);
-            for (c, &m) in c0.iter_mut().zip(message.iter()) {
-                *c = arith::add_mod(*c, arith::mont_mul(factor, m, p.q, p.q_inv_neg), p.q);
-            }
-        }
+    let (n, limbs) = (ps.n, limbs(ps));
+    for li in 0..limbs {
+        let p = limb_prime(ps, li);
+        stream::key_limb(
+            packed,
+            galois,
+            li == row,
+            ps.aux.q,
+            error,
+            prg,
+            p,
+            s,
+            c0,
+            tw,
+            |at, c1| emit((limbs + li) * n + at, c1),
+        )?;
+        emit(li * n, c0)?;
     }
     Ok(())
+}
+
+/// Whether `galois` names a supported key: 0 is relinearization, otherwise a
+/// non-identity odd Galois element modulo 2N.
+pub const fn valid(galois: u32, n: usize) -> bool {
+    galois == 0 || (galois > 1 && (galois as usize) < 2 * n && galois & 1 == 1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ntt::{self, stage_twiddle_words};
+    use crate::{params, rlwe, sample};
 
     #[test]
     fn galois_rule() {
-        assert!(valid(0) && valid(5) && valid(511));
+        assert!(valid(0, 256) && valid(5, 256) && valid(511, 256) && valid(32767, 16384));
         for g in [1, 2, 512] {
-            assert!(!valid(g), "g={g}");
+            assert!(!valid(g, 256), "g={g}");
         }
     }
 
+    /// One row as the runtime streams it, plus the row's error for checking.
+    fn row(
+        ps: &ParamSet,
+        packed: &[u8],
+        g: u32,
+        j: usize,
+        prg: &mut ChaCha20Prg,
+    ) -> (Vec<u32>, Vec<i8>) {
+        let n = ps.n;
+        let mut seed = [0u8; 32];
+        prg.fill(&mut seed);
+        let mut out = vec![0u32; row_words(ps)];
+        let (mut s, mut c0, mut tw) = (
+            vec![0u32; n],
+            vec![0u32; n],
+            vec![0u32; stage_twiddle_words(n)],
+        );
+        stream_row(
+            ps,
+            packed,
+            g,
+            j,
+            &seed,
+            prg,
+            &mut s,
+            &mut c0,
+            &mut tw,
+            |at, w| {
+                out[at..at + w.len()].copy_from_slice(w);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let mut e = vec![0i8; n];
+        sample::sample_cbd(&mut ChaCha20Prg::new(&seed), &mut e);
+        (out, e)
+    }
+
+    /// Every row limb decrypts, under the independently transformed secret, to
+    /// the gadget message plus the row's shared error.
     #[test]
     fn rows_decrypt_to_gadget_message_plus_error() {
+        for ps in [&params::PS, &params::PLEQ, &params::P16] {
+            check_rows(ps);
+        }
+    }
+
+    fn check_rows(ps: &ParamSet) {
+        let n = ps.n;
         let mut prg = ChaCha20Prg::new(&[0x47; 32]);
-        let mut packed = [0u8; 64];
-        rlwe::keygen(&mut prg, 256, &mut packed).unwrap();
-        let signed: [i64; 256] =
-            core::array::from_fn(|i| sample::unpack_ternary(&packed, i) as i64);
-        let fixture = std::env::var_os("FHE_EVALKEY_FIXTURE_DIR").map(std::path::PathBuf::from);
+        let mut packed = vec![0u8; n / 4];
+        rlwe::keygen(&mut prg, n, &mut packed).unwrap();
+        let signed: Vec<i64> = (0..n)
+            .map(|i| sample::unpack_ternary(&packed, i) as i64)
+            .collect();
+        let fixture = std::env::var_os("FHE_EVALKEY_FIXTURE_DIR")
+            .filter(|_| ps.name == "ps")
+            .map(std::path::PathBuf::from);
         if let Some(dir) = &fixture {
             std::fs::create_dir_all(dir).unwrap();
-            std::fs::write(
-                dir.join("secret.bin"),
-                signed
-                    .iter()
-                    .flat_map(|v| (*v as i32).to_le_bytes())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
+            let bytes: Vec<u8> = signed
+                .iter()
+                .flat_map(|v| (*v as i32).to_le_bytes())
+                .collect();
+            std::fs::write(dir.join("secret.bin"), bytes).unwrap();
         }
-        // Independent schoolbook negacyclic square, outside the NTT kernel.
-        let mut squared = [0i64; 256];
-        for i in 0..256 {
-            for j in 0..256 {
-                squared[(i + j) % 256] += signed[i] * signed[j] * if i + j < 256 { 1 } else { -1 };
+        // Independent schoolbook negacyclic square, outside the NTT kernel (P-S only).
+        let squared: Vec<i64> = if n == 256 {
+            let mut sq = vec![0i64; n];
+            for i in 0..n {
+                for j in 0..n {
+                    sq[(i + j) % n] += signed[i] * signed[j] * if i + j < n { 1 } else { -1 };
+                }
             }
+            sq
+        } else {
+            Vec::new()
+        };
+        // Relinearization (P-S), conjugation, and rotation steps 2^i (g = 5^(2^i)).
+        let two_n = 2 * n as u64;
+        let mut galois = if n == 256 {
+            vec![0u32, 511]
+        } else {
+            vec![(two_n - 1) as u32]
+        };
+        let mut g = 5u64;
+        for _ in 0..if n == 256 { 7 } else { 2 } {
+            galois.push(g as u32);
+            g = g * g % two_n;
         }
-        // Relinearization, conjugation, and every rotation step 2^i (g = 5^(2^i)).
-        let mut galois = vec![0u32, 511];
-        let mut g = 5u32;
-        for _ in 0..7 {
-            galois.push(g);
-            g = g * g % 512;
-        }
+        let mut tw = vec![0u32; stage_twiddle_words(n)];
         for g in galois {
-            for row in 0..ROWS {
-                let mut error = [0i8; 256];
-                sample::sample_cbd(&mut prg, &mut error);
-                let mut output = [0u32; ROW_WORDS];
-                let mut scratch = [0u32; SCRATCH_WORDS];
-                generate_row(&packed, g, row, &mut prg, &error, &mut output, &mut scratch).unwrap();
+            for j in 0..rows(ps) {
+                let (output, error) = row(ps, &packed, g, j, &mut prg);
                 if let Some(dir) = &fixture {
                     // Production format: one file per key, rows in order.
                     use std::io::Write;
                     std::fs::OpenOptions::new()
                         .create(true)
-                        .append(row > 0)
+                        .append(j > 0)
                         .write(true)
-                        .truncate(row == 0)
+                        .truncate(j == 0)
                         .open(dir.join(format!("key_{g}.bin")))
                         .unwrap()
                         .write_all(
@@ -159,36 +203,34 @@ mod tests {
                         )
                         .unwrap();
                 }
-                for (li, p) in LIMBS.iter().enumerate() {
-                    let mut transformed = [0u32; 256];
+                for li in 0..limbs(ps) {
+                    let p = limb_prime(ps, li);
                     // Independently apply sigma_g to s; it must decrypt every row.
-                    for i in 0..256 {
-                        let power = if g == 0 { i } else { (i * g as usize) % 512 };
-                        let value = signed[power % 256] * if power < 256 { 1 } else { -1 };
-                        transformed[i] = value.rem_euclid(p.q as i64) as u32;
-                    }
-                    let mut tw = [0u32; 256];
-                    ntt::gen_twiddles_fwd(256, p, &mut tw).unwrap();
-                    ntt::ntt(&mut transformed, &tw, p).unwrap();
-                    ntt::gen_twiddles_inv(256, p, &mut tw).unwrap();
-                    let mut result = [0u32; 256];
-                    rlwe::decrypt_limb(
-                        &output[li * 256..(li + 1) * 256],
-                        &output[(li + LIMBS.len()) * 256..(li + LIMBS.len() + 1) * 256],
-                        &transformed,
-                        p,
-                        &tw,
-                        &mut result,
-                    )
-                    .unwrap();
-                    for i in 0..256 {
+                    let mut transformed: Vec<u32> = (0..n)
+                        .map(|i| {
+                            let power = if g == 0 {
+                                i as u64
+                            } else {
+                                i as u64 * g as u64 % two_n
+                            } as usize;
+                            let value = signed[power % n] * if power < n { 1 } else { -1 };
+                            value.rem_euclid(p.q as i64) as u32
+                        })
+                        .collect();
+                    ntt::ntt_staged(&mut transformed, p, &mut tw).unwrap();
+                    let mut c1 = output[(li + limbs(ps)) * n..(li + limbs(ps) + 1) * n].to_vec();
+                    let mut c0 = output[li * n..(li + 1) * n].to_vec();
+                    stream::mul_assign(&mut c1, &transformed, p);
+                    stream::decrypt_finish(&mut c0, &c1, p, &mut tw).unwrap();
+                    for i in 0..n {
                         let message = if g == 0 { squared[i] } else { signed[i] };
-                        let gadget = if li == row { PS_AUX.q as i64 } else { 0 };
+                        let gadget = if li == j { ps.aux.q as i64 } else { 0 };
                         let expected =
                             (message * gadget + error[i] as i64).rem_euclid(p.q as i64) as u32;
                         assert_eq!(
-                            result[i], expected,
-                            "g={g} row={row} limb={li} coefficient={i}"
+                            c0[i], expected,
+                            "{} g={g} row={j} limb={li} coefficient={i}",
+                            ps.name
                         );
                     }
                 }

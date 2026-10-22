@@ -179,6 +179,22 @@ pub const APP_FHE_TEST_KEY_EVAL_KEYS: FwId = FwId {
     features: &["emu", "no-mldsa", "fhe-test-key", "fhe-eval-keys"],
     ..APP_FHE_DEBUG
 };
+/// N=16384, L=1: every command streams limb by limb in pointer mode.
+pub const APP_FHE_TEST_KEY_EVAL_KEYS_P16: FwId = FwId {
+    features: &[
+        "emu",
+        "no-mldsa",
+        "fhe-test-key",
+        "fhe-eval-keys",
+        "fhe-p16",
+    ],
+    ..APP_FHE_DEBUG
+};
+/// N=8192, L=4: per-limb streaming at the deepest generated set.
+pub const APP_FHE_TEST_KEY_PLEQ: FwId = FwId {
+    features: &["emu", "no-mldsa", "fhe-test-key", "fhe-pleq"],
+    ..APP_FHE_DEBUG
+};
 
 pub const APP_FHE: FwId = FwId {
     crate_name: "caliptra-runtime",
@@ -604,6 +620,8 @@ pub const REGISTERED_FW: &[&FwId] = &[
     &APP_FHE_ECDH_ML_CLEAR,
     &APP_FHE_TEST_KEY_ML_CLEAR,
     &APP_FHE_TEST_KEY_EVAL_KEYS,
+    &APP_FHE_TEST_KEY_EVAL_KEYS_P16,
+    &APP_FHE_TEST_KEY_PLEQ,
     #[cfg(feature = "fhe-aloha")]
     &APP_FHE_ALOHA,
     &APP_WITH_UART_FIPS_TEST_HOOKS,

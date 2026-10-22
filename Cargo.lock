@@ -588,6 +588,7 @@ dependencies = [
  "caliptra-emu-cpu",
  "caliptra-emu-periph",
  "caliptra-emu-types",
+ "caliptra-fhe-core",
  "caliptra-hw-model-types",
  "caliptra-image-fake-keys",
  "caliptra-image-types",

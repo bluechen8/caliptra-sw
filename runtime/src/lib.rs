@@ -32,11 +32,32 @@ compile_error!("fhe-ecdh and fhe-test-key are mutually exclusive");
     not(any(feature = "fhe-ecdh", feature = "fhe-test-key", feature = "fhe-aloha"))
 ))]
 compile_error!("fhe-session requires fhe-ecdh, fhe-test-key or fhe-aloha");
+#[cfg(all(feature = "fhe-session", feature = "fhe-debug"))]
+compile_error!("protected FHE must not be combined with raw debug commands");
 #[cfg(all(
-    feature = "fhe-session",
-    any(feature = "fhe-debug", feature = "fhe-pl", feature = "fhe-pleq")
+    feature = "fhe-aloha",
+    any(feature = "fhe-pl", feature = "fhe-pleq", feature = "fhe-p16")
 ))]
-compile_error!("protected FHE supports P-S only and must not be combined with raw debug commands");
+compile_error!("the Aloha profile supports P-S only");
+#[cfg(all(feature = "fhe-debug", feature = "fhe-p16"))]
+compile_error!("the raw debug kernels support P-S, P-L and P-L-eq only");
+#[cfg(any(
+    all(feature = "fhe-pl", feature = "fhe-pleq"),
+    all(feature = "fhe-pl", feature = "fhe-p16"),
+    all(feature = "fhe-pleq", feature = "fhe-p16")
+))]
+compile_error!("Select only one FHE parameter set");
+/// The one parameter set compiled into an FHE image: P-S unless a set is chosen.
+#[cfg(feature = "fhe")]
+pub(crate) const FHE_PARAMS: &caliptra_fhe_core::params::ParamSet = if cfg!(feature = "fhe-p16") {
+    &caliptra_fhe_core::params::P16
+} else if cfg!(feature = "fhe-pleq") {
+    &caliptra_fhe_core::params::PLEQ
+} else if cfg!(feature = "fhe-pl") {
+    &caliptra_fhe_core::params::PL
+} else {
+    &caliptra_fhe_core::params::PS
+};
 #[cfg(all(feature = "fhe-eval-keys", feature = "ml-clear"))]
 compile_error!("evaluation-key profile excludes ml-clear in the frozen runtime allocation");
 #[cfg(all(

@@ -8,6 +8,8 @@
 )))]
 use caliptra_api::{mailbox::CommandId, SocManager};
 use caliptra_builder::{firmware, FwId, ImageOptions};
+use caliptra_fhe_core::params::{self, ParamSet};
+use caliptra_fhe_core::{evalkey, ntt};
 use caliptra_hw_model::{BootParams, DefaultHwModel, Fuses, HwModel, InitParams};
 use caliptra_image_types::FwVerificationPqcKeyType;
 use zerocopy::IntoBytes;
@@ -159,14 +161,27 @@ fn unhex(s: &str) -> Vec<u8> {
 fn crypto(op: &str, key: &[u8], data: &[u8], aad: &[u8], iv: &[u8]) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fhe/protocol.py");
     let mut cmd = std::process::Command::new("python3");
-    cmd.arg(path).arg(op).arg(hex(key)).arg(hex(data));
+    cmd.arg(path).arg(op).arg(hex(key));
     if op != "mac" {
         cmd.arg(hex(aad)).arg(hex(iv));
     }
-    run_python(&mut cmd)
+    // The payload goes on stdin: P-16 blobs exceed the argument length limit.
+    run_python_with(&mut cmd, hex(data).as_bytes())
 }
 fn run_python(cmd: &mut std::process::Command) -> Vec<u8> {
-    let out = cmd.output().unwrap();
+    run_python_with(cmd, &[])
+}
+fn run_python_with(cmd: &mut std::process::Command, stdin: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    let out = child.wait_with_output().unwrap();
     assert!(
         out.status.success(),
         "{}",
@@ -177,8 +192,22 @@ fn run_python(cmd: &mut std::process::Command) -> Vec<u8> {
 /// P-S RNS primes and the auxiliary key-switching prime (fhe-core PS_AUX).
 const PS_Q: [u32; 2] = [1073738753, 1073732609];
 const PS_AUX: u32 = 0x3fffd601;
-/// One hybrid evaluation key: 2 rows x 2 polynomials x 3 limbs x 256 words.
-const KEY_BYTES: usize = 2 * 2 * 3 * 256 * 4;
+/// One hybrid evaluation key: a row per Q prime, 2 polynomials x (L + 1) limbs.
+const fn key_bytes(ps: &ParamSet) -> usize {
+    evalkey::key_words(ps) * 4
+}
+const KEY_BYTES: usize = key_bytes(&params::PS);
+/// Parameter set a firmware image was built for (feature `fhe-<name>`, else P-S).
+fn set_of(fwid: &FwId) -> &'static ParamSet {
+    fwid.features
+        .iter()
+        .find_map(|f| f.strip_prefix("fhe-").and_then(params::by_name))
+        .unwrap_or(&params::PS)
+}
+/// Mailbox words of one limb of polynomial work (two polynomials, N/2 twiddles).
+const fn poly_words(ps: &ParamSet) -> usize {
+    2 * ps.n + ntt::stage_twiddle_words(ps.n)
+}
 /// P-S decryption must stay within the CBD error support of the plaintext.
 fn ps_close(dec: &[u8], pt: &[u8]) -> bool {
     PS_Q.into_iter().enumerate().all(|(limb, q)| {
@@ -195,11 +224,25 @@ fn words(w: &[u32]) -> Vec<u8> {
 fn word(b: &[u8], i: usize) -> u32 {
     u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap())
 }
-/// Bytes of mailbox SRAM the FHE commands use and scrub (session.rs WORK).
-/// Beyond it lies only data the SoC itself wrote, e.g. at boot.
-const WORKSPACE: usize = 4 * (12 + 2 * 1024 + 512);
-fn mailbox_scrubbed(m: &mut DefaultHwModel, from: usize) -> bool {
-    m.mailbox_sram_snapshot(from, WORKSPACE - from)
+/// Bytes of mailbox SRAM one command uses and scrubs: command, input (mode 0,
+/// or a snapshot; pointer egress has none), mode-0 output, one limb of work.
+/// Beyond it lies only data the SoC itself wrote, e.g. the firmware at boot.
+fn footprint(op: u32, pointer: bool) -> usize {
+    footprint_for(&params::PS, op, pointer)
+}
+fn footprint_for(ps: &ParamSet, op: u32, pointer: bool) -> usize {
+    let (input, output) = lengths_for(ps, op);
+    let input = if pointer && op == 3 { 0 } else { input };
+    let output = if pointer { 0 } else { output };
+    let poly = if matches!(op, 2 | 3 | 6 | 7) {
+        4 * poly_words(ps)
+    } else {
+        0
+    };
+    48 + input + output + poly
+}
+fn scrubbed_to(m: &mut DefaultHwModel, from: usize, to: usize) -> bool {
+    m.mailbox_sram_snapshot(from, to - from)
         .iter()
         .all(|&v| v == 0)
 }
@@ -210,22 +253,33 @@ const JOB: u32 = 0x424f4a46;
 const IDS: [u32; 7] = [
     0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485254, 0x4648524c,
 ];
+/// Both P-S limbs of the golden plaintext; ingress sends limb 0 (`PT0`) and
+/// Caliptra lifts it into limb 1, which matches `PT` because |m| < q0/2.
 const PT: &[u8] = include_bytes!("../../fhe-core/tests/vectors/ps/pt.bin");
+const PT0: &[u8] = PT.split_at(1024).0;
 const SRC: u64 = 0x8000_0000;
-const DST: u64 = 0x8001_0000;
+/// External output buffer, past the largest P-16 input.
+const OUT: usize = 0x40000;
+const DST: u64 = SRC + OUT as u64;
 /// (input, output) wire lengths; sealed blobs add a 20-B header and 16-B tag.
-fn lengths(op: u32) -> (usize, usize) {
+fn lengths_for(ps: &ParamSet, op: u32) -> (usize, usize) {
     match op {
-        2 => (2084, 4096),
-        3 => (4096, 2084),
+        2 => (36 + ps.n * 4, ps.ct_bytes()),
+        3 => (ps.ct_bytes(), 36 + ps.pt_bytes()),
         4 => (232, 76),
-        6 | 7 => (0, KEY_BYTES),
+        6 | 7 => (0, key_bytes(ps)),
         _ => (0, 0),
     }
 }
-/// Plain 48-byte scheduler command.
+fn lengths(op: u32) -> (usize, usize) {
+    lengths_for(&params::PS, op)
+}
+/// Plain 48-byte P-S scheduler command.
 fn command(id: u32, op: u32, pointer: bool, arg: u32) -> Vec<u8> {
-    let (input, output) = lengths(op);
+    command_for(&params::PS, id, op, pointer, arg)
+}
+fn command_for(ps: &ParamSet, id: u32, op: u32, pointer: bool, arg: u32) -> Vec<u8> {
+    let (input, output) = lengths_for(ps, op);
     let src = if pointer && input > 0 { SRC } else { 0 };
     let dst = if pointer && output > 0 { DST } else { 0 };
     words(&[
@@ -257,6 +311,7 @@ struct Client {
     counter: u32,
     /// Next expected device result counter.
     results: u32,
+    ps: &'static ParamSet,
 }
 impl Client {
     fn new(open_request: Vec<u8>, id: u32, rx: Vec<u8>, tx: Vec<u8>) -> Self {
@@ -267,7 +322,12 @@ impl Client {
             tx,
             counter: 1,
             results: 1,
+            ps: &params::PS,
         }
+    }
+    fn with(mut self, ps: &'static ParamSet) -> Self {
+        self.ps = ps;
+        self
     }
     fn test_key(m: &mut DefaultHwModel) -> Self {
         use sha2::{Digest, Sha256};
@@ -301,11 +361,21 @@ impl Client {
     }
     /// Issue `op` with already-formed wire input; returns its output bytes.
     fn exec(&mut self, m: &mut DefaultHwModel, op: u32, data: &[u8], pointer: bool) -> Vec<u8> {
-        let (_, output) = lengths(op);
+        self.exec_arg(m, op, data, pointer, 0)
+    }
+    fn exec_arg(
+        &mut self,
+        m: &mut DefaultHwModel,
+        op: u32,
+        data: &[u8],
+        pointer: bool,
+        arg: u32,
+    ) -> Vec<u8> {
+        let (_, output) = lengths_for(self.ps, op);
         if pointer {
             m.soc_dram_mut().unwrap()[..data.len()].copy_from_slice(data);
         }
-        let h = command(self.id, op, pointer, 0);
+        let h = command_for(self.ps, self.id, op, pointer, arg);
         let response = send(
             m,
             CommandId::from(IDS[(op - 1) as usize]),
@@ -313,8 +383,13 @@ impl Client {
             if pointer { &[] } else { data },
         );
         assert_eq!(response.len(), 16 + if pointer { 0 } else { output });
+        println!(
+            "{} op {op} cycles {}",
+            self.ps.name,
+            u64::from_le_bytes(response[8..16].try_into().unwrap())
+        );
         if pointer {
-            m.soc_dram_mut().unwrap()[0x10000..0x10000 + output].to_vec()
+            m.soc_dram_mut().unwrap()[OUT..OUT + output].to_vec()
         } else {
             response[16..].to_vec()
         }
@@ -358,15 +433,15 @@ fn flow_and_lifecycle(fwid: &'static FwId<'static>, open: Open) {
     m.paint_runtime_stack_canary();
     let mut u = open(&mut m);
     reject_open(&mut m, &u.open_request); // a live session cannot be replaced
-    let blob = u.seal(2, PT);
+    let blob = u.seal(2, PT0);
     u.reject(&mut m, 2, &command(u.id, 2, false, 0), &blob); // before keygen
     u.call(&mut m, 1, &[], false);
     u.reject(&mut m, 1, &command(u.id, 1, false, 0), &[]); // one secret per session
     for pointer in [false, true] {
-        let ct = u.call(&mut m, 2, PT, pointer);
+        let ct = u.call(&mut m, 2, PT0, pointer);
         assert_eq!(ct.len(), 4096);
         assert!(ps_close(&u.call(&mut m, 3, &ct, pointer), PT));
-        assert_ne!(u.call(&mut m, 2, PT, pointer), ct, "fresh encryption");
+        assert_ne!(u.call(&mut m, 2, PT0, pointer), ct, "fresh encryption");
         let pixels: Vec<u8> = (0..196).map(|i| (i % 16) as u8).collect();
         check_logits(&pixels, &u.call(&mut m, 4, &pixels, pointer));
     }
@@ -406,17 +481,17 @@ fn validation(fwid: &'static FwId<'static>, open: Open) {
     let mut m = boot(fwid);
     let mut u = open(&mut m);
     u.call(&mut m, 1, &[], false);
-    let blob = u.seal(2, PT);
+    let blob = u.seal(2, PT0);
     let h = command(u.id, 2, false, 0);
     // Every blob header word, the body and the tag are authenticated.
-    for offset in [0, 4, 8, 12, 16, 20, 2083] {
+    for offset in [0, 4, 8, 12, 16, 20, 1059] {
         let mut bad = blob.clone();
         bad[offset] ^= 1;
         u.reject(&mut m, 2, &h, &bad);
-        assert!(mailbox_scrubbed(&mut m, 0));
+        assert!(scrubbed_to(&mut m, 0, footprint(2, false)));
     }
-    u.reject(&mut m, 2, &h, &u.seal_as(u.id + 1, 2, 99, PT)); // other session
-                                                              // A blob sealed for one op is refused by another (header op, then tag).
+    u.reject(&mut m, 2, &h, &u.seal_as(u.id + 1, 2, 99, PT0)); // other session
+                                                               // A blob sealed for one op is refused by another (header op, then tag).
     let pixels = [0u8; 196];
     u.reject(
         &mut m,
@@ -429,7 +504,7 @@ fn validation(fwid: &'static FwId<'static>, open: Open) {
         (4, 4),
         (12, u.id + 1),
         (16, 2),
-        (36, 2048),
+        (36, 1024),
         (40, 0),
         (44, 1),
     ] {
@@ -461,7 +536,7 @@ fn failed_write_and_poison(fwid: &'static FwId<'static>, open: Open) {
     let mut m = boot(fwid);
     let mut u = open(&mut m);
     u.call(&mut m, 1, &[], false);
-    let ct = u.call(&mut m, 2, PT, false);
+    let ct = u.call(&mut m, 2, PT0, false);
     assert!(ps_close(&u.call(&mut m, 3, &ct, false), PT));
     let end = m.soc_dram_mut().unwrap().len();
     let mut h = command(u.id, 3, true, 0);
@@ -474,8 +549,8 @@ fn failed_write_and_poison(fwid: &'static FwId<'static>, open: Open) {
         &m.soc_dram_mut().unwrap()[end - 16..],
         &words(&[5, u.id, 3, 2])[..]
     );
-    assert!(mailbox_scrubbed(&mut m, 0));
-    let blob = u.seal(2, PT);
+    assert!(scrubbed_to(&mut m, 0, footprint(3, true)));
+    let blob = u.seal(2, PT0);
     u.reject(&mut m, 2, &command(u.id, 2, false, 0), &blob);
     reject_open(&mut m, &u.open_request);
     u.call(&mut m, 5, &[], false);
@@ -490,12 +565,12 @@ fn read_poison(fwid: &'static FwId<'static>, open: Open) {
     let end = m.soc_dram_mut().unwrap().len();
     let mut h = command(u.id, 2, true, 0);
     h[20..24].copy_from_slice(&(0x80000000u32 + end as u32 - 4).to_le_bytes());
-    m.soc_dram_mut().unwrap()[0x10000..0x11000].fill(0x5a);
+    m.soc_dram_mut().unwrap()[OUT..OUT + 0x1000].fill(0x5a);
     u.reject(&mut m, 2, &h, &[]);
-    assert!(m.soc_dram_mut().unwrap()[0x10000..0x11000]
+    assert!(m.soc_dram_mut().unwrap()[OUT..OUT + 0x1000]
         .iter()
         .all(|&v| v == 0x5a));
-    assert!(mailbox_scrubbed(&mut m, 0));
+    assert!(scrubbed_to(&mut m, 0, footprint(2, true)));
     for _ in 0..2 {
         u.reject(&mut m, 1, &command(u.id, 1, false, 0), &[]);
         reject_open(&mut m, &u.open_request);
@@ -509,7 +584,7 @@ fn snapshot_and_cleanup(fwid: &'static FwId<'static>, open: Open) {
     let mut m = boot(fwid);
     let mut u = open(&mut m);
     u.call(&mut m, 1, &[], false);
-    let blob = u.seal(2, PT);
+    let blob = u.seal(2, PT0);
     m.soc_dram_mut().unwrap()[..blob.len()].copy_from_slice(&blob);
     m.start_mailbox_execute(IDS[1], &wire(IDS[1], &command(u.id, 2, true, 0), &[]))
         .unwrap();
@@ -532,14 +607,14 @@ fn snapshot_and_cleanup(fwid: &'static FwId<'static>, open: Open) {
         m.step();
     }
     assert_eq!(m.finish_mailbox_execute().unwrap().unwrap().len(), 16);
-    assert!(mailbox_scrubbed(&mut m, 16));
-    let ct = m.soc_dram_mut().unwrap()[0x10000..0x11000].to_vec();
+    assert!(scrubbed_to(&mut m, 16, footprint(2, true)));
+    let ct = m.soc_dram_mut().unwrap()[OUT..OUT + 0x1000].to_vec();
     assert!(ps_close(&u.call(&mut m, 3, &ct, false), PT));
     if fwid.features.contains(&"ml-clear") {
         // Authenticated but invalid pixels are refused and scrubbed.
         let bad = u.seal(4, &[16; 196]);
         u.reject(&mut m, 4, &command(u.id, 4, false, 0), &bad);
-        assert!(mailbox_scrubbed(&mut m, 0));
+        assert!(scrubbed_to(&mut m, 0, footprint(4, false)));
     }
     u.call(&mut m, 5, &[], false);
 }
@@ -624,6 +699,71 @@ fn ecdh_wrapper_fixture() {
     );
 }
 
+/// N=16384, L=1 and N=8192, L=4: polynomial commands stream one limb at a time
+/// in pointer mode, inside a fixed mailbox footprint; mailbox mode is refused
+/// because a ciphertext alone outgrows it.
+fn large_set(fwid: &'static FwId<'static>) {
+    let ps = set_of(fwid);
+    let (n, q0) = (ps.n, ps.primes[0].q);
+    let mut m = boot(fwid);
+    m.paint_runtime_stack_canary();
+    let mut u = Client::test_key(&mut m).with(ps);
+    u.call(&mut m, 1, &[], false);
+    // Limb-0 residues of a centered polynomial, |m| far below q0/2.
+    let plain: Vec<i64> = (0..n as i64)
+        .map(|i| (i * 7919) % 2_000_001 - 1_000_000)
+        .collect();
+    let body = words(
+        &plain
+            .iter()
+            .map(|v| v.rem_euclid(q0 as i64) as u32)
+            .collect::<Vec<_>>(),
+    );
+    let blob = u.seal(2, &body);
+    u.reject(&mut m, 2, &command_for(ps, u.id, 2, false, 0), &blob);
+    let ct = u.call(&mut m, 2, &body, true);
+    assert_eq!(ct.len(), ps.ct_bytes());
+    assert!(scrubbed_to(&mut m, 16, footprint_for(ps, 2, true)));
+    let dec = u.call(&mut m, 3, &ct, true);
+    assert_eq!(dec.len(), ps.pt_bytes());
+    for (li, p) in ps.primes.iter().enumerate() {
+        let q = i64::from(p.q);
+        for (i, v) in plain.iter().enumerate() {
+            let diff = (i64::from(word(&dec, li * n + i)) - v).rem_euclid(q);
+            assert!(diff <= 20 || diff >= q - 20, "limb {li} coefficient {i}");
+        }
+    }
+    assert!(scrubbed_to(&mut m, 16, footprint_for(ps, 2, true)));
+    if fwid.features.contains(&"fhe-eval-keys") {
+        let key = u.exec_arg(&mut m, 6, &[], true, 5);
+        assert_eq!(key.len(), key_bytes(ps));
+        let limbs = ps.level + 1;
+        for (i, chunk) in key.chunks(n * 4).enumerate() {
+            let q = evalkey::limb_prime(ps, i % limbs).q;
+            assert!((0..n).all(|j| word(chunk, j) < q), "unreduced key limb {i}");
+        }
+    }
+    u.call(&mut m, 5, &[], false);
+    println!("{} stack extent {}", ps.name, m.runtime_stack_canary_used());
+}
+#[test]
+fn testkey_p16_streaming() {
+    large_set(&firmware::APP_FHE_TEST_KEY_EVAL_KEYS_P16);
+}
+#[test]
+fn testkey_pleq_streaming() {
+    large_set(&firmware::APP_FHE_TEST_KEY_PLEQ);
+}
+/// Lattigo rotates and squares with keys Caliptra streamed at N=16384, L=1.
+#[test]
+fn testkey_p16_evalkey_host_demo() {
+    run_host_demo(
+        &firmware::APP_FHE_TEST_KEY_EVAL_KEYS_P16,
+        "evalkey_demo.py",
+        false,
+    );
+}
+
 /// `mnist_data` forwards FHE_MNIST_DATA as the client's cached --data-dir.
 fn run_host_demo(fwid: &'static FwId<'static>, script: &str, mnist_data: bool) {
     run_host_demo_fixture(fwid, script, mnist_data, false);
@@ -642,6 +782,7 @@ fn run_host_demo_fixture(
     };
     let (mut m, runtime_digest) = boot_with_measurement(fwid, wrapper_fixture);
     m.paint_runtime_stack_canary();
+    let ps = set_of(fwid);
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -687,6 +828,9 @@ fn run_host_demo_fixture(
             .arg(runtime_digest);
     } else if !mnist_data {
         cmd.arg("--session").arg("testkey");
+    }
+    if ps.name != "ps" {
+        cmd.arg("--params").arg(ps.name);
     }
     if std::env::var_os("FHE_FULL_DEMO").is_some() && script_name == "protected_demo.py" {
         cmd.arg("--full");
@@ -740,11 +884,11 @@ fn run_host_demo_fixture(
         let body = &data[16 + len..16 + len + ext];
         let (id, h, payload, outlen) = if id == JOB {
             let (op, mode, arg) = (word(&data, 4), word(&data, 5), word(&data, 6));
-            let outlen = if mode == 1 { lengths(op).1 } else { 0 };
+            let outlen = if mode == 1 { lengths_for(ps, op).1 } else { 0 };
             assert_eq!(len, 12, "malformed job {i}");
             assert_eq!(
                 (ext, word(&data, 3) as usize),
-                (lengths(op).0, outlen),
+                (lengths_for(ps, op).0, outlen),
                 "job {i} lengths"
             );
             if mailbox_only {
@@ -756,7 +900,7 @@ fn run_host_demo_fixture(
             let payload = if mode == 1 { &[][..] } else { body };
             (
                 IDS[(op - 1) as usize],
-                command(session, op, mode == 1, arg),
+                command_for(ps, session, op, mode == 1, arg),
                 payload,
                 outlen,
             )
@@ -769,10 +913,10 @@ fn run_host_demo_fixture(
             );
             (id, data[16..16 + len].to_vec(), &[][..], 0)
         };
-        // Keys must never touch mailbox SRAM past the command header.
+        // Keys use only the command header and one limb of polynomial work.
         let key = IDS[5..].contains(&id);
         if key {
-            m.limit_direct_mailbox_access(Some(48));
+            m.limit_direct_mailbox_access(Some(footprint_for(ps, 6, true) as u32));
         }
         let result = send(&mut m, CommandId::from(id), &h, payload);
         if key {
@@ -783,7 +927,7 @@ fn run_host_demo_fixture(
         }
         let mut packet = words(&[result.len() as u32, outlen as u32]);
         packet.extend(result);
-        packet.extend_from_slice(&m.soc_dram_mut().unwrap()[0x10000..0x10000 + outlen]);
+        packet.extend_from_slice(&m.soc_dram_mut().unwrap()[OUT..OUT + outlen]);
         fs::write(dir.join(format!("resp-{i}")), packet).unwrap();
     }
     panic!("demo exceeded request limit");

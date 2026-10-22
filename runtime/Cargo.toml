@@ -90,7 +90,7 @@ std = ["ufmt/std", "caliptra_common/std"]
 slow_tests = []
 verilator = ["caliptra-hw-model/verilator"]
 fips_self_test = []
-fhe = ["dep:caliptra-fhe-core"]
+fhe = ["dep:caliptra-fhe-core", "caliptra-drivers/gcm-any-key"]
 fhe-debug = ["fhe"]
 # One resident protected session; exactly one session profile below.
 fhe-session = ["fhe"]
@@ -98,14 +98,16 @@ fhe-session = ["fhe"]
 fhe-ecdh = ["fhe-session"]
 # Protocol v5 with fixed public test keys; debug-unlocked fake-ROM runs only.
 fhe-test-key = ["fhe-session"]
-# DCCM-only evaluation-key generation and FIFO DMA export; protocol v5 only.
+# Limb-by-limb evaluation-key generation and FIFO DMA export; protocol v5 only.
 fhe-eval-keys = ["fhe"]
 # N=256 hardware client with private AHB stream; distinct authenticated profile.
 fhe-aloha = ["fhe-session"]
 # Reference classifier for comparing clear and encrypted inference; off by default.
 ml-clear = ["caliptra-api/ml-clear"]
+# Parameter set (default P-S); fhe-p16 (N=16384) is protocol v5 only.
 fhe-pl = ["fhe"]
 fhe-pleq = ["fhe"]
+fhe-p16 = ["fhe"]
 no-cfi = [
     "caliptra-image-verify/no-cfi",
     "caliptra-drivers/no-cfi",

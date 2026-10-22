@@ -64,7 +64,11 @@ pub mod fips_self_test_cmd {
     use super::*;
     use crate::RtBootStatus::{RtFipSelfTestComplete, RtFipSelfTestStarted};
     use caliptra_cfi_lib_git::cfi_assert_eq_8_words;
-    use caliptra_common::{verifier::FirmwareImageVerificationEnv, FMC_SIZE, RUNTIME_SIZE};
+    #[cfg(feature = "fhe")]
+    use caliptra_common::FHE_RUNTIME_SIZE as RUNTIME_SIZE;
+    #[cfg(not(feature = "fhe"))]
+    use caliptra_common::RUNTIME_SIZE;
+    use caliptra_common::{verifier::FirmwareImageVerificationEnv, FMC_SIZE};
     use caliptra_drivers::{ResetReason, ShaAccLockState};
     use caliptra_image_types::{ImageTocEntry, RomInfo};
     use caliptra_image_verify::ImageVerifier;
