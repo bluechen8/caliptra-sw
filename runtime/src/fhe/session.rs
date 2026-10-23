@@ -6,7 +6,7 @@
 use crate::{fhe_transport::Transport, Drivers};
 use caliptra_drivers::memory_layout::{MBOX_ORG, MBOX_SIZE};
 use caliptra_drivers::{Aes, AesGcmContext, AesKey, CaliptraError, CaliptraResult, Dma, Trng};
-use caliptra_fhe_core::{evalkey, ntt, params, prg::ChaCha20Prg, rlwe, stream};
+use caliptra_fhe_core::{evalkey, ntt, params, prg::ChaCha20Prg, rlwe, slots, stream};
 use caliptra_registers::mbox::enums::MboxStatusE;
 use zerocopy::IntoBytes;
 use zeroize::{Zeroize, Zeroizing};
@@ -36,6 +36,7 @@ const REQUEST_LEN: usize = if OPEN_LEN > COMMAND_LEN {
 };
 /// Sealed blob: header (version, session, op, counter, length), body, tag.
 const BLOB_HEADER: usize = 20;
+const HEADER_WORDS: usize = BLOB_HEADER / 4;
 const TAG: usize = 16;
 const OPEN: u32 = 0x4648534f;
 /// Ops 1..8, numbered as the Aloha accelerator's commands (KEYGEN, ENCRYPT,
@@ -47,11 +48,26 @@ const IDS: [u32; 8] = [
 /// Workspace base in mailbox words: inputs start right after the command.
 const BASE: usize = COMMAND_LEN / 4;
 const MBOX_WORDS: usize = MBOX_SIZE as usize / 4;
-/// One limb: ingress plaintext and decrypt results are limb-0 residues (`|m| < q0/2`).
+/// One limb (N words); user data is N/2 complex binary64 slots, two limbs' worth.
 const LIMB_BYTES: usize = N * 4;
+const SLOT_BYTES: usize = 2 * LIMB_BYTES;
+const SLOT_WORDS: usize = SLOT_BYTES / 4;
 const KEY_BYTES: usize = evalkey::key_words(PARAMS) * 4;
 /// Per-limb polynomial work: A and B (N words each), then stage twiddles.
 const POLY_WORDS: usize = 2 * N + ntt::stage_twiddle_words(N);
+/// ENCRYPT's area: the blob header, the slots, then the encoder's scratch over
+/// the (verified) tag; once encoded, limb 0 (N words) and one limb of work
+/// overlap them.
+const ENC_WORDS: usize = HEADER_WORDS + max(SLOT_WORDS + slots::scratch_words(N), N + POLY_WORDS);
+/// DECRYPT's work: one limb of work, then the decoder's slots and scratch.
+const DEC_WORDS: usize = max(POLY_WORDS, SLOT_WORDS + slots::scratch_words(N));
+const fn max(a: usize, b: usize) -> usize {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
 /// DCCM staging for AES-GCM: mailbox SRAM has no byte write enables.
 const AES_WORDS: usize = 256;
 const fn blob(body: usize) -> usize {
@@ -61,8 +77,8 @@ const fn blob(body: usize) -> usize {
 /// `level` limbs, DECRYPT and REFRESH read limb 0 (the server rescales first).
 const fn lengths(op: u32, level: usize) -> (usize, usize) {
     match op {
-        2 => (blob(LIMB_BYTES), 2 * level * LIMB_BYTES),
-        3 => (2 * LIMB_BYTES, blob(LIMB_BYTES)),
+        2 => (blob(SLOT_BYTES), 2 * level * LIMB_BYTES),
+        3 => (2 * LIMB_BYTES, blob(SLOT_BYTES)),
         4 => (blob(196), blob(40)),
         6 => (2 * LIMB_BYTES, 2 * level * LIMB_BYTES),
         7 | 8 => (0, KEY_BYTES),
@@ -204,14 +220,18 @@ impl Request {
         let mode = word(b, 4);
         let src = (u64::from(word(b, 6)) << 32) | u64::from(word(b, 5));
         let dst = (u64::from(word(b, 8)) << 32) | u64::from(word(b, 7));
-        // arg, as Aloha's header word 11: [11:8] output level for ENCRYPT and
-        // REFRESH; keys take the Galois element (0 for relinearization).
+        // arg, as Aloha's header word 11: [7:0] log2 of the scale for ENCRYPT
+        // (required) and DECRYPT (optional: 0 returns Δ·z), [11:8] the output
+        // level of ENCRYPT and REFRESH; keys take the Galois element (0 for
+        // relinearization).
         let arg = word(b, 11);
         let level = (arg >> 8) as usize;
         let key = op >= 7;
+        let levels = (1..=PARAMS.level).contains(&level); // also refuses bits above [11:8]
         let arg_ok = match op {
-            // Any bit above [11:8] makes the level exceed L.
-            2 | 6 => arg & 0xff == 0 && (1..=PARAMS.level).contains(&level),
+            2 => (1..slots::max_log_delta(PARAMS)).contains(&(arg & 0xff)) && levels,
+            3 => arg >> 8 == 0,
+            6 => arg & 0xff == 0 && levels,
             7 | 8 => (op == 8) == (arg == 0) && evalkey::valid(arg, N),
             _ => arg == 0,
         };
@@ -247,10 +267,12 @@ impl Request {
         }
         // Pointer DECRYPT and REFRESH read their public limb once each, with no
         // snapshot; REFRESH keeps the decrypted limb in its input area. Every
-        // other input is snapshotted once. Polynomial ops add one limb of work.
+        // other input is snapshotted once. ENCRYPT's area holds its input and
+        // all its work; other polynomial ops add one limb of work after the output.
         let pointer = mode == 1;
         r.op = op;
         r.in_words = match (pointer, op) {
+            (_, 2) => ENC_WORDS,
             (true, 3) => 0,
             (true, 6) => N,
             _ => input / 4,
@@ -269,12 +291,16 @@ impl Request {
     fn level(&self) -> usize {
         (self.arg >> 8) as usize
     }
+    /// log2 of the slot scale of ENCRYPT and DECRYPT (arg [7:0]).
+    fn log_delta(&self) -> u32 {
+        self.arg & 0xff
+    }
     /// Mailbox words this command uses and scrubs.
     fn words(&self) -> usize {
-        let poly = if matches!(self.op, 2 | 3 | 6 | 7 | 8) {
-            POLY_WORDS
-        } else {
-            0
+        let poly = match self.op {
+            3 => DEC_WORDS,
+            6..=8 => POLY_WORDS,
+            _ => 0,
         };
         BASE + self.in_words + self.out_words + poly
     }
@@ -342,8 +368,8 @@ fn kernel(r: caliptra_fhe_core::Result<()>) -> CaliptraResult<()> {
 /// One limb of work: polynomials A and B (N words each), then stage twiddles.
 fn limb_work(poly: &mut [u32]) -> (&mut [u32], &mut [u32], &mut [u32]) {
     let (a, rest) = poly.split_at_mut(N);
-    let (b, tw) = rest.split_at_mut(N);
-    (a, b, tw)
+    let (b, rest) = rest.split_at_mut(N);
+    (a, b, &mut rest[..ntt::stage_twiddle_words(N)])
 }
 /// Authenticate a user blob for `op` and decrypt its body in place.
 /// The body is used only once the tag verifies; callers scrub on failure.
@@ -512,14 +538,15 @@ fn decrypt0(
     limb(0, a, out)?;
     kernel(stream::decrypt_finish(a, b, p, tw))
 }
-/// ENCRYPT: authenticate limb-0 residues, then encrypt to the chosen level.
+/// ENCRYPT: authenticate the slots, encode them at scale 2^log_delta into
+/// limb-0 residues, then encrypt to the chosen level. Slot range errors
+/// surface only after the tag verifies.
 #[inline(never)]
 fn ingress(
     d: &mut Drivers,
     r: &Request,
-    input: &mut [u32],
+    area: &mut [u32],
     output: &mut [u32],
-    poly: &mut [u32],
 ) -> CaliptraResult<()> {
     let Drivers {
         aes,
@@ -528,11 +555,15 @@ fn ingress(
         fhe_session: s,
         ..
     } = d;
-    open_blob(aes, trng, s.id, 2, input)?;
+    open_blob(aes, trng, s.id, 2, &mut area[..blob(SLOT_BYTES) / 4])?;
+    let (body, scratch) = area[HEADER_WORDS..].split_at_mut(SLOT_WORDS);
+    kernel(slots::encode(PARAMS, body, r.log_delta(), scratch))?;
+    let (m0, poly) = area[HEADER_WORDS..].split_at_mut(N);
     let mut out = Sink::new(output, r, dma, &mut s.transport);
-    encrypt_to(trng, &s.secret, &input[5..5 + N], r.level(), poly, &mut out)
+    encrypt_to(trng, &s.secret, m0, r.level(), poly, &mut out)
 }
-/// DECRYPT: decrypt limb 0 and seal its residues to the user.
+/// DECRYPT: decrypt limb 0, decode it at scale 2^log_delta and seal the slots
+/// to the user.
 #[inline(never)]
 fn egress(
     d: &mut Drivers,
@@ -550,8 +581,10 @@ fn egress(
     } = d;
     let mut out = Sink::new(output, r, dma, &mut s.transport);
     decrypt0(r, input, &s.secret, poly, &mut out)?;
-    let mut seal = Seal::begin(aes, trng, s.id, &mut s.counter, 3, LIMB_BYTES, &mut out)?;
-    seal.update(aes, &poly[..N], &mut out)?;
+    let (slot_words, scratch) = poly.split_at_mut(SLOT_WORDS);
+    kernel(slots::decode(PARAMS, slot_words, r.log_delta(), scratch))?;
+    let mut seal = Seal::begin(aes, trng, s.id, &mut s.counter, 3, SLOT_BYTES, &mut out)?;
+    seal.update(aes, slot_words, &mut out)?;
     seal.end(aes, &mut out)
 }
 /// REFRESH: decrypt limb 0 and re-encrypt it, at its scale, to the chosen
@@ -679,12 +712,13 @@ fn command(
     let (output, poly) = rest.split_at_mut(r.out_words);
     if r.pointer && matches!(op, 2 | 4) {
         // Snapshot sealed input once; every later read uses this copy.
+        let words = lengths(op, r.level()).0 / 4;
         s.transport
-            .with_fifo(&mut d.dma, |t| t.read(r.src, input))
+            .with_fifo(&mut d.dma, |t| t.read(r.src, &mut input[..words]))
             .map_err(|_| READ_FAILED)?;
     }
     match op {
-        2 => ingress(d, r, input, output, poly)?,
+        2 => ingress(d, r, input, output)?,
         3 => egress(d, r, input, output, poly)?,
         6 => refresh(d, r, input, output, poly)?,
         #[cfg(feature = "ml-clear")]

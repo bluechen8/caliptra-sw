@@ -40,6 +40,8 @@ pub struct ParamSet {
     pub primes: &'static [PrimeParams],
     /// Auxiliary key-switching prime P, below every Q prime (keys only).
     pub aux: PrimeParams,
+    /// cos and sin of 2*pi/2N in Q62: the slot FFT's twiddle seed.
+    pub zeta: [i64; 2],
 }
 
 impl ParamSet {
@@ -103,6 +105,7 @@ pub const PS: ParamSet = ParamSet {
     scale_bits: 20,
     primes: &PS_PRIMES,
     aux: PS_AUX,
+    zeta: [4611338766951757487, 56592481536850979],
 };
 
 /// P-L: N=8192, L=2, 30-bit primes, log q = 60.
@@ -147,6 +150,7 @@ pub const PL: ParamSet = ParamSet {
     scale_bits: 20,
     primes: &PL_PRIMES,
     aux: PL_AUX,
+    zeta: [4611685679310367043, 1768559394657194],
 };
 
 /// P-L-eq: N=8192, L=4, 27-bit primes, log q = 108.
@@ -209,6 +213,7 @@ pub const PLEQ: ParamSet = ParamSet {
     scale_bits: 18,
     primes: &PLEQ_PRIMES,
     aux: PLEQ_AUX,
+    zeta: [4611685679310367043, 1768559394657194],
 };
 
 /// P-16: N=16384, L=1, 30-bit primes, log q = 30.
@@ -242,6 +247,7 @@ pub const P16: ParamSet = ParamSet {
     scale_bits: 20,
     primes: &P16_PRIMES,
     aux: P16_AUX,
+    zeta: [4611685933648131909, 884279713584815],
 };
 
 /// P-LR: N=1024, L=7, 30-bit q0, 25-bit q1..q6, log q = 180.
@@ -331,6 +337,7 @@ pub const PLR: ParamSet = ParamSet {
     scale_bits: 25,
     primes: &PLR_PRIMES,
     aux: PLR_AUX,
+    zeta: [4611664314954810277, 14148453308909941],
 };
 
 /// Every parameter point, in plan §2.3 order.

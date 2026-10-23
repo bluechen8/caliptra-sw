@@ -84,7 +84,7 @@ fn ecdh_freshness_and_key_erasure() {
     let mut m = boot(&firmware::APP_FHE_ECDH_ML_CLEAR);
     let mut u = open(&mut m);
     u.call(&mut m, 1, &[], false);
-    let old = u.seal(2, PT0);
+    let old = u.seal(2, &z_body());
     u.call(&mut m, 5, &[], false);
     erased(&mut m);
     let mut v = open(&mut m);
@@ -145,8 +145,8 @@ fn ecdh_without_clear_reference() {
     u.call(&mut m, 1, &[], false);
     let pixels = u.seal(4, &[0; 196]);
     u.reject(&mut m, 4, &command(u.id, 4, false, 0), &pixels);
-    let ct = u.call(&mut m, 2, PT0, false);
-    assert!(ps_close(&u.decrypt(&mut m, &ct, false), PT));
+    let ct = u.call(&mut m, 2, &z_body(), false);
+    assert!(ps_close(&u.decrypt(&mut m, &ct, false)));
     u.call(&mut m, 5, &[], false);
     erased(&mut m);
 }
@@ -181,7 +181,8 @@ fn evaluation_keys() {
     }
     assert_ne!(keys[0], keys[1], "keys must use fresh randomness");
     // Per row: [c0 q0, c0 q1, c0 P, c1 q0, c1 q1, c1 P].
-    let limbs = [PS_Q[0], PS_Q[1], PS_AUX];
+    let ps = &params::PS;
+    let limbs = [ps.primes[0].q, ps.primes[1].q, ps.aux.q];
     for (i, q) in limbs.iter().cycle().take(12).enumerate() {
         assert!(
             (0..256).all(|j| word(&keys[0], i * 256 + j) < *q),

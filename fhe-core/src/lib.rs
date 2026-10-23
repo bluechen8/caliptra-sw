@@ -48,6 +48,8 @@ pub mod prg;
 pub mod rlwe;
 /// Ternary / centered-binomial / uniform samplers.
 pub mod sample;
+/// Fixed-point CKKS slot encoding and decoding (no FPU).
+pub mod slots;
 /// Limb-at-a-time kernels for the protected service.
 pub mod stream;
 
@@ -70,6 +72,8 @@ pub enum Error {
     StaleSeq,
     /// The caller's output sink (DMA or mailbox) failed.
     Sink,
+    /// A slot or coefficient is outside the range its encoding allows.
+    OutOfRange,
 }
 
 /// Result alias for the kernels.

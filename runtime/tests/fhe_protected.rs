@@ -9,7 +9,7 @@
 use caliptra_api::{mailbox::CommandId, SocManager};
 use caliptra_builder::{firmware, FwId, ImageOptions};
 use caliptra_fhe_core::params::{self, ParamSet};
-use caliptra_fhe_core::{evalkey, ntt};
+use caliptra_fhe_core::{evalkey, ntt, slots};
 use caliptra_hw_model::{BootParams, DefaultHwModel, Fuses, HwModel, InitParams};
 use caliptra_image_types::FwVerificationPqcKeyType;
 use zerocopy::IntoBytes;
@@ -189,9 +189,6 @@ fn run_python_with(cmd: &mut std::process::Command, stdin: &[u8]) -> Vec<u8> {
     );
     unhex(String::from_utf8(out.stdout).unwrap().trim())
 }
-/// P-S RNS primes and the auxiliary key-switching prime (fhe-core PS_AUX).
-const PS_Q: [u32; 2] = [1073738753, 1073732609];
-const PS_AUX: u32 = 0x3fffd601;
 /// One hybrid evaluation key: a row per Q prime, 2 polynomials x (L + 1) limbs.
 const fn key_bytes(ps: &ParamSet) -> usize {
     evalkey::key_words(ps) * 4
@@ -208,17 +205,41 @@ fn set_of(fwid: &FwId) -> &'static ParamSet {
 const fn poly_words(ps: &ParamSet) -> usize {
     2 * ps.n + ntt::stage_twiddle_words(ps.n)
 }
-/// A limb-0 decryption must stay within `bound` of the limb-0 plaintext: the
-/// CBD error support (20), or twice that after a refresh adds a fresh error.
-fn close_to(q: u32, dec: &[u8], pt: &[u8], bound: i64) -> bool {
-    let q = i64::from(q);
-    (0..pt.len() / 4).all(|i| {
-        let diff = (word(dec, i) as i64 - word(pt, i) as i64).rem_euclid(q);
-        diff <= bound || diff >= q - bound
-    })
+/// ENCRYPT and DECRYPT scale: slots travel as N/2 complex binary64 values.
+const LOG_DELTA: u32 = 20;
+/// Test slots, within the |z| < 2^(qbits - 1 - LOG_DELTA) range of every set.
+fn slots_for(ps: &ParamSet) -> Vec<(f64, f64)> {
+    (0..ps.n / 2)
+        .map(|j| {
+            (
+                ((j * 37) % 64) as f64 / 8.0 - 4.0,
+                ((j * 11) % 32) as f64 / 8.0 - 2.0,
+            )
+        })
+        .collect()
 }
-fn ps_close(dec: &[u8], pt: &[u8]) -> bool {
-    close_to(PS_Q[0], dec, &pt[..1024], 20)
+fn slot_bytes(z: &[(f64, f64)]) -> Vec<u8> {
+    z.iter()
+        .flat_map(|&(r, i)| [r.to_le_bytes(), i.to_le_bytes()])
+        .flatten()
+        .collect()
+}
+/// The P-S ENCRYPT body.
+fn z_body() -> Vec<u8> {
+    slot_bytes(&slots_for(&params::PS))
+}
+/// A DECRYPT result decodes to the test slots within `tol` (CKKS noise, plus a
+/// second error after a refresh).
+fn slots_close(ps: &ParamSet, dec: &[u8], tol: f64) -> bool {
+    let f = |k: usize| f64::from_le_bytes(dec[8 * k..8 * k + 8].try_into().unwrap());
+    dec.len() == 8 * ps.n
+        && slots_for(ps)
+            .iter()
+            .enumerate()
+            .all(|(j, &(r, i))| (f(2 * j) - r).abs() < tol && (f(2 * j + 1) - i).abs() < tol)
+}
+fn ps_close(dec: &[u8]) -> bool {
+    slots_close(&params::PS, dec, 1e-3)
 }
 /// Limb 0 of a ciphertext (c0 then c1), as the server leaves it after
 /// rescaling: what DECRYPT and REFRESH read.
@@ -240,16 +261,20 @@ fn footprint(op: u32, pointer: bool) -> usize {
 }
 fn footprint_for(ps: &ParamSet, op: u32, pointer: bool) -> usize {
     let (input, output) = lengths_for(ps, op, ps.level);
+    let (n, codec) = (ps.n, slots::scratch_words(ps.n));
+    // ENCRYPT's area: blob header, slots, then codec scratch over the tag; then
+    // limb 0 and one limb of work.
     let input = match (pointer, op) {
+        (_, 2) => 4 * (5 + (2 * n + codec).max(n + poly_words(ps))),
         (true, 3) => 0,
-        (true, 6) => ps.n * 4,
+        (true, 6) => n * 4,
         _ => input,
     };
     let output = if pointer { 0 } else { output };
-    let poly = if matches!(op, 2 | 3 | 6 | 7 | 8) {
-        4 * poly_words(ps)
-    } else {
-        0
+    let poly = match op {
+        3 => 4 * poly_words(ps).max(2 * n + codec),
+        6..=8 => 4 * poly_words(ps),
+        _ => 0,
     };
     48 + input + output + poly
 }
@@ -266,10 +291,6 @@ const JOB: u32 = 0x424f4a46;
 const IDS: [u32; 8] = [
     0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485246, 0x46485254, 0x4648524c,
 ];
-/// Both P-S limbs of the golden plaintext; ingress sends limb 0 (`PT0`) and
-/// Caliptra lifts it into limb 1, which matches `PT` because |m| < q0/2.
-const PT: &[u8] = include_bytes!("../../fhe-core/tests/vectors/ps/pt.bin");
-const PT0: &[u8] = PT.split_at(1024).0;
 const SRC: u64 = 0x8000_0000;
 /// External output buffer, past the largest P-16 input.
 const OUT: usize = 0x40000;
@@ -279,28 +300,32 @@ const DST: u64 = SRC + OUT as u64;
 fn lengths_for(ps: &ParamSet, op: u32, level: usize) -> (usize, usize) {
     let limb = ps.n * 4;
     match op {
-        2 => (36 + limb, 2 * level * limb),
-        3 => (2 * limb, 36 + limb),
+        2 => (36 + 2 * limb, 2 * level * limb),
+        3 => (2 * limb, 36 + 2 * limb),
         4 => (232, 76),
         6 => (2 * limb, 2 * level * limb),
         7 | 8 => (0, key_bytes(ps)),
         _ => (0, 0),
     }
 }
-/// ENCRYPT and REFRESH default to the full level (arg [11:8]).
+/// Default args: ENCRYPT and REFRESH at the full level (arg [11:8]), ENCRYPT
+/// and DECRYPT at scale 2^LOG_DELTA (arg [7:0]).
 fn arg_for(ps: &ParamSet, op: u32, arg: u32) -> u32 {
-    if matches!(op, 2 | 6) && arg == 0 {
-        (ps.level as u32) << 8
-    } else {
-        arg
+    let level = (ps.level as u32) << 8;
+    match op {
+        _ if arg != 0 => arg,
+        2 => level | LOG_DELTA,
+        3 => LOG_DELTA,
+        6 => level,
+        _ => 0,
     }
 }
 /// Plain 48-byte P-S scheduler command.
 fn command(id: u32, op: u32, pointer: bool, arg: u32) -> Vec<u8> {
-    command_for(&params::PS, id, op, pointer, arg)
+    command_for(&params::PS, id, op, pointer, arg_for(&params::PS, op, arg))
 }
+/// The command with `arg` as given (the relay forwards the host's verbatim).
 fn command_for(ps: &ParamSet, id: u32, op: u32, pointer: bool, arg: u32) -> Vec<u8> {
-    let arg = arg_for(ps, op, arg);
     let (input, output) = lengths_for(ps, op, (arg >> 8) as usize);
     let src = if pointer && input > 0 { SRC } else { 0 };
     let dst = if pointer && output > 0 { DST } else { 0 };
@@ -393,7 +418,8 @@ impl Client {
         pointer: bool,
         arg: u32,
     ) -> Vec<u8> {
-        let (_, output) = lengths_for(self.ps, op, (arg_for(self.ps, op, arg) >> 8) as usize);
+        let arg = arg_for(self.ps, op, arg);
+        let (_, output) = lengths_for(self.ps, op, (arg >> 8) as usize);
         if pointer {
             m.soc_dram_mut().unwrap()[..data.len()].copy_from_slice(data);
         }
@@ -460,26 +486,30 @@ fn flow_and_lifecycle(fwid: &'static FwId<'static>, open: Open) {
     m.paint_runtime_stack_canary();
     let mut u = open(&mut m);
     reject_open(&mut m, &u.open_request); // a live session cannot be replaced
-    let blob = u.seal(2, PT0);
+    let blob = u.seal(2, &z_body());
     u.reject(&mut m, 2, &command(u.id, 2, false, 0), &blob); // before keygen
     u.call(&mut m, 1, &[], false);
     u.reject(&mut m, 1, &command(u.id, 1, false, 0), &[]); // one secret per session
     for pointer in [false, true] {
-        let ct = u.call(&mut m, 2, PT0, pointer);
+        let ct = u.call(&mut m, 2, &z_body(), pointer);
         assert_eq!(ct.len(), 4096);
-        assert!(ps_close(&u.decrypt(&mut m, &ct, pointer), PT));
-        assert_ne!(u.call(&mut m, 2, PT0, pointer), ct, "fresh encryption");
+        assert!(ps_close(&u.decrypt(&mut m, &ct, pointer)));
+        assert_ne!(
+            u.call(&mut m, 2, &z_body(), pointer),
+            ct,
+            "fresh encryption"
+        );
         // REFRESH limb 0 to each level, and ENCRYPT at level 1.
         for level in [1, 2] {
             let fresh = u.exec_arg(&mut m, 6, &limb0(&params::PS, &ct), pointer, level << 8);
             assert_eq!(fresh.len(), 2048 * level as usize);
             let dec = u.decrypt(&mut m, &fresh, pointer);
-            assert!(close_to(PS_Q[0], &dec, &PT[..1024], 40));
+            assert!(ps_close(&dec));
         }
-        let blob = u.seal(2, PT0);
-        let low = u.exec_arg(&mut m, 2, &blob, pointer, 1 << 8);
+        let blob = u.seal(2, &z_body());
+        let low = u.exec_arg(&mut m, 2, &blob, pointer, 1 << 8 | LOG_DELTA);
         assert_eq!(low.len(), 2048);
-        assert!(ps_close(&u.decrypt(&mut m, &low, pointer), PT));
+        assert!(ps_close(&u.decrypt(&mut m, &low, pointer)));
         let pixels: Vec<u8> = (0..196).map(|i| (i % 16) as u8).collect();
         check_logits(&pixels, &u.call(&mut m, 4, &pixels, pointer));
     }
@@ -487,7 +517,7 @@ fn flow_and_lifecycle(fwid: &'static FwId<'static>, open: Open) {
     let first = u.exec(&mut m, 2, &blob, false);
     let second = u.exec(&mut m, 2, &blob, false);
     assert_ne!(first, second);
-    assert!(ps_close(&u.decrypt(&mut m, &second, false), PT));
+    assert!(ps_close(&u.decrypt(&mut m, &second, false)));
     // Close is a plain scheduler command; nothing survives it.
     u.call(&mut m, 5, &[], false);
     u.reject(&mut m, 1, &command(u.id, 1, false, 0), &[]);
@@ -496,7 +526,7 @@ fn flow_and_lifecycle(fwid: &'static FwId<'static>, open: Open) {
     v.reject(&mut m, 3, &command(v.id, 3, false, 0), &first);
     v.call(&mut m, 1, &[], false);
     assert!(
-        !ps_close(&v.decrypt(&mut m, &first, false), PT),
+        !ps_close(&v.decrypt(&mut m, &first, false)),
         "old secret survived"
     );
     v.reject(&mut m, 2, &command(v.id, 2, false, 0), &blob); // old session's blob
@@ -519,17 +549,17 @@ fn validation(fwid: &'static FwId<'static>, open: Open) {
     let mut m = boot(fwid);
     let mut u = open(&mut m);
     u.call(&mut m, 1, &[], false);
-    let blob = u.seal(2, PT0);
+    let blob = u.seal(2, &z_body());
     let h = command(u.id, 2, false, 0);
     // Every blob header word, the body and the tag are authenticated.
-    for offset in [0, 4, 8, 12, 16, 20, 1059] {
+    for offset in [0, 4, 8, 12, 16, 20, blob.len() / 2, blob.len() - 1] {
         let mut bad = blob.clone();
         bad[offset] ^= 1;
         u.reject(&mut m, 2, &h, &bad);
         assert!(scrubbed_to(&mut m, 0, footprint(2, false)));
     }
-    u.reject(&mut m, 2, &h, &u.seal_as(u.id + 1, 2, 99, PT0)); // other session
-                                                               // A blob sealed for one op is refused by another (header op, then tag).
+    u.reject(&mut m, 2, &h, &u.seal_as(u.id + 1, 2, 99, &z_body())); // other session
+                                                                     // A blob sealed for one op is refused by another (header op, then tag).
     let pixels = [0u8; 196];
     u.reject(
         &mut m,
@@ -561,7 +591,8 @@ fn validation(fwid: &'static FwId<'static>, open: Open) {
         u.reject(&mut m, 2, &bad, &[]);
     }
     u.reject(&mut m, 5, &command(u.id, 5, true, 0), &[]);
-    // ENCRYPT and REFRESH levels must be 1..=L with no other arg bits.
+    // Levels must be 1..=L; ENCRYPT needs a scale below q0/2, REFRESH none;
+    // DECRYPT takes no level.
     let ct = u.exec(&mut m, 2, &blob, false);
     for arg in [3 << 8, 0x201] {
         u.reject(
@@ -570,12 +601,36 @@ fn validation(fwid: &'static FwId<'static>, open: Open) {
             &command(u.id, 6, false, arg),
             &limb0(&params::PS, &ct),
         );
+    }
+    for arg in [3 << 8 | LOG_DELTA, 2 << 8, 0x1000 | LOG_DELTA, 2 << 8 | 29] {
         u.reject(&mut m, 2, &command(u.id, 2, false, arg), &blob);
     }
+    u.reject(
+        &mut m,
+        3,
+        &command(u.id, 3, false, 1 << 8 | LOG_DELTA),
+        &limb0(&params::PS, &ct),
+    );
     // The session and result counter are untouched by all of the above.
     let ct = u.exec(&mut m, 2, &blob, false);
-    assert!(ps_close(&u.decrypt(&mut m, &ct, false), PT));
+    assert!(ps_close(&u.decrypt(&mut m, &ct, false)));
     assert_eq!(u.results, 2);
+    // DECRYPT at scale 0 returns Δ·z, for a host with a non-power-of-two scale.
+    let h = command_for(&params::PS, u.id, 3, false, 0);
+    let response = send(
+        &mut m,
+        CommandId::from(IDS[2]),
+        &h,
+        &limb0(&params::PS, &ct),
+    );
+    let raw = u.open_result(3, &response[16..]);
+    let z: Vec<u8> = raw
+        .chunks(8)
+        .flat_map(|c| {
+            (f64::from_le_bytes(c.try_into().unwrap()) / f64::from(1 << LOG_DELTA)).to_le_bytes()
+        })
+        .collect();
+    assert!(ps_close(&z));
     u.call(&mut m, 5, &[], false);
 }
 
@@ -585,8 +640,8 @@ fn failed_write_and_poison(fwid: &'static FwId<'static>, open: Open) {
     let mut m = boot(fwid);
     let mut u = open(&mut m);
     u.call(&mut m, 1, &[], false);
-    let ct = u.call(&mut m, 2, PT0, false);
-    assert!(ps_close(&u.decrypt(&mut m, &ct, false), PT));
+    let ct = u.call(&mut m, 2, &z_body(), false);
+    assert!(ps_close(&u.decrypt(&mut m, &ct, false)));
     let end = m.soc_dram_mut().unwrap().len();
     let mut h = command(u.id, 3, true, 0);
     h[28..32].copy_from_slice(&(0x80000000u32 + end as u32 - 16).to_le_bytes());
@@ -599,7 +654,7 @@ fn failed_write_and_poison(fwid: &'static FwId<'static>, open: Open) {
         &words(&[5, u.id, 3, 2])[..]
     );
     assert!(scrubbed_to(&mut m, 0, footprint(3, true)));
-    let blob = u.seal(2, PT0);
+    let blob = u.seal(2, &z_body());
     u.reject(&mut m, 2, &command(u.id, 2, false, 0), &blob);
     reject_open(&mut m, &u.open_request);
     u.call(&mut m, 5, &[], false);
@@ -633,7 +688,7 @@ fn snapshot_and_cleanup(fwid: &'static FwId<'static>, open: Open) {
     let mut m = boot(fwid);
     let mut u = open(&mut m);
     u.call(&mut m, 1, &[], false);
-    let blob = u.seal(2, PT0);
+    let blob = u.seal(2, &z_body());
     m.soc_dram_mut().unwrap()[..blob.len()].copy_from_slice(&blob);
     m.start_mailbox_execute(IDS[1], &wire(IDS[1], &command(u.id, 2, true, 0), &[]))
         .unwrap();
@@ -658,7 +713,7 @@ fn snapshot_and_cleanup(fwid: &'static FwId<'static>, open: Open) {
     assert_eq!(m.finish_mailbox_execute().unwrap().unwrap().len(), 16);
     assert!(scrubbed_to(&mut m, 16, footprint(2, true)));
     let ct = m.soc_dram_mut().unwrap()[OUT..OUT + 0x1000].to_vec();
-    assert!(ps_close(&u.decrypt(&mut m, &ct, false), PT));
+    assert!(ps_close(&u.decrypt(&mut m, &ct, false)));
     if fwid.features.contains(&"ml-clear") {
         // Authenticated but invalid pixels are refused and scrubbed.
         let bad = u.seal(4, &[16; 196]);
@@ -753,47 +808,32 @@ fn ecdh_wrapper_fixture() {
 /// because a ciphertext alone outgrows it.
 fn large_set(fwid: &'static FwId<'static>) {
     let ps = set_of(fwid);
-    let (n, q0) = (ps.n, ps.primes[0].q);
+    let n = ps.n;
     let mut m = boot(fwid);
     m.paint_runtime_stack_canary();
     let mut u = Client::test_key(&mut m).with(ps);
     u.call(&mut m, 1, &[], false);
-    // Limb-0 residues of a centered polynomial, |m| far below q0/2.
-    let plain: Vec<i64> = (0..n as i64)
-        .map(|i| (i * 7919) % 2_000_001 - 1_000_000)
-        .collect();
-    let body = words(
-        &plain
-            .iter()
-            .map(|v| v.rem_euclid(q0 as i64) as u32)
-            .collect::<Vec<_>>(),
-    );
+    let body = slot_bytes(&slots_for(ps));
     let blob = u.seal(2, &body);
     // Mailbox mode works only while the whole command fits the 256-KiB mailbox.
     if footprint_for(ps, 2, false) > caliptra_common::memory_layout::MBOX_SIZE as usize {
-        u.reject(&mut m, 2, &command_for(ps, u.id, 2, false, 0), &blob);
+        u.reject(&mut m, 2, &command_for(ps, u.id, 2, false, arg_for(ps, 2, 0)), &blob);
     } else {
         assert_eq!(u.exec(&mut m, 2, &blob, false).len(), ps.ct_bytes());
     }
     let ct = u.call(&mut m, 2, &body, true);
     assert_eq!(ct.len(), ps.ct_bytes());
     assert!(scrubbed_to(&mut m, 16, footprint_for(ps, 2, true)));
-    let close = |dec: &[u8], bound: i64| {
-        let q = i64::from(q0);
-        assert_eq!(dec.len(), n * 4);
-        for (i, v) in plain.iter().enumerate() {
-            let diff = (i64::from(word(dec, i)) - v).rem_euclid(q);
-            assert!(diff <= bound || diff >= q - bound, "coefficient {i}");
-        }
-    };
-    close(&u.decrypt(&mut m, &ct, true), 20);
+    // Max slot noise grows with sqrt(N) at a 2^20 scale; a refresh adds more.
+    let close = |dec: &[u8]| assert!(slots_close(ps, dec, 1e-2), "{} slots", ps.name);
+    close(&u.decrypt(&mut m, &ct, true));
     assert!(scrubbed_to(&mut m, 16, footprint_for(ps, 2, true)));
     // REFRESH limb 0 back to every level; each output decrypts to m + e + e'.
     for level in 1..=ps.level {
         let arg = (level as u32) << 8;
         let fresh = u.exec_arg(&mut m, 6, &limb0(ps, &ct), true, arg);
         assert_eq!(fresh.len(), 2 * level * n * 4);
-        close(&u.decrypt(&mut m, &fresh, true), 40);
+        close(&u.decrypt(&mut m, &fresh, true));
     }
     assert!(scrubbed_to(&mut m, 16, footprint_for(ps, 2, true)));
     if fwid.features.contains(&"fhe-eval-keys") {

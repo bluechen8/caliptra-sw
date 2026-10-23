@@ -118,6 +118,16 @@ pub const fn from_i32(v: i32, q: u32) -> u32 {
     }
 }
 
+/// The centered value in (-q/2, q/2] of a residue in [0, q).
+#[inline(always)]
+pub const fn center(v: u32, q: u32) -> i32 {
+    if v > q / 2 {
+        v as i32 - q as i32
+    } else {
+        v as i32
+    }
+}
+
 /// Reverse the low `bits` bits of `i`.
 #[inline]
 pub const fn bit_reverse(i: usize, bits: u32) -> usize {

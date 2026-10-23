@@ -6,7 +6,7 @@
 //! ciphertext (or key row) without being stored: each limb re-draws it from
 //! the same 32-byte error seed. The uniform mask is drawn in chunks and handed
 //! to `emit(offset, chunk)` as soon as it is used, so `c1` never needs a buffer.
-use crate::arith::{add_mod, from_i32, mont_mul, neg_mod, sub_mod, to_mont};
+use crate::arith::{add_mod, center, from_i32, mont_mul, neg_mod, sub_mod, to_mont};
 use crate::ntt::{intt_staged, ntt_staged};
 use crate::params::PrimeParams;
 use crate::prg::ChaCha20Prg;
@@ -30,11 +30,7 @@ pub fn lift_limb(m0: &[u32], q0: u32, p: &PrimeParams, out: &mut [u32]) -> Resul
         if v >= q0 {
             return Err(Error::NotReduced);
         }
-        let signed = if v > q0 / 2 {
-            v as i32 - q0 as i32
-        } else {
-            v as i32
-        };
+        let signed = center(v, q0);
         *o = from_i32(if small { signed % p.q as i32 } else { signed }, p.q);
     }
     Ok(())
