@@ -191,6 +191,12 @@ fn enter_idle(drivers: &mut Drivers) {
         }
     }
 
+    // Don't halt while FHE is still running (an abandoned command draining).
+    #[cfg(feature = "fhe-aloha")]
+    if !fhe_aloha::idle() {
+        return;
+    }
+
     #[cfg(feature = "riscv")]
     caliptra_cpu::csr::mpmc_halt_and_enable_interrupts();
 }

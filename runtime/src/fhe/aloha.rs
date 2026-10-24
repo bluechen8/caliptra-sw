@@ -106,6 +106,13 @@ fn wr(off: usize, value: u32) {
 pub fn clear() {
     wr(REG_CTRL, CTRL_ZEROIZE);
 }
+/// Whether VeeR may halt. FHE runs on Caliptra's gated clock and does not hold
+/// it open, so the runtime halts only while the engine is absent or READY.
+/// Presence is read from NAME0, not the boot's table flag: a failed table
+/// install can leave an earlier image's command draining.
+pub fn idle() -> bool {
+    rd(REG_NAME0) != NAME0 || rd(REG_STATUS) & STATUS_READY != 0
+}
 /// The engine's geometry, if it is present and speaks map v2 on the DMA stream.
 pub fn geometry() -> CaliptraResult<Geometry> {
     let cap = rd(REG_CAP);
