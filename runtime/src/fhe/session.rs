@@ -394,22 +394,31 @@ fn open_blob(
     let mut input = Zeroizing::new([0u32; AES_WORDS]);
     let mut out = Zeroizing::new([0u32; AES_WORDS + 4]);
     // Output lags input by under one block, so it only overwrites consumed words.
+    // The last chunk goes through the final call: the RTL's GCM phase register
+    // refuses RESTORE -> TAG, so a final with no text after a restore hangs.
+    let last = (body - 1) / AES_WORDS * AES_WORDS;
     let mut at = 5;
-    for start in (0..body).step_by(AES_WORDS) {
-        let n = core::cmp::min(AES_WORDS, body - start);
-        input[..n].copy_from_slice(&blob[5 + start..5 + start + n]);
+    for start in (0..last).step_by(AES_WORDS) {
+        input.copy_from_slice(&blob[5 + start..5 + start + AES_WORDS]);
         let (written, next) = aes.aes_256_gcm_decrypt_update_with_key(
             key,
             &ctx,
-            input[..n].as_bytes(),
+            input.as_bytes(),
             out.as_mut_bytes(),
         )?;
         ctx = next;
         copy_words(&mut blob[at..at + written / 4], &out[..written / 4]);
         at += written / 4;
     }
-    let (written, _, ok) =
-        aes.aes_256_gcm_decrypt_final_with_key(key, &ctx, &[], out.as_mut_bytes(), tag.as_bytes())?;
+    let n = body - last;
+    input[..n].copy_from_slice(&blob[5 + last..5 + body]);
+    let (written, _, ok) = aes.aes_256_gcm_decrypt_final_with_key(
+        key,
+        &ctx,
+        input[..n].as_bytes(),
+        out.as_mut_bytes(),
+        tag.as_bytes(),
+    )?;
     copy_words(&mut blob[at..at + written / 4], &out[..written / 4]);
     if !ok {
         return Err(INVALID);
@@ -447,9 +456,12 @@ impl Seal {
         out.put(0, &header)?;
         Ok(Self { key, ctx, at: 5 })
     }
-    fn update(&mut self, aes: &mut Aes, plain: &[u32], out: &mut Sink) -> CaliptraResult<()> {
+    /// Seal `plain` (not empty) and write the tag after it. The last chunk goes
+    /// through the final call, as in `open_blob`: the RTL refuses RESTORE -> TAG.
+    fn finish(mut self, aes: &mut Aes, plain: &[u32], out: &mut Sink) -> CaliptraResult<()> {
         let mut sealed = Zeroizing::new([0u32; AES_WORDS + 4]);
-        for chunk in plain.chunks(AES_WORDS) {
+        let last = (plain.len() - 1) / AES_WORDS * AES_WORDS;
+        for chunk in plain[..last].chunks(AES_WORDS) {
             let (written, next) = aes.aes_256_gcm_encrypt_update_with_key(
                 self.key,
                 &self.ctx,
@@ -460,21 +472,16 @@ impl Seal {
             out.put(self.at, &sealed[..written / 4])?;
             self.at += written / 4;
         }
-        Ok(())
-    }
-    /// Write the final partial block and the tag in one transfer.
-    fn end(self, aes: &mut Aes, out: &mut Sink) -> CaliptraResult<()> {
-        let mut last = Zeroizing::new([0u32; 8]);
         let (written, tag) = aes.aes_256_gcm_encrypt_final_with_key(
             self.key,
             &self.ctx,
-            &[],
-            last[..4].as_mut_bytes(),
+            plain[last..].as_bytes(),
+            sealed[..AES_WORDS].as_mut_bytes(),
         )?;
         let words = written / 4;
         let tag: [u32; 4] = zerocopy::transmute!(tag);
-        last[words..words + 4].copy_from_slice(&tag);
-        out.put(self.at, &last[..words + 4])
+        sealed[words..words + 4].copy_from_slice(&tag);
+        out.put(self.at, &sealed[..words + 4])
     }
 }
 /// Encrypt limb-0 residues `m0` (|m| < q0/2) to `level` limbs and emit the
@@ -583,9 +590,8 @@ fn egress(
     decrypt0(r, input, &s.secret, poly, &mut out)?;
     let (slot_words, scratch) = poly.split_at_mut(SLOT_WORDS);
     kernel(slots::decode(PARAMS, slot_words, r.log_delta(), scratch))?;
-    let mut seal = Seal::begin(aes, trng, s.id, &mut s.counter, 3, SLOT_BYTES, &mut out)?;
-    seal.update(aes, slot_words, &mut out)?;
-    seal.end(aes, &mut out)
+    Seal::begin(aes, trng, s.id, &mut s.counter, 3, SLOT_BYTES, &mut out)?
+        .finish(aes, slot_words, &mut out)
 }
 /// REFRESH: decrypt limb 0 and re-encrypt it, at its scale, to the chosen
 /// level with fresh randomness; no plaintext leaves Caliptra.
@@ -639,9 +645,7 @@ fn clear_reference(
         *logit = v as u32;
     }
     let mut out = Sink::new(output, r, dma, &mut s.transport);
-    let mut seal = Seal::begin(aes, trng, s.id, &mut s.counter, 4, 40, &mut out)?;
-    seal.update(aes, &logits, &mut out)?;
-    seal.end(aes, &mut out)
+    Seal::begin(aes, trng, s.id, &mut s.counter, 4, 40, &mut out)?.finish(aes, &logits, &mut out)
 }
 /// Generate one public evaluation key, row by row and limb by limb, and DMA
 /// each limb to its place in the key as it is produced. Cycles include DMA.
