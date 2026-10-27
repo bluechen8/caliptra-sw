@@ -6,6 +6,8 @@
 //! REFRESH picks a level 1..=L_max. Message: N/2 interleaved complex f64 slots.
 //! Ciphertext: c0 then c1, `level` N-word residue limbs per component, each
 //! coefficient serialized as LE u64.
+//! Evaluation keys (docs/fhe/21): L = L_max - 1 rows, each c0 then c1 with
+//! L + 1 limbs (q_0..q_{L-1}, then P = q_{L_max-1}), one EVKGEN per row.
 use caliptra_common::keyids::KEY_ID_FHE_SEED;
 use caliptra_drivers::{
     hmac_kdf, Aes, AesKey, AesOperation, CaliptraError, CaliptraResult, Hmac, HmacMode, KeyId,
@@ -25,17 +27,20 @@ const REG_CAP: usize = 0x1c;
 const REG_KV_RD_SEED_CTRL: usize = 0x20;
 const REG_KV_RD_SEED_STATUS: usize = 0x24;
 const REG_SLOT0: usize = 0x30;
+const REG_EVK: usize = 0x54;
 /// CROM window (docs/fhe/19): word w, lane k at REG_CROM + 16*w + 4*k. The
 /// lane-3 store writes the word; stores are taken only while the engine is idle.
 const REG_CROM: usize = 0x4000;
 
 const NAME0: u32 = 0x534b4b43; // "CKKS"
-/// CAP fields: [15:0] N, [19:16] L_max, [24] DMA stream, [31:28] map version.
-/// Other capability bits (build options) are ignored.
+/// CAP fields: [15:0] N, [19:16] L_max, [21] EVKGEN, [24] DMA stream,
+/// [31:28] map version. Other capability bits (build options) are ignored.
 const CAP_CHECKED: u32 = 1 << 24 | 0xf << 28;
 const CAP_EXPECTED: u32 = 1 << 24 | 2 << 28;
+const CAP_EVKGEN: u32 = 1 << 21;
 const CMD_ENCRYPT: u32 = 1;
 const CMD_KEYGEN: u32 = 2;
+const CMD_EVKGEN: u32 = 3;
 const CMD_DECRYPT: u32 = 4;
 const CMD_REFRESH: u32 = 6;
 const CTRL_ZEROIZE: u32 = 1 << 3;
@@ -65,6 +70,8 @@ const CROM_CATALOG: u8 = 1;
 pub struct Geometry {
     pub logn: u32,
     pub l_max: u32,
+    /// The engine generates evaluation keys (CAP.EVKGEN; needs L_max >= 2).
+    pub eval_keys: bool,
 }
 impl Geometry {
     /// One limb of one component: N LE u64 coefficients.
@@ -86,6 +93,22 @@ impl Geometry {
     /// A level an ENCRYPT or REFRESH can produce.
     pub fn level_ok(self, level: u32) -> bool {
         (1..=self.l_max).contains(&level)
+    }
+    /// Evaluation keys are at level L_max - 1, with P = q_{L_max-1}.
+    fn key_level(self) -> u32 {
+        self.l_max - 1
+    }
+    /// One key row: c0 then c1, L + 1 limbs each.
+    fn key_row_bytes(self) -> u64 {
+        self.ciphertext_bytes(self.key_level() + 1) as u64
+    }
+    /// A Galois or relinearization key: L rows.
+    pub fn eval_key_bytes(self) -> usize {
+        self.key_level() as usize * self.key_row_bytes() as usize
+    }
+    /// A Galois element the engine takes: odd, 1 < g < 2N.
+    pub fn galois_ok(self, g: u32) -> bool {
+        g & 1 == 1 && g > 1 && g < 2 << self.logn
     }
     /// 12-bit RNS encode scale field for 2^LOG_SCALE at this N.
     fn rns_scale(self) -> u32 {
@@ -120,6 +143,7 @@ pub fn geometry() -> CaliptraResult<Geometry> {
     let g = Geometry {
         logn: n.trailing_zeros(),
         l_max: cap >> 16 & 0xf,
+        eval_keys: cap & CAP_EVKGEN != 0,
     };
     if rd(REG_NAME0) != NAME0
         || cap & CAP_CHECKED != CAP_EXPECTED
@@ -212,13 +236,18 @@ fn start(
     slots: &[(usize, u64)],
 ) -> CaliptraResult<()> {
     ready()?;
+    launch(g, cmd, limbs, scale, slots);
+    Ok(())
+}
+/// `start` without the READY wait, for a caller that wrote other
+/// READY-gated registers (EVK) after its own wait.
+fn launch(g: Geometry, cmd: u32, limbs: u32, scale: u32, slots: &[(usize, u64)]) {
     g.config(limbs, scale);
     for &(slot, base) in slots {
         wr(REG_SLOT0 + 8 * slot, base as u32);
         wr(REG_SLOT0 + 8 * slot + 4, (base >> 32) as u32);
     }
     wr(REG_CTRL, cmd);
-    Ok(())
 }
 /// Waits for a bit of `mask` in STATUS; aborts the command on timeout.
 fn wait(mask: u32) -> CaliptraResult<u32> {
@@ -359,4 +388,53 @@ pub fn refresh(g: Geometry, level: u32, src: u64, dst: u64) -> CaliptraResult<Do
         &[(0, src), (1, src + limb), (2, dst), (3, dst + level as u64 * limb)],
     )?;
     wait(STATUS_VALID).map(Done::new)
+}
+/// h = g^-1 mod 2N for odd g (0 stays 0, the relinearization key). Odd g is
+/// invertible mod 2^k and each Newton step doubles the correct bits.
+fn galois_inverse(galois: u32, logn: u32) -> u32 {
+    let mut h = galois;
+    // g*g = 1 mod 8, so g starts 3 bits right; 3 steps reach 24 >= log2(2N).
+    for _ in 0..3 {
+        h = h.wrapping_mul(2u32.wrapping_sub(galois.wrapping_mul(h)));
+    }
+    h & ((2 << logn) - 1)
+}
+/// Generate one evaluation key into `dst` (`Geometry::eval_key_bytes`), one
+/// EVKGEN per row: the relinearization key for `galois` = 0, else the Galois
+/// key for g = `galois` (checked by the caller). The engine applies h = g^-1
+/// mod 2N to the secret, as Lattigo's GenGaloisKey does. Rows are public; a
+/// failed row leaves a partial key, which the caller discards.
+pub fn eval_key(g: Geometry, galois: u32, dst: u64) -> CaliptraResult<Done> {
+    let l = g.key_level();
+    let h = galois_inverse(galois, g.logn);
+    let c1 = u64::from(l + 1) * g.limb_bytes();
+    let mut status = 0;
+    for row in 0..l {
+        let c0 = dst + u64::from(row) * g.key_row_bytes();
+        // EVK, like CONFIG and the slots, is written only while READY.
+        ready()?;
+        wr(REG_EVK, row << 16 | h);
+        launch(g, CMD_EVKGEN, l, 0, &[(2, c0), (3, c0 + c1)]);
+        status = wait(STATUS_VALID)?;
+        if status & STATUS_ERROR != 0 {
+            break;
+        }
+    }
+    Ok(Done::new(status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::galois_inverse;
+    #[test]
+    fn galois_inverse_mod_2n() {
+        for logn in [7, 8, 10, 13, 14] {
+            let m = 2u32 << logn;
+            for g in (1..m).step_by(2) {
+                let h = galois_inverse(g, logn);
+                assert!(h < m && g * h % m == 1, "logn {logn} g {g} h {h}");
+            }
+        }
+        assert_eq!(galois_inverse(0, 8), 0);
+    }
 }

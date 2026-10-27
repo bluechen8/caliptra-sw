@@ -9,7 +9,8 @@
 //! ENCRYPT message is GCM-sealed under the request key and checked by its tag
 //! before Aloha commits it; the DECRYPT output is GCM-sealed under the
 //! response key by the DMA. FHE ciphertexts bypass AES. Bulk data stays in
-//! DRAM: VeeR never reads it.
+//! DRAM: VeeR never reads it. Evaluation keys (ops 7 and 8, as fhe-sw-client)
+//! are public and bypass AES too; they need CAP.EVKGEN.
 use crate::fhe_aloha::Done;
 use crate::Drivers;
 use caliptra_drivers::{AesKey, CaliptraError, CaliptraResult};
@@ -32,11 +33,13 @@ const ENCRYPT: u32 = 2;
 const DECRYPT: u32 = 3;
 const CLOSE: u32 = 5;
 const REFRESH: u32 = 6;
+const GALOIS_KEY: u32 = 7;
+const RELIN_KEY: u32 = 8;
 /// Aloha profile: 0xa100 | log2(N) of the engine's build.
 const PARAM_ID_BASE: u32 = 0xa100;
 const OPEN: u32 = 0x4648534f;
-const IDS: [u32; 6] = [
-    0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485246,
+const IDS: [u32; 8] = [
+    0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485246, 0x46485254, 0x4648524c,
 ];
 fn word(b: &[u8], i: usize) -> u32 {
     u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap())
@@ -119,6 +122,8 @@ pub struct Request {
     dst: u64,
     /// ENCRYPT / REFRESH output level, chosen by the orchestrator (Rocket).
     level: u32,
+    /// GALOIS_KEY: the Galois element g (RELIN_KEY: 0).
+    galois: u32,
     /// The engine's geometry, read once per request (unset for OPEN).
     g: crate::fhe_aloha::Geometry,
 }
@@ -141,20 +146,31 @@ impl Request {
                 src: 0,
                 dst: 0,
                 level: 0,
+                galois: 0,
                 g: Default::default(),
             });
         }
         let op = word(b, 2);
-        if word(b, 1) != VERSION || !(1..=6).contains(&op) || IDS[(op - 1) as usize] != id {
+        if word(b, 1) != VERSION || !(1..=IDS.len() as u32).contains(&op) || IDS[(op - 1) as usize] != id {
             return Err(INVALID);
         }
         // Word 11: [7:0] log2 of the decode scale (DECRYPT, REFRESH),
-        // [11:8] output level (ENCRYPT, REFRESH), the rest zero.
+        // [11:8] output level (ENCRYPT, REFRESH), the rest zero; for keys, the
+        // Galois element g (GALOIS_KEY) or 0 (RELIN_KEY).
         let g = crate::fhe_aloha::geometry().map_err(|_| INVALID)?;
-        let log_scale = word(b, 11) & 0xff;
-        let level = word(b, 11) >> 8;
+        let key = matches!(op, GALOIS_KEY | RELIN_KEY);
+        let (log_scale, level, galois) = if key {
+            (0, 0, word(b, 11))
+        } else {
+            (word(b, 11) & 0xff, word(b, 11) >> 8, 0)
+        };
         let leveled = matches!(op, ENCRYPT | REFRESH);
-        if leveled != g.level_ok(level) || (!leveled && level != 0) {
+        if leveled != g.level_ok(level)
+            || (!leveled && level != 0)
+            || (key && !g.eval_keys)
+            || (op == RELIN_KEY && galois != 0)
+            || (op == GALOIS_KEY && !g.galois_ok(galois))
+        {
             return Err(INVALID);
         }
         let (input, output) = match op {
@@ -162,6 +178,7 @@ impl Request {
             ENCRYPT => (g.message_bytes(), g.ciphertext_bytes(level)),
             DECRYPT => (g.q0_bytes(), g.message_bytes()),
             REFRESH => (g.q0_bytes(), g.ciphertext_bytes(level)),
+            GALOIS_KEY | RELIN_KEY => (0, g.eval_key_bytes()),
             _ => return Err(INVALID),
         };
         let src = (u64::from(word(b, 6)) << 32) | u64::from(word(b, 5));
@@ -175,21 +192,21 @@ impl Request {
         {
             return Err(INVALID);
         }
-        if input == 0 {
-            if src != 0 || dst != 0 {
-                return Err(INVALID);
-            }
-        } else {
-            // Aloha's slots need 16-byte alignment.
-            for (addr, n) in [(src, input), (dst, output)] {
+        // Unused buffers are zero; Aloha's slots need 16-byte alignment.
+        for (addr, n) in [(src, input), (dst, output)] {
+            if n == 0 {
+                if addr != 0 {
+                    return Err(INVALID);
+                }
+            } else {
                 crate::fhe_transport::validate_range(addr, n as u64).map_err(|_| INVALID)?;
                 if addr & 15 != 0 {
                     return Err(INVALID);
                 }
             }
-            if src < dst + output as u64 && dst < src + input as u64 {
-                return Err(INVALID);
-            }
+        }
+        if input != 0 && src < dst + output as u64 && dst < src + input as u64 {
+            return Err(INVALID);
         }
         Ok(Self {
             bytes,
@@ -197,6 +214,7 @@ impl Request {
             src,
             dst,
             level,
+            galois,
             g,
         })
     }
@@ -214,10 +232,13 @@ fn open(d: &mut Drivers, r: &Request, header: &mut [u8; OPEN_RESPONSE_BYTES]) ->
     if !constant_time_eq::constant_time_eq(&tag, &r.bytes[60..76]) {
         return Err(INVALID);
     }
-    // KEYGEN, ENCRYPT, DECRYPT, REFRESH.
-    let supported = 0x4e;
+    // KEYGEN, ENCRYPT, DECRYPT, REFRESH, and the two evaluation keys when
+    // the engine generates them.
+    let g = crate::fhe_aloha::geometry()?;
+    let keys = if g.eval_keys { 1 << GALOIS_KEY | 1 << RELIN_KEY } else { 0 };
+    let supported = 1 << KEYGEN | 1 << ENCRYPT | 1 << DECRYPT | 1 << REFRESH | keys;
     if word(&r.bytes, 2) & !supported != 0
-        || word(&r.bytes, 4) != PARAM_ID_BASE | crate::fhe_aloha::geometry()?.logn
+        || word(&r.bytes, 4) != PARAM_ID_BASE | g.logn
         || word(&r.bytes, 5) != 2
         || word(&r.bytes, 6) != 0
     {
@@ -291,6 +312,7 @@ fn kernel(d: &mut Drivers, r: &Request, op: u32, seq: u32) -> CaliptraResult<Don
             r.src,
             r.dst,
         )?,
+        GALOIS_KEY | RELIN_KEY => crate::fhe_aloha::eval_key(r.g, r.galois, r.dst)?,
         _ => crate::fhe_aloha::refresh(r.g, r.level, r.src, r.dst)?,
     })
 }

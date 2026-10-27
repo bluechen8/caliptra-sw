@@ -138,8 +138,8 @@ fn words(w: &[u32]) -> Vec<u8> {
 fn word(b: &[u8], i: usize) -> u32 {
     u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap())
 }
-const IDS: [u32; 6] = [
-    0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485246,
+const IDS: [u32; 8] = [
+    0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485246, 0x46485254, 0x4648524c,
 ];
 /// Authenticated parameter-set ID of the Aloha N=256 profile.
 #[cfg(feature = "fhe-aloha")]
@@ -305,6 +305,8 @@ mod v5 {
             2 => (MSG, ct(level)),
             3 => (Q0, MSG),
             6 => (Q0, ct(level)),
+            // One key: L_MAX - 1 rows, each a ciphertext over L_MAX limbs.
+            7 | 8 => (0, (L_MAX as usize - 1) * ct(L_MAX)),
             _ => (0, 0),
         }
     }
@@ -319,7 +321,8 @@ mod v5 {
         pub fn header(&self, op: u32, tag: &[u8], log_scale: u32) -> Vec<u8> {
             let level = if matches!(op, 2 | 6) { L_MAX } else { 0 };
             let (input, output) = lengths(op, level);
-            let (src, dst) = if input == 0 { (0, 0) } else { (SRC, DST) };
+            let src = if input == 0 { 0 } else { SRC };
+            let dst = if output == 0 { 0 } else { DST };
             let mut h = words(&[
                 0,
                 5,
@@ -654,6 +657,69 @@ fn protected_aloha_levels() {
     v5::set_level(&mut h, 1);
     h[40..44].copy_from_slice(&(v5::ct(2) as u32).to_le_bytes());
     u.reject(&mut m, 6, &h, &[]);
+}
+
+/// Evaluation keys (ops 7 and 8, docs/fhe/21) on the RTL link's build (N = 256,
+/// L_max = 2): key level 1, so one row of c0 and c1 over q0 and P = q1. The RTL
+/// testbench checks that rows decrypt to G_j m + e; this checks the protocol,
+/// the key's size and residue ranges, and that the key leaves the secret usable.
+#[test]
+#[cfg(feature = "fhe-aloha")]
+#[ignore = "requires FHE_ALOHA_RTL and FHE_ALOHA_RTL_CWD"]
+fn protected_aloha_eval_keys() {
+    let key_len = v5::lengths(8, 0).1;
+    let mut m = boot(&firmware::APP_FHE_ALOHA);
+    let values: Vec<f64> = (0..256).map(|i| (i % 7) as f64 / 8.0).collect();
+    let pt: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    // A key policy needs ops 7 and 8 allowed.
+    let mut u = User::open(&mut m, [0x1ce, 8, ALOHA_PROFILE, 2, 0]);
+    u.keygen(&mut m);
+    // Word 11 carries g; word 10 is overridden only by the wrong-length case.
+    let header = |u: &User, op: u32, arg: u32, len: usize| {
+        let mut h = u.header(op, &[], 0);
+        h[40..44].copy_from_slice(&(len as u32).to_le_bytes());
+        h[44..48].copy_from_slice(&arg.to_le_bytes());
+        h
+    };
+    let mut keys = Vec::new();
+    for (op, g) in [(8, 0), (7, 5), (7, 511)] {
+        let h = header(&u, op, g, key_len);
+        assert_eq!(u.send5(&mut m, &h).status, 0, "op {op} g {g}");
+        let key = dram_read(&mut m, v5::DST, key_len);
+        for (i, limb) in key.chunks_exact(v5::LIMB).enumerate() {
+            let q = coefficient_recovery::Q[i % 2];
+            let w: Vec<u64> = limb.chunks_exact(8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).collect();
+            assert!(w.iter().all(|&v| v < q), "op {op} g {g}: limb {i} has a word >= q");
+            assert!(w.iter().any(|&v| v != w[0]), "op {op} g {g}: limb {i} is constant");
+        }
+        keys.push(key);
+    }
+    assert!(keys[0] != keys[1] && keys[1] != keys[2]);
+    // The secret is still resident and usable.
+    let (status, ct) = u.encrypt5(&mut m, &pt, 1);
+    assert_eq!(status, 0);
+    let (status, slots) = u.decrypt5(&mut m, &v5::q0(&ct), 25);
+    assert_eq!(status, 0);
+    let err = slots
+        .chunks_exact(8)
+        .zip(&values)
+        .map(|(b, v)| (f64::from_le_bytes(b.try_into().unwrap()) - v).abs())
+        .fold(0.0, f64::max);
+    assert!(err < 0.001);
+    // Malformed key requests: g missing, even, 1 or 2N; a relinearization key
+    // with an argument; a wrong length; a source buffer.
+    for (op, g) in [(7, 0), (7, 4), (7, 1), (7, 512), (8, 5)] {
+        u.reject(&mut m, op, &header(&u, op, g, key_len), &[]);
+    }
+    u.reject(&mut m, 8, &header(&u, 8, 0, key_len - 16), &[]);
+    let mut h = header(&u, 8, 0, key_len);
+    h[20..24].copy_from_slice(&(v5::SRC as u32).to_le_bytes());
+    u.reject(&mut m, 8, &h, &[]);
+    u.close(&mut m);
+    // A session whose policy omits the key ops cannot request them.
+    let mut u = User::open(&mut m, [0x4e, 8, ALOHA_PROFILE, 2, 0]);
+    u.keygen(&mut m);
+    u.reject(&mut m, 8, &header(&u, 8, 0, key_len), &[]);
 }
 
 /// An update reset restarts only VeeR, not the engine: the new runtime zeroizes
