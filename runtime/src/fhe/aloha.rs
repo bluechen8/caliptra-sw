@@ -149,7 +149,7 @@ pub fn geometry() -> CaliptraResult<Geometry> {
         || cap & CAP_CHECKED != CAP_EXPECTED
         || !n.is_power_of_two()
         || !(128..=16384).contains(&n)
-        || !(1..=8).contains(&g.l_max)
+        || g.l_max == 0
     {
         return Err(CaliptraError::RUNTIME_FHE_ABSENT);
     }
