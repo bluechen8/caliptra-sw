@@ -54,6 +54,7 @@ tock-registers.workspace = true
 
 [dev-dependencies]
 caliptra-builder.workspace = true
+caliptra-fhe-core = { path = "../fhe-core" }
 caliptra-registers.workspace = true
 caliptra-test-harness-types.workspace = true
 nix.workspace = true
@@ -70,5 +71,5 @@ name = "fhe_commands"
 path = "../runtime/tests/fhe_commands.rs"
 
 [[test]]
-name = "fhe_psk"
-path = "../runtime/tests/fhe_psk.rs"
+name = "fhe_protected"
+path = "../runtime/tests/fhe_protected.rs"

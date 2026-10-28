@@ -58,6 +58,10 @@ pub struct AxiRootBus {
     /// like to Caliptra, and what pointer-mode mailbox commands need to be
     /// testable on the emulator at all.
     pub dram: Option<Ram>,
+    /// While the Aloha RTL link is up, SoC DRAM is its testbench memory (the
+    /// one the engine's DMA reaches), so Caliptra's DMA reads and writes there.
+    #[cfg(feature = "fhe-aloha")]
+    pub fhe: crate::fhe_rtl::FheRtl,
     pub mcu_sram: ReadWriteMemory<MCU_SRAM_SIZE>,
     pub indirect_fifo_status: u32,
     pub use_mcu_recovery_interface: bool,
@@ -120,6 +124,13 @@ impl AxiRootBus {
     /// Last byte of the DRAM window.
     pub const DRAM_END: AxiAddr = Self::DRAM_OFFSET + DRAM_SIZE as u64 - 1;
 
+    /// The Aloha RTL link, if it is up and serves this DRAM address.
+    #[cfg(feature = "fhe-aloha")]
+    fn rtl_dram(&mut self, addr: AxiAddr) -> Option<&mut crate::fhe_rtl::FheRtl> {
+        let serves = self.fhe.active() && crate::fhe_rtl::RPC_DRAM.contains(&addr);
+        serves.then_some(&mut self.fhe)
+    }
+
     /// True when this address is served by the local DRAM model.
     fn in_dram(&self, addr: AxiAddr) -> bool {
         self.dram.is_some() && (Self::DRAM_OFFSET..=Self::DRAM_END).contains(&addr)
@@ -160,6 +171,8 @@ impl AxiRootBus {
             dma_result: None,
             test_sram,
             dram,
+            #[cfg(feature = "fhe-aloha")]
+            fhe: Default::default(),
             mcu_sram,
             indirect_fifo_status: 0,
             use_mcu_recovery_interface,
@@ -306,6 +319,10 @@ impl AxiRootBus {
             _ => {}
         };
 
+        #[cfg(feature = "fhe-aloha")]
+        if let Some(rtl) = self.rtl_dram(addr) {
+            return Bus::read(rtl, size, addr as RvAddr);
+        }
         if self.in_dram(addr) {
             let off = (addr - Self::DRAM_OFFSET) as RvAddr;
             return Bus::read(self.dram.as_mut().unwrap(), size, off);
@@ -367,6 +384,10 @@ impl AxiRootBus {
             }
             _ => {}
         };
+        #[cfg(feature = "fhe-aloha")]
+        if let Some(rtl) = self.rtl_dram(addr) {
+            return Bus::write(rtl, size, addr as RvAddr, val);
+        }
         if self.in_dram(addr) {
             let off = (addr - Self::DRAM_OFFSET) as RvAddr;
             return Bus::write(self.dram.as_mut().unwrap(), size, off, val);

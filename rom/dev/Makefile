@@ -33,36 +33,54 @@ MINIMAL_DEMO ?= 0
 MINIMAL_DEMO_FEATURE = $(if $(filter 1,$(MINIMAL_DEMO)),minimal-demo,)
 
 # Set to 1 to compile software-client support. Raw commands require FHE_DEBUG.
-# Existing runtime builds are unchanged when off. FHE_PSK explicitly selects
-# the protected P-S demo; FHE_DEBUG selects the separate raw test commands.
+# FHE=1 builds protocol v5 with device-attested ECDH; FHE_TEST_KEY=1 uses fixed
+# public test keys (debug-unlocked fake-ROM runs only). Off builds are unchanged.
+# FHE_ALOHA=1 runs the same protocol on the Aloha accelerator instead of the
+# software kernels (with FHE=1 or FHE_TEST_KEY=1); FHE_DEBUG the raw commands.
 FHE ?= 0
 FHE_DEBUG ?= 0
-FHE_PSK ?= 0
+FHE_TEST_KEY ?= 0
 FHE_ALOHA ?= 0
+FHE_EVAL_KEYS ?= 0
+ifeq ($(FHE_PSK),1)
+$(error FHE_PSK is retired; use FHE=1 or FHE_TEST_KEY=1, with FHE_ALOHA=1 for Aloha)
+endif
+# Optional clear-reference model/command for FHE comparisons.
+ML_CLEAR ?= 0
+FHE_PARAMS ?= ps
+ifneq ($(word 2,$(filter 1,$(FHE) $(FHE_TEST_KEY) $(FHE_DEBUG))),)
+$(error choose one of FHE=1, FHE_TEST_KEY=1 or FHE_DEBUG=1)
+endif
+FHE_FEATURE = $(if $(filter 1,$(FHE_DEBUG)),fhe-debug,$(if $(filter 1,$(FHE)),fhe-ecdh,$(if $(filter 1,$(FHE_TEST_KEY)),fhe-test-key,)))
+# Evaluated before backend/params/ml-clear suffixes are comma-joined onto FHE_FEATURE.
+FHE_PROTECTED := $(filter fhe-test-key fhe-ecdh,$(FHE_FEATURE))
 ifeq ($(FHE_ALOHA),1)
-override FHE_PSK := 1
+ifeq ($(FHE_PROTECTED),)
+$(error FHE_ALOHA=1 needs FHE=1 or FHE_TEST_KEY=1)
+endif
+# The engine's N and L come from its CAP register; evaluation keys from CAP.EVKGEN.
+ifneq ($(FHE_PARAMS),ps)
+$(error FHE_ALOHA takes its geometry from the engine; leave FHE_PARAMS unset)
+endif
+ifeq ($(FHE_EVAL_KEYS),1)
+$(error FHE_ALOHA serves evaluation keys when CAP.EVKGEN is set; leave FHE_EVAL_KEYS unset)
+endif
 # The runtime embeds the CROM table it installs at boot (gen_aloha_tables.py).
 ifeq ($(wildcard $(FHE_CROM)),)
 $(error FHE_ALOHA=1 needs FHE_CROM=<crom.bin from gen_aloha_tables.py>)
 endif
 export FHE_CROM := $(abspath $(FHE_CROM))
+FHE_FEATURE := $(FHE_FEATURE),fhe-aloha
 endif
-# Optional clear-reference model/command for FHE comparisons.
-ML_CLEAR ?= 0
-FHE_PARAMS ?= ps
-FHE_FEATURE = $(if $(filter 1,$(FHE_DEBUG)),fhe-debug,$(if $(filter 1,$(FHE)),fhe,))
-ifeq ($(FHE_PSK),1)
+# Protocol v5 streams any set limb by limb; the raw debug kernels stop at N=8192.
 ifeq ($(FHE_DEBUG),1)
-$(error FHE_PSK and FHE_DEBUG are mutually exclusive)
-endif
-ifneq ($(FHE_PARAMS),ps)
-$(error FHE_PSK currently supports FHE_PARAMS=ps only)
-endif
-FHE_FEATURE := $(if $(filter 1,$(FHE_ALOHA)),fhe-aloha,fhe-psk)
-endif
-ifneq ($(filter 1,$(FHE) $(FHE_DEBUG) $(FHE_PSK)),)
 ifeq ($(filter $(FHE_PARAMS),ps pl pleq),)
-$(error FHE_PARAMS must be ps, pl or pleq)
+$(error FHE_DEBUG requires FHE_PARAMS=ps, pl or pleq)
+endif
+endif
+ifneq ($(filter 1,$(FHE) $(FHE_DEBUG) $(FHE_TEST_KEY) $(FHE_ALOHA)),)
+ifeq ($(filter $(FHE_PARAMS),ps pl pleq p16 plr),)
+$(error FHE_PARAMS must be ps, pl, pleq, p16 or plr)
 endif
 ifneq ($(FHE_PARAMS),ps)
 FHE_FEATURE := $(FHE_FEATURE),fhe-$(FHE_PARAMS)
@@ -70,10 +88,20 @@ endif
 endif
 
 ifeq ($(ML_CLEAR),1)
-ifneq ($(FHE_PSK),1)
-$(error ML_CLEAR requires FHE_PSK=1)
+ifeq ($(FHE_PROTECTED),)
+$(error ML_CLEAR requires a protected FHE build)
 endif
 FHE_FEATURE := $(FHE_FEATURE),ml-clear
+endif
+
+ifeq ($(FHE_EVAL_KEYS),1)
+ifeq ($(filter fhe-ecdh fhe-test-key,$(FHE_PROTECTED)),)
+$(error FHE_EVAL_KEYS requires protocol v5 (FHE=1 or FHE_TEST_KEY=1))
+endif
+ifeq ($(ML_CLEAR),1)
+$(error FHE_EVAL_KEYS excludes ML_CLEAR in the frozen runtime allocation)
+endif
+FHE_FEATURE := $(FHE_FEATURE),fhe-eval-keys
 endif
 
 comma := ,

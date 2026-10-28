@@ -14,7 +14,13 @@ use caliptra_drivers::{
     KeyReadArgs, KeyUsage, KeyVault, KeyWriteArgs, Trng,
 };
 const BASE: usize = 0x1005_0000;
-const LOG_SCALE: i32 = 25;
+/// KEYGEN's RNS encode scale (its value does not reach the key).
+const KEYGEN_LOG_SCALE: u32 = 25;
+/// log2 of the slot scale ENCRYPT accepts is below this: qbits(q0) - 1, q0 of
+/// 46 bits (fhe_profiles.py), as fhe-core's slots::max_log_delta. The CROM
+/// manifest pins the prime catalog (CROM_CATALOG), so a new catalog bumps
+/// that byte and this bound together.
+pub const MAX_LOG_DELTA: u32 = 45;
 const POLL: usize = 20_000_000;
 const FAILED: CaliptraError = CaliptraError::RUNTIME_FHE_DECRYPT_FAILED;
 
@@ -66,7 +72,7 @@ const CROM_LAYOUT: u8 = 2;
 const CROM_CATALOG: u8 = 1;
 
 /// The engine's build: ring dimension N = 2^logn and largest level L_max.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct Geometry {
     pub logn: u32,
     pub l_max: u32,
@@ -75,7 +81,7 @@ pub struct Geometry {
 }
 impl Geometry {
     /// One limb of one component: N LE u64 coefficients.
-    fn limb_bytes(self) -> u64 {
+    pub fn limb_bytes(self) -> u64 {
         8 << self.logn
     }
     /// The slot vector: N/2 complex f64, the same size as a limb.
@@ -83,20 +89,21 @@ impl Geometry {
         self.limb_bytes() as usize
     }
     /// c0 and c1, `level` limbs each.
-    pub fn ciphertext_bytes(self, level: u32) -> usize {
+    fn ciphertext_bytes(self, level: u32) -> usize {
         2 * level as usize * self.limb_bytes() as usize
-    }
-    /// c0 and c1 limb 0.
-    pub fn q0_bytes(self) -> usize {
-        self.ciphertext_bytes(1)
-    }
-    /// A level an ENCRYPT or REFRESH can produce.
-    pub fn level_ok(self, level: u32) -> bool {
-        (1..=self.l_max).contains(&level)
     }
     /// Evaluation keys are at level L_max - 1, with P = q_{L_max-1}.
     fn key_level(self) -> u32 {
         self.l_max - 1
+    }
+    /// The largest ciphertext level: the Q primes, without P when the engine
+    /// serves evaluation keys (as the parameter sets count levels).
+    pub fn levels(self) -> u32 {
+        if self.eval_keys {
+            self.key_level()
+        } else {
+            self.l_max
+        }
     }
     /// One key row: c0 then c1, L + 1 limbs each.
     fn key_row_bytes(self) -> u64 {
@@ -106,17 +113,16 @@ impl Geometry {
     pub fn eval_key_bytes(self) -> usize {
         self.key_level() as usize * self.key_row_bytes() as usize
     }
-    /// A Galois element the engine takes: odd, 1 < g < 2N.
-    pub fn galois_ok(self, g: u32) -> bool {
-        g & 1 == 1 && g > 1 && g < 2 << self.logn
-    }
-    /// 12-bit RNS encode scale field for 2^LOG_SCALE at this N.
-    fn rns_scale(self) -> u32 {
-        ((LOG_SCALE - 52 - 1023 - self.logn as i32) & 0xfff) as u32
+    /// 12-bit RNS encode scale field for 2^log_delta at this N.
+    fn rns_scale(self, log_delta: u32) -> u32 {
+        ((log_delta as i32 - 52 - 1023 - self.logn as i32) & 0xfff) as u32
     }
     /// CONFIG = {SCALE[27:16], LOGN[7:4], L[3:0]}.
     fn config(self, limbs: u32, scale: u32) {
-        wr(REG_CONFIG, (scale & 0xfff) << 16 | self.logn << 4 | (limbs & 0xf));
+        wr(
+            REG_CONFIG,
+            (scale & 0xfff) << 16 | self.logn << 4 | (limbs & 0xf),
+        );
     }
 }
 
@@ -128,6 +134,10 @@ fn wr(off: usize, value: u32) {
 }
 pub fn clear() {
     wr(REG_CTRL, CTRL_ZEROIZE);
+}
+/// KEY_VALID: the engine holds a resident key.
+pub fn key_valid() -> bool {
+    rd(REG_STATUS) & STATUS_KEY_VALID != 0
 }
 /// Whether VeeR may halt. FHE runs on Caliptra's gated clock and does not hold
 /// it open, so the runtime halts only while the engine is absent or READY.
@@ -159,7 +169,7 @@ pub fn geometry() -> CaliptraResult<Geometry> {
 /// earlier image left, since an update reset does not reset the engine. Then
 /// this image's table is copied into the CROM. Fails, leaving FHE unusable,
 /// if the engine is absent or the table was built for another geometry.
-pub fn install_tables() -> CaliptraResult<()> {
+pub fn install_tables() -> CaliptraResult<Geometry> {
     let g = geometry()?;
     // gen_aloha_tables.py checked the word count against (log2 N, L_max).
     let (manifest, table) = CROM_IMAGE.split_at(CROM_IMAGE.len().min(16));
@@ -178,7 +188,7 @@ pub fn install_tables() -> CaliptraResult<()> {
     for i in 0..table.len() / 4 {
         wr(REG_CROM + 4 * i, le32(table, 4 * i));
     }
-    Ok(())
+    Ok(g)
 }
 /// The LE u32 at byte offset `i`.
 fn le32(b: &[u8], i: usize) -> u32 {
@@ -209,14 +219,6 @@ pub struct Done {
     pub tag: [u8; 16],
 }
 impl Done {
-    /// A command that ran no engine operation.
-    pub fn ok(key_valid: bool) -> Self {
-        Self {
-            cause: 0,
-            key_valid,
-            tag: [0; 16],
-        }
-    }
     fn new(status: u32) -> Self {
         Self {
             cause: status >> STATUS_CAUSE_SHIFT & 0xf,
@@ -282,16 +284,24 @@ pub fn keygen(
             SEED_LABEL,
             Some(&nonce),
             trng,
-            KeyWriteArgs::new(KEY_ID_FHE_SEED, KeyUsage::default().set_mldsa_key_gen_seed_en()).into(),
+            KeyWriteArgs::new(
+                KEY_ID_FHE_SEED,
+                KeyUsage::default().set_mldsa_key_gen_seed_en(),
+            )
+            .into(),
             HmacMode::Hmac384,
         )?;
-        wr(REG_KV_RD_SEED_CTRL, (KEY_ID_FHE_SEED as u32) << 1 | KV_READ_EN);
+        wr(
+            REG_KV_RD_SEED_CTRL,
+            (KEY_ID_FHE_SEED as u32) << 1 | KV_READ_EN,
+        );
         let status = poll(REG_KV_RD_SEED_STATUS, KV_STATUS_VALID)?;
         if status >> KV_STATUS_ERROR_SHIFT & 0xff != 0 {
             return Err(FAILED);
         }
         // KEYGEN fills every installed limb.
-        start(g, CMD_KEYGEN, g.l_max, g.rns_scale(), &[])?;
+        // READY since the wait above; the KV read does not start the engine.
+        launch(g, CMD_KEYGEN, g.l_max, g.rns_scale(KEYGEN_LOG_SCALE), &[]);
         let status = wait(STATUS_VALID)?;
         if status & (STATUS_ERROR | STATUS_KEY_VALID) != STATUS_KEY_VALID {
             return Err(FAILED);
@@ -303,8 +313,9 @@ pub fn keygen(
     result.and(erased)
 }
 /// ENCRYPT the sealed slot vector at `src` into c0, c1 at `dst`, `level`
-/// limbs each (component-major); `level` is checked by the caller and the engine. The DMA GCM-decrypts the message into Aloha
-/// under `key` and `iv`; at COMMIT_WAIT the tag decides INPUT_COMMIT or
+/// limbs each (component-major), encoded at 2^`log_delta`; both are checked
+/// by the caller and the engine. The DMA GCM-decrypts the message into Aloha
+/// under `key`, `iv` and `aad`; at COMMIT_WAIT the tag decides INPUT_COMMIT or
 /// ZEROIZE, so no arithmetic sees an unauthenticated message. The ciphertext
 /// bypasses AES.
 #[allow(clippy::too_many_arguments)]
@@ -312,20 +323,22 @@ pub fn encrypt(
     g: Geometry,
     aes: &mut Aes,
     trng: &mut Trng,
-    key: &[u8; 32],
+    key: AesKey,
     iv: &[u8; 12],
+    aad: &[u8],
     tag: &[u8; 16],
+    log_delta: u32,
     level: u32,
     src: u64,
     dst: u64,
 ) -> CaliptraResult<Done> {
-    aes.aes_256_gcm_begin(trng, iv, AesKey::Array(key), &[], AesOperation::Decrypt)?;
+    aes.aes_256_gcm_begin(trng, iv, key, aad, AesOperation::Decrypt)?;
     // a and e0 continue the resident key's sampling stream: no seed here.
     start(
         g,
         CMD_ENCRYPT,
         level,
-        g.rns_scale(),
+        g.rns_scale(log_delta),
         &[(0, src), (2, dst), (3, dst + level as u64 * g.limb_bytes())],
     )?;
     let status = wait(STATUS_VALID | STATUS_COMMIT_WAIT)?;
@@ -334,29 +347,36 @@ pub fn encrypt(
         discard_gcm();
         return Ok(Done::new(status));
     }
-    let computed = aes.aes_256_gcm_end(0, g.message_bytes())?;
+    let computed = aes.aes_256_gcm_end(aad.len(), g.message_bytes())?;
     let commit = constant_time_eq::constant_time_eq(&computed, tag);
-    wr(REG_CTRL, if commit { CTRL_INPUT_COMMIT } else { CTRL_ZEROIZE });
+    wr(
+        REG_CTRL,
+        if commit {
+            CTRL_INPUT_COMMIT
+        } else {
+            CTRL_ZEROIZE
+        },
+    );
     wait(STATUS_VALID).map(Done::new)
 }
 /// DECRYPT c0 and c1 limb 0 at `src` (2N words) into the slot vector at `dst`,
-/// GCM-encrypted by the DMA under `key` and `iv`; returns the tag. Decode uses
-/// the power-of-two scale exponent; the evaluator supplies the actual scale.
+/// GCM-encrypted by the DMA under `key`, `iv` and `aad`; returns the tag.
+/// Decode divides by 2^`log_delta` (0 returns Δ·z, for a host holding a
+/// scale that is not a power of two).
+#[allow(clippy::too_many_arguments)]
 pub fn decrypt(
     g: Geometry,
     aes: &mut Aes,
     trng: &mut Trng,
-    key: &[u8; 32],
+    key: AesKey,
     iv: &[u8; 12],
-    log_scale: u32,
+    aad: &[u8],
+    log_delta: u32,
     src: u64,
     dst: u64,
 ) -> CaliptraResult<Done> {
-    if !(1..=40).contains(&log_scale) {
-        return Err(FAILED);
-    }
-    aes.aes_256_gcm_begin(trng, iv, AesKey::Array(key), &[], AesOperation::Encrypt)?;
-    let scale = (-(log_scale as i32)) as u32;
+    aes.aes_256_gcm_begin(trng, iv, key, aad, AesOperation::Encrypt)?;
+    let scale = (-(log_delta as i32)) as u32;
     // DECRYPT reads limb 0 only.
     start(
         g,
@@ -371,7 +391,7 @@ pub fn decrypt(
         discard_gcm();
         return Ok(done);
     }
-    done.tag = aes.aes_256_gcm_end(0, g.message_bytes())?;
+    done.tag = aes.aes_256_gcm_end(aad.len(), g.message_bytes())?;
     Ok(done)
 }
 /// Trusted level refresh from q0 to `level` limbs, with no slot
@@ -385,7 +405,12 @@ pub fn refresh(g: Geometry, level: u32, src: u64, dst: u64) -> CaliptraResult<Do
         CMD_REFRESH,
         level,
         0,
-        &[(0, src), (1, src + limb), (2, dst), (3, dst + level as u64 * limb)],
+        &[
+            (0, src),
+            (1, src + limb),
+            (2, dst),
+            (3, dst + level as u64 * limb),
+        ],
     )?;
     wait(STATUS_VALID).map(Done::new)
 }

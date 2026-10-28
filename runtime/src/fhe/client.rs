@@ -16,19 +16,13 @@ use zeroize::{Zeroize, Zeroizing};
 
 const INVALID: CaliptraError = CaliptraError::RUNTIME_MAILBOX_INVALID_PARAMS;
 const FAILED: CaliptraError = CaliptraError::RUNTIME_FHE_DECRYPT_FAILED;
-#[cfg(all(feature = "fhe-pl", feature = "fhe-pleq"))]
-compile_error!("Select only one FHE parameter set");
 #[cfg(feature = "fhe-pleq")]
 const PARAM_ID: u32 = 2;
 #[cfg(all(feature = "fhe-pl", not(feature = "fhe-pleq")))]
 const PARAM_ID: u32 = 1;
 #[cfg(not(any(feature = "fhe-pl", feature = "fhe-pleq")))]
 const PARAM_ID: u32 = 0;
-const PARAMS: &params::ParamSet = match PARAM_ID {
-    1 => &params::PL,
-    2 => &params::PLEQ,
-    _ => &params::PS,
-};
+const PARAMS: &params::ParamSet = crate::FHE_PARAMS;
 const N: usize = PARAMS.n;
 const L: usize = PARAMS.level;
 const PT_WORDS: usize = L * N;

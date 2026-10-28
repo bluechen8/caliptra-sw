@@ -24,17 +24,71 @@ mod disable;
 mod dpe_crypto;
 mod dpe_platform;
 mod drivers;
+// Protected session profiles: exactly one of fhe-ecdh, fhe-test-key. The
+// fhe-aloha backend runs the same protocol on the Aloha accelerator.
+#[cfg(all(feature = "fhe-ecdh", feature = "fhe-test-key"))]
+compile_error!("fhe-ecdh and fhe-test-key are mutually exclusive");
+#[cfg(all(
+    feature = "fhe-session",
+    not(any(feature = "fhe-ecdh", feature = "fhe-test-key"))
+))]
+compile_error!("fhe-session requires fhe-ecdh or fhe-test-key");
+#[cfg(all(feature = "fhe-aloha", not(feature = "fhe-session")))]
+compile_error!("fhe-aloha is a backend of protocol v5 (fhe-ecdh or fhe-test-key)");
+#[cfg(all(feature = "fhe-aloha", feature = "fhe-eval-keys"))]
+compile_error!("fhe-aloha serves evaluation keys when CAP.EVKGEN is set; drop fhe-eval-keys");
+#[cfg(all(feature = "fhe-session", feature = "fhe-debug"))]
+compile_error!("protected FHE must not be combined with raw debug commands");
+#[cfg(all(
+    feature = "fhe-aloha",
+    any(
+        feature = "fhe-pl",
+        feature = "fhe-pleq",
+        feature = "fhe-p16",
+        feature = "fhe-plr"
+    )
+))]
+compile_error!("fhe-aloha takes N and L from the engine; select no parameter set");
+#[cfg(all(feature = "fhe-debug", any(feature = "fhe-p16", feature = "fhe-plr")))]
+compile_error!("the raw debug kernels support P-S, P-L and P-L-eq only");
+const _: () = assert!(
+    cfg!(feature = "fhe-pl") as u32
+        + cfg!(feature = "fhe-pleq") as u32
+        + cfg!(feature = "fhe-p16") as u32
+        + cfg!(feature = "fhe-plr") as u32
+        <= 1,
+    "Select only one FHE parameter set"
+);
+/// The one parameter set compiled into an FHE image: P-S unless a set is chosen.
+#[cfg(feature = "fhe")]
+pub(crate) const FHE_PARAMS: &caliptra_fhe_core::params::ParamSet = if cfg!(feature = "fhe-plr") {
+    &caliptra_fhe_core::params::PLR
+} else if cfg!(feature = "fhe-p16") {
+    &caliptra_fhe_core::params::P16
+} else if cfg!(feature = "fhe-pleq") {
+    &caliptra_fhe_core::params::PLEQ
+} else if cfg!(feature = "fhe-pl") {
+    &caliptra_fhe_core::params::PL
+} else {
+    &caliptra_fhe_core::params::PS
+};
+#[cfg(all(feature = "fhe-eval-keys", feature = "ml-clear"))]
+compile_error!("evaluation-key profile excludes ml-clear in the frozen runtime allocation");
+#[cfg(all(
+    feature = "fhe-eval-keys",
+    not(any(feature = "fhe-ecdh", feature = "fhe-test-key"))
+))]
+compile_error!("fhe-eval-keys requires protocol v5 (fhe-ecdh or fhe-test-key)");
 mod fe_programming;
-#[cfg(feature = "fhe-debug")]
-#[path = "fhe/client.rs"]
-mod fhe_client;
-#[cfg(feature = "fhe-psk")]
-#[cfg_attr(not(feature = "fhe-aloha"), path = "fhe/session.rs")]
-#[cfg_attr(feature = "fhe-aloha", path = "fhe/session_aloha.rs")]
-mod fhe_session;
 #[cfg(feature = "fhe-aloha")]
 #[path = "fhe/aloha.rs"]
 mod fhe_aloha;
+#[cfg(feature = "fhe-debug")]
+#[path = "fhe/client.rs"]
+mod fhe_client;
+#[cfg(feature = "fhe-session")]
+#[path = "fhe/session.rs"]
+mod fhe_session;
 #[cfg(feature = "fhe")]
 #[path = "fhe/transport.rs"]
 mod fhe_transport;
@@ -271,9 +325,9 @@ fn handle_command(drivers: &mut Drivers) -> CaliptraResult<MboxStatusE> {
         return fhe_client::raw(drivers, request);
     }
 
-    #[cfg(feature = "fhe-psk")]
+    #[cfg(feature = "fhe-session")]
     if fhe_session::handles(req_packet.cmd) {
-        let request = fhe_session::Request::parse(req_packet.cmd, cmd_bytes)?;
+        let request = fhe_session::Request::parse(req_packet.cmd, cmd_bytes, &drivers.fhe_session)?;
         drop(req_packet);
         return fhe_session::execute(drivers, request);
     }

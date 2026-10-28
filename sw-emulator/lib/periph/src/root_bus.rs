@@ -372,7 +372,10 @@ impl CaliptraRootBus {
             key_vault.clear_keys_with_debug_values(false);
         }
         let sha512_acc = Sha512Accelerator::new(clock, mailbox_ram.clone());
-        let dma = Dma::new(
+        #[cfg(feature = "fhe-aloha")]
+        let fhe = crate::fhe_rtl::FheRtl::new();
+        #[allow(unused_mut)]
+        let mut dma = Dma::new(
             clock,
             mailbox_ram.clone(),
             soc_reg.clone(),
@@ -381,13 +384,15 @@ impl CaliptraRootBus {
             test_sram,
             use_mcu_recovery_interface,
         );
+        #[cfg(feature = "fhe-aloha")]
+        {
+            dma.axi.fhe = fhe.clone();
+        }
 
         let sha512 = HashSha512::new(clock, key_vault.clone());
         let ml_dsa87 = Mldsa87::new(clock, key_vault.clone(), sha512.clone());
 
         let aes_key = Rc::new(RefCell::new(None));
-        #[cfg(feature = "fhe-aloha")]
-        let fhe = crate::fhe_rtl::FheRtl::new();
 
         Self {
             rom,

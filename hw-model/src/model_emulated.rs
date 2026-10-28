@@ -21,6 +21,7 @@ use caliptra_emu_cpu::CoverageBitmaps;
 use caliptra_emu_cpu::{Cpu, CpuArgs, InstrTracer, Pic};
 use caliptra_emu_periph::dma::recovery::RecoveryControl;
 use caliptra_emu_periph::ActionCb;
+use caliptra_emu_periph::KeyVault;
 use caliptra_emu_periph::MailboxExternal;
 use caliptra_emu_periph::Mci;
 use caliptra_emu_periph::ReadyForFwCb;
@@ -128,6 +129,11 @@ impl ModelEmulated {
         self.cpu.bus.bus.mailbox_sram.require_word_writes();
     }
 
+    /// Bound CPU direct SRAM accesses while testing DMA-only export commands.
+    pub fn limit_direct_mailbox_access(&mut self, bytes: Option<u32>) {
+        self.cpu.bus.bus.mailbox_sram.limit_direct_access(bytes);
+    }
+
     /// Read backing mailbox SRAM for emulator-only ownership/cleanup assertions.
     /// This is test instrumentation, not an exposed firmware or SoC interface.
     pub fn mailbox_sram_snapshot(&mut self, offset: usize, len: usize) -> Vec<u8> {
@@ -142,6 +148,13 @@ impl ModelEmulated {
                     .unwrap() as u8
             })
             .collect()
+    }
+
+    /// Emulator-only KV ownership checks; never exposed through a mailbox API.
+    /// Reports slot use flags without returning secret key bytes to the test.
+    pub fn key_vault_usage(&mut self, slot: u32) -> u32 {
+        assert!(slot < KeyVault::KEY_COUNT);
+        self.cpu.bus.bus.key_vault.key_usage(slot)
     }
 
     /// Paint only unused runtime stack below the paused CPU's current SP.

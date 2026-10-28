@@ -29,9 +29,8 @@ PROFILES = {
     'fmc_noemu': ('caliptra-fmc', 'riscv'),
     'rom_noemu': ('caliptra-rom', 'riscv'),
     'no_mldsa': ('caliptra-runtime', 'emu,riscv,no-mldsa'),
-    'software_psk': ('caliptra-runtime', 'emu,riscv,no-mldsa,fhe-psk'),
-    # Registered APP_FHE_PSK_ML_CLEAR image used by the default protected tests.
-    'software_psk_ml_clear': ('caliptra-runtime', 'emu,riscv,no-mldsa,fhe-psk,ml-clear'),
+    # Protected profiles are not compared: they change with the protocol by
+    # design, and older baselines may lack the current profile features.
 }
 DEFAULT_PROFILES = ['rom', 'fmc', 'standard', 'rom_noemu', 'fmc_noemu', 'standard_noemu']
 
@@ -46,8 +45,8 @@ def main():
     parser.add_argument('--out', required=True, type=Path)
     parser.add_argument('--current', type=Path, default=ROOT, help='Optional staged source tree; Git baselines still come from this repository')
     parser.add_argument('--profiles', nargs='+', choices=sorted(PROFILES), default=DEFAULT_PROFILES,
-                        help='Default: ROM/FMC/runtime with and without emu. The no_mldsa/software_psk profiles '
-                             'need a baseline that already has those features (8efce033 does not)')
+                        help='Default: ROM/FMC/runtime with and without emu. The no_mldsa profile '
+                             'needs a baseline that already has that feature (8efce033 does not)')
     args = parser.parse_args()
     current = args.current.resolve()
     out = args.out.resolve()

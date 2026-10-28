@@ -41,6 +41,8 @@ itrng = ["caliptra-hw-model/itrng"]
 verilator = ["caliptra-hw-model/verilator"]
 no-cfi = []
 fips-test-hooks = []
+# Streaming AES-GCM with KeyVault keys (FHE protected service only).
+gcm-any-key = []
 
 [dev-dependencies]
 caliptra-api.workspace = true

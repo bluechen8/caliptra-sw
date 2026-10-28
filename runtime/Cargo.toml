@@ -90,15 +90,26 @@ std = ["ufmt/std", "caliptra_common/std"]
 slow_tests = []
 verilator = ["caliptra-hw-model/verilator"]
 fips_self_test = []
-fhe = ["dep:caliptra-fhe-core"]
+fhe = ["dep:caliptra-fhe-core", "caliptra-drivers/gcm-any-key"]
 fhe-debug = ["fhe"]
-fhe-psk = ["fhe"]
-# N=256 hardware client with private AHB stream; distinct authenticated profile.
-fhe-aloha = ["fhe-psk", "no-mldsa"]
+# One resident protected session; exactly one session profile below.
+fhe-session = ["fhe"]
+# Protocol v5 with device-attested ECDH open.
+fhe-ecdh = ["fhe-session"]
+# Protocol v5 with fixed public test keys; debug-unlocked fake-ROM runs only.
+fhe-test-key = ["fhe-session"]
+# Limb-by-limb evaluation-key generation and FIFO DMA export; protocol v5 only.
+fhe-eval-keys = ["fhe"]
+# Backend: the Aloha accelerator runs protocol v5's kernels (with fhe-ecdh or fhe-test-key).
+fhe-aloha = ["fhe", "no-mldsa"]
 # Reference classifier for comparing clear and encrypted inference; off by default.
-ml-clear = ["fhe-psk", "caliptra-api/ml-clear"]
+ml-clear = ["caliptra-api/ml-clear"]
+# Parameter set (default P-S); fhe-p16 (N=16384) is protocol v5 only.
 fhe-pl = ["fhe"]
 fhe-pleq = ["fhe"]
+fhe-p16 = ["fhe"]
+# Simulation-only N=1024, L=7 set for logistic-regression training; protocol v5 only.
+fhe-plr = ["fhe"]
 no-cfi = [
     "caliptra-image-verify/no-cfi",
     "caliptra-drivers/no-cfi",

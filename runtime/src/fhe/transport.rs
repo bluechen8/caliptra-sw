@@ -31,13 +31,14 @@ pub enum Error {
 /// Validate the full host-supplied address before any narrowing or MMIO.
 /// Empty transfers are rejected; callers handle optional empty payloads locally.
 pub fn validate_range(addr: u64, bytes: u64) -> Result<(), Error> {
+    validate_extent(addr, bytes, u32::MAX as u64) // the DMA byte count register
+}
+
+/// [`validate_range`] for a command-wide extent that later transfers stay
+/// inside, bounded by the caller's own `max` rather than one transfer's.
+pub fn validate_extent(addr: u64, bytes: u64, max: u64) -> Result<(), Error> {
     let end = addr.checked_add(bytes).ok_or(Error::InvalidRange)?;
-    if bytes == 0
-        || bytes > u32::MAX as u64 // the DMA byte count register
-        || (addr | bytes) & 3 != 0
-        || addr < DRAM_START
-        || end > DRAM_END
-    {
+    if bytes == 0 || bytes > max || (addr | bytes) & 3 != 0 || addr < DRAM_START || end > DRAM_END {
         return Err(Error::InvalidRange);
     }
     Ok(())

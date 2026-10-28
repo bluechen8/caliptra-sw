@@ -121,19 +121,86 @@ pub fn intt(a: &mut [u32], tw: &[u32], p: &PrimeParams) -> Result<()> {
     Ok(())
 }
 
-/// Pointwise `a[i] * b[i] mod q`, writing into `out`.
-///
-/// Both inputs are plain (non-Montgomery) residues, so one operand is lifted
-/// on the fly; this is the shape `INGRESS`/`EGRESS` need (`a . NTT(s)`).
-pub fn mul_pointwise(a: &[u32], b: &[u32], out: &mut [u32], p: &PrimeParams) -> Result<()> {
-    if a.len() != b.len() || a.len() != out.len() {
+/// Words of twiddle scratch the stage-wise transforms need: `N/2`.
+pub const fn stage_twiddle_words(n: usize) -> usize {
+    n / 2
+}
+
+/// Stage `m` of the bit-reversed table, `tw[m + i]` for `i < m`, into
+/// `out[..m]`. With `k = log2 m`, `bitrev_logN(m + i) = N/2m + bitrev_k(i) * N/m`,
+/// so the stage is `g^(N/2m) * (g^(N/m))^bitrev_k(i)`, in Montgomery form.
+fn gen_stage(root: u32, n: usize, m: usize, p: &PrimeParams, out: &mut [u32]) {
+    let mut x = to_mont(pow_mod(root, (n / (2 * m)) as u32, p.q), p);
+    let step = mont_mul(x, x, p.q, p.q_inv_neg);
+    // `r` walks bitrev_k(j) incrementally: add one at the top bit, carry down.
+    let mut r = 0usize;
+    for _ in 0..m {
+        out[r] = x;
+        x = mont_mul(x, step, p.q, p.q_inv_neg);
+        let mut b = m >> 1;
+        while r & b != 0 {
+            r ^= b;
+            b >>= 1;
+        }
+        r |= b;
+    }
+}
+
+/// [`ntt`] with each stage's twiddles generated into `tw` (`N/2` words)
+/// instead of read from a full table; the output is identical.
+pub fn ntt_staged(a: &mut [u32], p: &PrimeParams, tw: &mut [u32]) -> Result<()> {
+    let n = a.len();
+    if !n.is_power_of_two() || n < 2 || tw.len() != stage_twiddle_words(n) {
         return Err(Error::BadLength);
     }
     let (q, qi) = (p.q, p.q_inv_neg);
-    for i in 0..a.len() {
-        // (a*R) * b * R^-1 = a*b
-        let am = mont_mul(a[i], p.r2, q, qi);
-        out[i] = mont_mul(am, b[i], q, qi);
+    let mut t = n;
+    let mut m = 1usize;
+    while m < n {
+        t >>= 1;
+        gen_stage(p.root, n, m, p, tw);
+        for (i, &s) in tw[..m].iter().enumerate() {
+            let j1 = 2 * i * t;
+            for j in j1..j1 + t {
+                let u = a[j];
+                let v = mont_mul(a[j + t], s, q, qi);
+                a[j] = add_mod(u, v, q);
+                a[j + t] = sub_mod(u, v, q);
+            }
+        }
+        m <<= 1;
+    }
+    Ok(())
+}
+
+/// [`intt`] with stage twiddles generated into `tw` (`N/2` words).
+pub fn intt_staged(a: &mut [u32], p: &PrimeParams, tw: &mut [u32]) -> Result<()> {
+    let n = a.len();
+    if !n.is_power_of_two() || n < 2 || tw.len() != stage_twiddle_words(n) {
+        return Err(Error::BadLength);
+    }
+    let (q, qi) = (p.q, p.q_inv_neg);
+    let mut t = 1usize;
+    let mut m = n;
+    while m > 1 {
+        let mut j1 = 0usize;
+        let h = m >> 1;
+        gen_stage(p.root_inv, n, h, p, tw);
+        for &s in &tw[..h] {
+            for j in j1..j1 + t {
+                let u = a[j];
+                let v = a[j + t];
+                a[j] = add_mod(u, v, q);
+                a[j + t] = mont_mul(sub_mod(u, v, q), s, q, qi);
+            }
+            j1 += 2 * t;
+        }
+        t <<= 1;
+        m >>= 1;
+    }
+    let n_inv = to_mont(p.n_inv, p);
+    for x in a.iter_mut() {
+        *x = mont_mul(*x, n_inv, q, qi);
     }
     Ok(())
 }
@@ -198,6 +265,27 @@ mod tests {
                 ntt(&mut a, &f, p).unwrap();
                 intt(&mut a, &i, p).unwrap();
                 assert_eq!(a, x, "{} limb q={}", ps.name, p.q);
+            }
+        }
+    }
+
+    #[test]
+    fn staged_matches_table() {
+        for ps in params::ALL {
+            for p in ps.primes.iter().chain([&ps.aux]) {
+                let (f, i) = tables(ps.n, p);
+                let x: Vec<u32> = (0..ps.n)
+                    .map(|k| ((k as u64 * 2_654_435_761 + 77) % p.q as u64) as u32)
+                    .collect();
+                let mut tw = vec![0u32; stage_twiddle_words(ps.n)];
+                let (mut table, mut staged) = (x.clone(), x.clone());
+                ntt(&mut table, &f, p).unwrap();
+                ntt_staged(&mut staged, p, &mut tw).unwrap();
+                assert_eq!(table, staged, "{} forward q={}", ps.name, p.q);
+                intt(&mut table, &i, p).unwrap();
+                intt_staged(&mut staged, p, &mut tw).unwrap();
+                assert_eq!(table, staged, "{} inverse q={}", ps.name, p.q);
+                assert_eq!(staged, x);
             }
         }
     }

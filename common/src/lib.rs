@@ -50,6 +50,10 @@ pub const FMC_ORG: u32 = 0x40000000;
 pub const FMC_SIZE: u32 = 36 * 1024; // Must be 4k aligned
 pub const RUNTIME_ORG: u32 = FMC_ORG + FMC_SIZE;
 pub const RUNTIME_SIZE: u32 = 146 * 1024;
+/// Runtime allocation of FHE builds (Cargo feature `fhe`): the protected
+/// service's streaming kernels and fixed-point slot codec take 10 KiB more of the spare ICCM. Other
+/// builds keep `RUNTIME_SIZE`.
+pub const FHE_RUNTIME_SIZE: u32 = RUNTIME_SIZE + 10 * 1024;
 
 pub use memory_layout::{DATA_ORG, PERSISTENT_DATA_ORG};
 pub use wdt::{restart_wdt, start_wdt, stop_wdt, WdtTimeout};

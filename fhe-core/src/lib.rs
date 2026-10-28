@@ -16,8 +16,9 @@ Abstract:
     on VeeR (plan §3.2: the microcontroller may read *and* write mailbox SRAM
     while a SoC command is executing).
 
-    Scope, per plan §2.6: encrypt and decrypt only.  There are no homomorphic
-    operations here, no refresh, and no path that returns a decryption to the
+    Scope: encrypt/decrypt and evaluation-key generation; `stream` holds the
+    limb-at-a-time forms the protected runtime uses at every parameter set. There are no
+    user-ciphertext evaluation operations here, no refresh, and no path that returns a decryption to the
     SoC in the clear -- that is the runtime's job, and only `FHE_EGRESS`
     (decrypt fused with AES-GCM to the user) may do it.
 
@@ -33,6 +34,8 @@ Abstract:
 
 /// Modular arithmetic mod q < 2^31, Montgomery form with R = 2^32.
 pub mod arith;
+/// Streamable rotation/relinearization evaluation-key generation.
+pub mod evalkey;
 /// Wrapped-blob header and the little-endian polynomial wire layout.
 pub mod format;
 /// Negacyclic NTT in the plan §4.1 layout.
@@ -45,6 +48,10 @@ pub mod prg;
 pub mod rlwe;
 /// Ternary / centered-binomial / uniform samplers.
 pub mod sample;
+/// Fixed-point CKKS slot encoding and decoding (no FPU).
+pub mod slots;
+/// Limb-at-a-time kernels for the protected service.
+pub mod stream;
 
 pub use params::{ParamSet, PrimeParams};
 
@@ -63,6 +70,10 @@ pub enum Error {
     BadHeader,
     /// A blob's sequence number did not advance.
     StaleSeq,
+    /// The caller's output sink (DMA or mailbox) failed.
+    Sink,
+    /// A slot or coefficient is outside the range its encoding allows.
+    OutOfRange,
 }
 
 /// Result alias for the kernels.

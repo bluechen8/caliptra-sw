@@ -155,20 +155,68 @@ pub const APP_FHE_DEBUG_PLEQ: FwId = FwId {
     features: &["emu", "no-mldsa", "fhe-debug", "fhe-pleq"],
     ..APP_FHE_DEBUG
 };
-pub const APP_FHE_PSK: FwId = FwId {
-    features: &["emu", "no-mldsa", "fhe-psk"],
+/// Protocol v5 on the Aloha accelerator, test-key open (debug-unlocked runs).
+#[cfg(feature = "fhe-aloha")]
+pub const APP_FHE_ALOHA: FwId = FwId {
+    features: &["emu", "no-mldsa", "fhe-test-key", "fhe-aloha"],
+    ..APP_FHE_DEBUG
+};
+/// Protocol v5 on Aloha with the device-attested ECDH open.
+#[cfg(feature = "fhe-aloha")]
+pub const APP_FHE_ALOHA_ECDH: FwId = FwId {
+    features: &["emu", "no-mldsa", "fhe-ecdh", "fhe-aloha"],
     ..APP_FHE_DEBUG
 };
 
-#[cfg(feature = "fhe-aloha")]
-pub const APP_FHE_ALOHA: FwId = FwId {
-    features: &["emu", "no-mldsa", "fhe-aloha"],
-    ..APP_FHE_PSK
+pub const APP_FHE_ECDH: FwId = FwId {
+    features: &["emu", "no-mldsa", "fhe-ecdh"],
+    ..APP_FHE_DEBUG
+};
+pub const APP_FHE_EVAL_KEYS: FwId = FwId {
+    features: &["emu", "no-mldsa", "fhe-ecdh", "fhe-eval-keys"],
+    ..APP_FHE_DEBUG
 };
 
-pub const APP_FHE_PSK_ML_CLEAR: FwId = FwId {
-    features: &["emu", "no-mldsa", "fhe-psk", "ml-clear"],
-    ..APP_FHE_PSK
+pub const APP_FHE_ECDH_ML_CLEAR: FwId = FwId {
+    features: &["emu", "no-mldsa", "fhe-ecdh", "ml-clear"],
+    ..APP_FHE_DEBUG
+};
+
+/// Fixed public test keys; the runtime refuses to open unless debug-unlocked.
+pub const APP_FHE_TEST_KEY_ML_CLEAR: FwId = FwId {
+    features: &["emu", "no-mldsa", "fhe-test-key", "ml-clear"],
+    ..APP_FHE_DEBUG
+};
+pub const APP_FHE_TEST_KEY_EVAL_KEYS: FwId = FwId {
+    features: &["emu", "no-mldsa", "fhe-test-key", "fhe-eval-keys"],
+    ..APP_FHE_DEBUG
+};
+/// N=16384, L=1: every command streams limb by limb in pointer mode.
+pub const APP_FHE_TEST_KEY_EVAL_KEYS_P16: FwId = FwId {
+    features: &[
+        "emu",
+        "no-mldsa",
+        "fhe-test-key",
+        "fhe-eval-keys",
+        "fhe-p16",
+    ],
+    ..APP_FHE_DEBUG
+};
+/// N=1024, L=7 (simulation only): logistic-regression training with REFRESH.
+pub const APP_FHE_TEST_KEY_EVAL_KEYS_PLR: FwId = FwId {
+    features: &[
+        "emu",
+        "no-mldsa",
+        "fhe-test-key",
+        "fhe-eval-keys",
+        "fhe-plr",
+    ],
+    ..APP_FHE_DEBUG
+};
+/// N=8192, L=4: per-limb streaming at the deepest generated set.
+pub const APP_FHE_TEST_KEY_PLEQ: FwId = FwId {
+    features: &["emu", "no-mldsa", "fhe-test-key", "fhe-pleq"],
+    ..APP_FHE_DEBUG
 };
 
 pub const APP_FHE: FwId = FwId {
@@ -591,10 +639,18 @@ pub const REGISTERED_FW: &[&FwId] = &[
     &APP_FHE_DEBUG_PL,
     &APP_FHE_DEBUG_PLEQ,
     &APP_FHE,
-    &APP_FHE_PSK,
+    &APP_FHE_ECDH,
+    &APP_FHE_EVAL_KEYS,
+    &APP_FHE_ECDH_ML_CLEAR,
+    &APP_FHE_TEST_KEY_ML_CLEAR,
+    &APP_FHE_TEST_KEY_EVAL_KEYS,
+    &APP_FHE_TEST_KEY_EVAL_KEYS_P16,
+    &APP_FHE_TEST_KEY_EVAL_KEYS_PLR,
+    &APP_FHE_TEST_KEY_PLEQ,
     #[cfg(feature = "fhe-aloha")]
     &APP_FHE_ALOHA,
-    &APP_FHE_PSK_ML_CLEAR,
+    #[cfg(feature = "fhe-aloha")]
+    &APP_FHE_ALOHA_ECDH,
     &APP_WITH_UART_FIPS_TEST_HOOKS,
     &APP_WITH_UART_FPGA,
     &APP_ZEROS,

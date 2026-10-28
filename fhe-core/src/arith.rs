@@ -107,15 +107,24 @@ pub const fn pow_mod(base: u32, exp: u32, q: u32) -> u32 {
     acc
 }
 
-/// Reduce a signed value into `[0, q)`.  Used for the ternary secret and the
-/// centered-binomial error, whose magnitudes are tiny.
+/// Reduce a signed value with `|v| < q` into `[0, q)`: the ternary secret, the
+/// centered-binomial error and centered plaintext residues. A select, no divide.
 #[inline(always)]
 pub const fn from_i32(v: i32, q: u32) -> u32 {
-    let r = v % (q as i32);
-    if r < 0 {
-        (r + q as i32) as u32
+    if v < 0 {
+        (v + q as i32) as u32
     } else {
-        r as u32
+        v as u32
+    }
+}
+
+/// The centered value in (-q/2, q/2] of a residue in [0, q).
+#[inline(always)]
+pub const fn center(v: u32, q: u32) -> i32 {
+    if v > q / 2 {
+        v as i32 - q as i32
+    } else {
+        v as i32
     }
 }
 
