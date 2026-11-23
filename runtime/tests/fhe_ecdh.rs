@@ -196,7 +196,7 @@ fn evaluation_keys() {
     // transport, and only close runs afterwards.
     let end = m.soc_dram_mut().unwrap().len() as u64;
     let mut h = key(u.id, 8, 0);
-    h[28..36].copy_from_slice(&(0x8000_0000 + end - (KEY_BYTES as u64) / 2).to_le_bytes());
+    h[28..36].copy_from_slice(&(SRC + end - (KEY_BYTES as u64) / 2).to_le_bytes());
     u.reject(&mut m, 8, &h, &[]);
     u.reject(&mut m, 8, &key(u.id, 8, 0), &[]);
     u.call(&mut m, 5, &[], false);

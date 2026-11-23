@@ -121,6 +121,18 @@ fn req(id: u32, seq: u32) -> FheRawDecryptReq {
         ..Default::default()
     }
 }
+#[allow(dead_code)]
+#[path = "../src/fhe/transport.rs"]
+mod transport;
+/// The emulator's DRAM model, at the window base the runtime accepts.
+const DRAM: u32 = transport::DRAM_START as u32;
+#[test]
+fn emulator_dram_is_the_runtime_window() {
+    assert_eq!(
+        transport::DRAM_START,
+        caliptra_emu_periph::dma::axi_root_bus::AxiRootBus::DRAM_OFFSET
+    );
+}
 const CT: &[u8] = include_bytes!("../../fhe-core/tests/vectors/ps/ct.bin");
 const DEC: &[u8] = include_bytes!("../../fhe-core/tests/vectors/ps/dec.bin");
 fn reject(model: &mut DefaultHwModel, id: CommandId, data: &[u8], payload: &[u8]) {
@@ -169,15 +181,15 @@ fn ps_decrypt_mailbox_and_pointer_golden() {
     reject(&mut model, CommandId::FHE_DECRYPT_RAW, r.as_bytes(), CT); // replay
     r.seq = 2;
     r.mode = 1;
-    r.src_lo = 0x8000_0000;
-    r.dst_lo = 0x8000_2000;
+    r.src_lo = DRAM;
+    r.dst_lo = DRAM + 0x2000;
     model.soc_dram_mut().unwrap()[..4096].copy_from_slice(CT);
     model.soc_dram_mut().unwrap()[8192..10240].fill(0xa5);
     r.dst_hi = 2;
-    r.src_lo = 0x8100_0000; // unmapped in model: invalid output must reject before DMA
+    r.src_lo = DRAM + 0x100_0000; // past the 8-MiB model: invalid output must reject before DMA
     reject(&mut model, CommandId::FHE_DECRYPT_RAW, r.as_bytes(), &[]);
     r.dst_hi = 0;
-    r.src_lo = 0x8000_0000;
+    r.src_lo = DRAM;
     let result = send(&mut model, CommandId::FHE_DECRYPT_RAW, r.as_bytes(), &[]);
     assert_eq!(result.len(), core::mem::size_of::<FheSwResp>());
     assert_eq!(&model.soc_dram_mut().unwrap()[8192..10240], DEC);
@@ -208,11 +220,11 @@ fn ps_decrypt_mailbox_and_pointer_golden() {
     };
     let result = send(&mut model, CommandId::FHE_KEYGEN, random.as_bytes(), &[]);
     let random_id = FheSwResp::ref_from_bytes(&result).unwrap().session_id;
-    // Address is legal in the 4-GiB fabric window but unmapped in the 8-MiB
+    // Address is legal in the host window but unmapped in the 8-MiB
     // emulator RAM. Exercise the real register adapter's sticky error path.
     r.session_id = random_id;
     r.seq = 1;
-    r.src_lo = 0x8100_0000;
+    r.src_lo = DRAM + 0x100_0000;
     let err = model
         .mailbox_execute(
             CommandId::FHE_DECRYPT_RAW.into(),
@@ -224,7 +236,7 @@ fn ps_decrypt_mailbox_and_pointer_golden() {
         if code == u32::from(caliptra_api::error::CaliptraError::RUNTIME_FHE_DECRYPT_FAILED)),
         "{err:?}"
     );
-    r.src_lo = 0x8000_0000;
+    r.src_lo = DRAM;
     r.seq = 2;
     reject(&mut model, CommandId::FHE_DECRYPT_RAW, r.as_bytes(), &[]);
     reject(&mut model, CommandId::FHE_KEYGEN, key_req().as_bytes(), &[]);
@@ -266,9 +278,9 @@ fn pointer_partial_write_fails_and_poison_blocks_rekey() {
     model.soc_dram_mut().unwrap()[..4096].copy_from_slice(CT);
     let mut r = req(id, 1);
     r.mode = 1;
-    r.src_lo = 0x8000_0000;
+    r.src_lo = DRAM;
     let len = model.soc_dram_mut().unwrap().len();
-    r.dst_lo = 0x8000_0000 + len as u32 - 4;
+    r.dst_lo = DRAM + len as u32 - 4;
     let err = model
         .mailbox_execute(
             CommandId::FHE_DECRYPT_RAW.into(),
@@ -283,7 +295,7 @@ fn pointer_partial_write_fails_and_poison_blocks_rekey() {
     assert_eq!(&model.soc_dram_mut().unwrap()[len - 4..], &DEC[..4]);
     reject(&mut model, CommandId::FHE_KEYGEN, key_req().as_bytes(), &[]);
     r.seq = 2;
-    r.dst_lo = 0x8000_2000;
+    r.dst_lo = DRAM + 0x2000;
     reject(&mut model, CommandId::FHE_DECRYPT_RAW, r.as_bytes(), &[]);
 }
 
@@ -330,8 +342,8 @@ fn raw_golden(
         } else {
             model.soc_dram_mut().unwrap()[..pt.len()].copy_from_slice(pt);
             model.soc_dram_mut().unwrap()[0x3fffc..0x40000 + ct.len() + 4].fill(0xa5);
-            enc.common.src_lo = 0x8000_0000;
-            enc.common.dst_lo = 0x8004_0000;
+            enc.common.src_lo = DRAM;
+            enc.common.dst_lo = DRAM + 0x4_0000;
             &[]
         };
         let result = send(
@@ -363,8 +375,8 @@ fn raw_golden(
             seq,
             mode,
             input_len: ct.len() as u32,
-            src_lo: if mode == 1 { 0x8004_0000 } else { 0 },
-            dst_lo: if mode == 1 { 0x8009_0000 } else { 0 },
+            src_lo: if mode == 1 { DRAM + 0x4_0000 } else { 0 },
+            dst_lo: if mode == 1 { DRAM + 0x9_0000 } else { 0 },
             ..Default::default()
         };
         let result = send(
@@ -442,8 +454,8 @@ fn encrypt_reseeds_and_rejects_invalid_input() {
     );
     enc.common.seq += 1;
     enc.common.mode = 1;
-    enc.common.src_lo = 0x8000_0000;
-    enc.common.dst_lo = 0x8000_2000;
+    enc.common.src_lo = DRAM;
+    enc.common.dst_lo = DRAM + 0x2000;
     model.soc_dram_mut().unwrap()[..pt.len()].copy_from_slice(pt);
     model.soc_dram_mut().unwrap()[pt.len() - 4..pt.len()].fill(0xff);
     model.soc_dram_mut().unwrap()[8192..12288].fill(0xa5);

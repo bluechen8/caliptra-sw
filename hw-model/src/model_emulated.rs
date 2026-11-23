@@ -180,7 +180,7 @@ impl ModelEmulated {
     }
 
     /// Host-side access to the standalone model's SoC DRAM window at
-    /// 0x8000_0000. None in subsystem mode, where an external MCU owns it.
+    /// 0x8400_0000 (the SoC's host window). None in subsystem mode, where an external MCU owns it.
     /// This does not access Caliptra mailbox SRAM or change mailbox ownership.
     pub fn soc_dram_mut(&mut self) -> Option<&mut [u8]> {
         self.cpu

@@ -30,14 +30,10 @@ use caliptra_cfi_lib::CfiCounter;
 use caliptra_drivers::{AxiAddr, Dma};
 use caliptra_test_harness::test_suite;
 
-/// Scratch base inside the SoC DRAM window (plan §4.5: pointers must lie in
-/// `[0x8000_0000, 0x8000_0000 + 4 GiB)`).
-///
-/// 4 MiB in, which clears the Rocket host image and heap in the Chipyard
-/// simulation (`test.riscv` ends at ~0x8005_B000) while staying inside the
-/// emulator's modelled DRAM window.  The Rocket-side smoke test
-/// (`caliptra-wrapper/software/caliptra-dma-test.c`) uses the same constants.
-const DRAM_BASE: u64 = 0x8040_0000;
+/// Scratch base 4 MiB into the emulator's modelled DRAM window, which starts
+/// at the SoC's host window (0x8400_0000); the SoC copy in rom/dev/test-fw uses
+/// the same base.
+const DRAM_BASE: u64 = 0x8440_0000;
 /// 1 KiB, the transfer size plan §6/WP2 names for the smoke test.
 const XFER_WORDS: usize = 256;
 /// Second buffer, deliberately not adjacent, so a copy cannot pass by aliasing.

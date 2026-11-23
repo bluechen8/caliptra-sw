@@ -39,8 +39,9 @@ use caliptra_registers::mbox::MboxCsr;
 const FLOW_READY_FOR_MB_PROCESSING: u32 = 1 << 28;
 const FLOW_STATUS: *mut u32 = 0x3003_003C as *mut u32;
 
-/// Scratch base inside the SoC DRAM window; must match caliptra-dma-test.c.
-const DRAM_BASE: u64 = 0x8040_0000;
+/// Scratch base in the SoC's host window, the only DRAM the DMA reaches, and in
+/// the emulator's DRAM model; must match caliptra-dma-test.c.
+const DRAM_BASE: u64 = 0x8440_0000;
 /// 1 KiB, the transfer size plan §6/WP2 names for the smoke test.
 const XFER_WORDS: usize = 256;
 /// Second buffer, deliberately not adjacent, so a copy cannot pass by aliasing.
