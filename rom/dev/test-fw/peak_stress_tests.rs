@@ -1,9 +1,13 @@
 // Licensed under the Apache-2.0 license
 //
-// Short concurrent AES/SHA/ECC/optional-DMA stress. No runtime upload.
-// Prepare operands first; capture a cycle budget, then drain and check results.
-// All hardware waits have cycle deadlines. This is public test data, not a
-// production cryptographic service. Host protocol: caliptra-peak-stress.c.
+// Single-run, two-phase peak-power stress. No runtime upload.
+// Phase A: AES-256-ECB + SHA-512 (+ optional DMA) for a cycle budget.
+// Phase B: one complete ECC-P384 verify + SHA-512 (+ optional DMA).
+// AES and ECC never overlap: frozen caliptra_top raises fatal crypto_error.
+// Prepare operands first; each phase has its own BOOT_STATUS window for a
+// separate SAIF; drain and check results afterwards. All hardware waits have
+// cycle deadlines. This is public test data, not a production cryptographic
+// service. Host protocol: caliptra-peak-stress.c.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(not(feature = "std"), no_main)]
@@ -24,24 +28,29 @@ const FLOW_STATUS: *mut u32 = 0x3003_003c as *mut u32;
 const BOOT_STATUS: *mut u32 = 0x3003_0038 as *mut u32;
 const SHARED: *mut u32 = 0x3003_0018 as *mut u32;
 const MARK: u32 = 0x5a17_5000;
-const PHASE_CAPTURE: u32 = 2;
+const PHASE_A_CAPTURE: u32 = 2;
 const PHASE_DONE: u32 = 3;
-const PHASE_DRAIN: u32 = 4;
+const PHASE_A_END: u32 = 4;
 const PHASE_ARMED: u32 = 5;
+const PHASE_B_CAPTURE: u32 = 6;
+const PHASE_B_END: u32 = 7;
 const PHASE_FAIL: u32 = 15;
-// Versioned protocol: incompatible with the old message-count workload.
-const CTRL_MAGIC: u32 = 0x5a17_c7a4;
-const RES_MAGIC: u32 = 0x5a17_d0e7;
+// Versioned protocol: incompatible with the single-window profile ROM.
+const CTRL_MAGIC: u32 = 0x5a17_c7a5;
+const RES_MAGIC: u32 = 0x5a17_d0e8;
 const LEG_AES: u32 = 1;
 const LEG_SHA: u32 = 2;
 const LEG_DMA: u32 = 4;
 // Bit 3 belongs to Rocket, which the host runs independently.
 const LEG_ECC: u32 = 16;
-const ENGINE_MASK: u32 = LEG_AES | LEG_SHA | LEG_DMA | LEG_ECC;
+const REQUIRED: u32 = LEG_AES | LEG_SHA | LEG_ECC;
+const ENGINE_MASK: u32 = REQUIRED | LEG_DMA;
 const DEFAULT_WINDOW: u32 = 4096;
 const MIN_WINDOW: u32 = 1024;
 const MAX_WINDOW: u32 = 65536;
 const WAIT_CYCLES: u32 = 2_000_000;
+// One P-384 verify is roughly 1M cycles; phase B waits for it to finish.
+const ECC_WAIT_CYCLES: u32 = 8_000_000;
 const ACK_START: u32 = 0x53544152;
 const ACK_END: u32 = 0x454e4421;
 const DMA_SOURCE: u32 = 0x8050_0000;
@@ -99,11 +108,14 @@ fn check_fatal() {
         fail(0xf0);
     }
 }
-fn deadline(start: u32, stage: u32) {
+fn deadline_for(start: u32, limit: u32, stage: u32) {
     check_fatal();
-    if rdmcycle().wrapping_sub(start) >= WAIT_CYCLES {
+    if rdmcycle().wrapping_sub(start) >= limit {
         fail(stage);
     }
+}
+fn deadline(start: u32, stage: u32) {
+    deadline_for(start, WAIT_CYCLES, stage);
 }
 fn await_ack(ack: u32) {
     let start = rdmcycle();
@@ -125,6 +137,9 @@ fn pattern(i: usize) -> u8 {
 }
 fn dma_pattern(i: usize) -> u32 {
     (i as u32).wrapping_mul(0x9e3779b9).wrapping_add(0x12345678)
+}
+fn saturate(count: u32) -> u32 {
+    count.min(0xffff)
 }
 #[no_mangle]
 #[inline(never)]
@@ -182,69 +197,64 @@ struct Engines {
     aes_last: [u32; 4],
     counts: [u32; 4], // AES, SHA, DMA, ECC; includes final drain completion
     pending: u32,
+    slot: u32,
 }
 impl Engines {
     fn prepare(&mut self) {
         let start = rdmcycle();
-        if self.legs & LEG_AES != 0 {
-            while !self.aes.regs().status().read().idle() {
-                deadline(start, 0xa4);
-            }
-            for _ in 0..2 {
-                self.aes.regs_mut().ctrl_shadowed().write(|w| {
-                    w.key_len(4)
-                        .mode(1)
-                        .operation(1)
-                        .manual_operation(false)
-                        .sideload(false)
-                });
-            }
-            for i in 0..8 {
-                let word = u32::from_le_bytes(core::array::from_fn(|j| (4 * i + j) as u8));
-                self.aes
-                    .regs_mut()
-                    .key_share0()
-                    .at(i)
-                    .write(|_| word ^ 0x12345678);
-                self.aes.regs_mut().key_share1().at(i).write(|_| 0x12345678);
-            }
-            self.aes_in = core::array::from_fn(|i| {
-                u32::from_le_bytes(core::array::from_fn(|j| pattern(4 * i + j)))
+        while !self.aes.regs().status().read().idle() {
+            deadline(start, 0xa4);
+        }
+        for _ in 0..2 {
+            self.aes.regs_mut().ctrl_shadowed().write(|w| {
+                w.key_len(4)
+                    .mode(1)
+                    .operation(1)
+                    .manual_operation(false)
+                    .sideload(false)
             });
-            // The fourth write starts automatic AES; defer it until launch.
-            for i in 0..3 {
-                self.aes
-                    .regs_mut()
-                    .data_in()
-                    .at(i)
-                    .write(|_| self.aes_in[i]);
-            }
         }
-        if self.legs & LEG_SHA != 0 {
-            while !self.sha.regs().status().read().ready() {
-                deadline(start, 0xb0);
-            }
-            for i in 0..32 {
-                let word = match i {
-                    0..=15 => u32::from_be_bytes(core::array::from_fn(|j| pattern(4 * i + j))),
-                    16 => 0x80000000,
-                    31 => 512,
-                    _ => 0,
-                };
-                self.sha.regs_mut().block().at(i).write(|_| word);
-            }
+        for i in 0..8 {
+            let word = u32::from_le_bytes(core::array::from_fn(|j| (4 * i + j) as u8));
+            self.aes
+                .regs_mut()
+                .key_share0()
+                .at(i)
+                .write(|_| word ^ 0x12345678);
+            self.aes.regs_mut().key_share1().at(i).write(|_| 0x12345678);
         }
-        if self.legs & LEG_ECC != 0 {
-            while !self.ecc.regs().status().read().ready() {
-                deadline(start, 0xe0);
-            }
-            for i in 0..12 {
-                self.ecc.regs_mut().pubkey_x().at(i).write(|_| ECC_X[i]);
-                self.ecc.regs_mut().pubkey_y().at(i).write(|_| ECC_Y[i]);
-                self.ecc.regs_mut().msg().at(i).write(|_| 0);
-                self.ecc.regs_mut().sign_r().at(i).write(|_| ECC_R[i]);
-                self.ecc.regs_mut().sign_s().at(i).write(|_| ECC_S[i]);
-            }
+        self.aes_in =
+            core::array::from_fn(|i| u32::from_le_bytes(core::array::from_fn(|j| pattern(4 * i + j))));
+        // The fourth write starts automatic AES; defer it until launch.
+        for i in 0..3 {
+            self.aes
+                .regs_mut()
+                .data_in()
+                .at(i)
+                .write(|_| self.aes_in[i]);
+        }
+        while !self.sha.regs().status().read().ready() {
+            deadline(start, 0xb0);
+        }
+        for i in 0..32 {
+            let word = match i {
+                0..=15 => u32::from_be_bytes(core::array::from_fn(|j| pattern(4 * i + j))),
+                16 => 0x80000000,
+                31 => 512,
+                _ => 0,
+            };
+            self.sha.regs_mut().block().at(i).write(|_| word);
+        }
+        // Loading ECC operands does not make ECC busy; only the command does.
+        while !self.ecc.regs().status().read().ready() {
+            deadline(start, 0xe0);
+        }
+        for i in 0..12 {
+            self.ecc.regs_mut().pubkey_x().at(i).write(|_| ECC_X[i]);
+            self.ecc.regs_mut().pubkey_y().at(i).write(|_| ECC_Y[i]);
+            self.ecc.regs_mut().msg().at(i).write(|_| 0);
+            self.ecc.regs_mut().sign_r().at(i).write(|_| ECC_R[i]);
+            self.ecc.regs_mut().sign_s().at(i).write(|_| ECC_S[i]);
         }
         if self.legs & LEG_DMA != 0 {
             while dma_busy(&self.dma) {
@@ -261,6 +271,16 @@ impl Engines {
                 d.block_size().write(|w| w.size(0));
             });
         }
+    }
+    fn start_aes(&mut self) {
+        for i in 0..4 {
+            self.aes
+                .regs_mut()
+                .data_in()
+                .at(i)
+                .write(|_| self.aes_in[i]);
+        }
+        self.pending |= LEG_AES;
     }
     fn start_sha(&mut self) {
         self.sha
@@ -283,29 +303,25 @@ impl Engines {
         });
         self.pending |= LEG_DMA;
     }
-    fn launch(&mut self) {
-        // Start long autonomous work first; only command writes remain.
-        if self.legs & LEG_ECC != 0 {
-            self.start_ecc();
-        }
+    fn launch_a(&mut self) {
+        // Start the long DMA first; only command writes remain.
         if self.legs & LEG_DMA != 0 {
             self.start_dma();
         }
-        if self.legs & LEG_AES != 0 {
-            self.aes
-                .regs_mut()
-                .data_in()
-                .at(3)
-                .write(|_| self.aes_in[3]);
-            self.pending |= LEG_AES;
-        }
-        if self.legs & LEG_SHA != 0 {
-            self.start_sha();
-        }
+        self.aes
+            .regs_mut()
+            .data_in()
+            .at(3)
+            .write(|_| self.aes_in[3]);
+        self.pending |= LEG_AES;
+        self.start_sha();
     }
-    // One nonblocking engine step per deadline check. No digest comparisons,
-    // data generation, printing, or waiting for an entire message in capture.
-    fn step(&mut self, slot: u32, restart: bool) {
+    // One nonblocking engine step, round-robin. Engines in `restart` are
+    // reissued on completion. No digest comparisons, data generation,
+    // printing, or waiting for an entire operation inside a window.
+    fn step(&mut self, restart: u32) {
+        let slot = self.slot;
+        self.slot = (slot + 1) & 3;
         match slot {
             0 if self.pending & LEG_AES != 0 => {
                 let status: u32 = self.aes.regs().status().read().into();
@@ -318,15 +334,8 @@ impl Engines {
                     }
                     self.counts[0] += 1;
                     self.pending &= !LEG_AES;
-                    if restart {
-                        for i in 0..4 {
-                            self.aes
-                                .regs_mut()
-                                .data_in()
-                                .at(i)
-                                .write(|_| self.aes_in[i]);
-                        }
-                        self.pending |= LEG_AES;
+                    if restart & LEG_AES != 0 {
+                        self.start_aes();
                     }
                 }
             }
@@ -335,7 +344,7 @@ impl Engines {
                 if status.ready() && status.valid() {
                     self.counts[1] += 1;
                     self.pending &= !LEG_SHA;
-                    if restart {
+                    if restart & LEG_SHA != 0 {
                         self.start_sha();
                     }
                 }
@@ -344,7 +353,7 @@ impl Engines {
                 if !dma_busy(&self.dma) {
                     self.counts[2] += 1;
                     self.pending &= !LEG_DMA;
-                    if restart {
+                    if restart & LEG_DMA != 0 {
                         self.start_dma();
                     }
                 }
@@ -354,7 +363,7 @@ impl Engines {
                 if status.ready() && status.valid() {
                     self.counts[3] += 1;
                     self.pending &= !LEG_ECC;
-                    if restart {
+                    if restart & LEG_ECC != 0 {
                         self.start_ecc();
                     }
                 }
@@ -365,19 +374,15 @@ impl Engines {
     fn check(&self) -> u32 {
         // Check the final result of each repeated fixed vector, after capture.
         // Counts are completions, not a separate correctness check per operation.
-        let aes_ok =
-            self.legs & LEG_AES == 0 || (self.counts[0] > 0 && self.aes_last == AES_EXPECT);
-        let mut sha_ok = self.legs & LEG_SHA == 0 || self.counts[1] > 0;
-        if self.legs & LEG_SHA != 0 {
-            for i in 0..16 {
-                sha_ok &= self.sha.regs().digest().at(i).read() == SHA_EXPECT[i];
-            }
+        let aes_ok = self.counts[0] > 0 && self.aes_last == AES_EXPECT;
+        let mut sha_ok = self.counts[1] > 0;
+        for i in 0..16 {
+            sha_ok &= self.sha.regs().digest().at(i).read() == SHA_EXPECT[i];
         }
-        let mut ecc_ok = self.legs & LEG_ECC == 0 || self.counts[3] > 0;
-        if self.legs & LEG_ECC != 0 {
-            for i in 0..12 {
-                ecc_ok &= self.ecc.regs().verify_r().at(i).read() == ECC_R[i];
-            }
+        // Exactly one ECC pass by construction: phase B never reissues it.
+        let mut ecc_ok = self.counts[3] == 1;
+        for i in 0..12 {
+            ecc_ok &= self.ecc.regs().verify_r().at(i).read() == ECC_R[i];
         }
         let mut dma_ok = self.legs & LEG_DMA == 0 || self.counts[2] > 0;
         if self.legs & LEG_DMA != 0 {
@@ -396,12 +401,11 @@ pub extern "C" fn rom_entry() -> ! {
     let (legs, window) = if external {
         (shared_read(1), shared_read(2))
     } else {
-        (LEG_AES | LEG_SHA, DEFAULT_WINDOW)
+        (REQUIRED, DEFAULT_WINDOW)
     };
-    // Frozen hardware forbids concurrent AES/ECC (fatal crypto_error).
-    if legs == 0
+    // AES, SHA and ECC are mandatory; DMA follows the hardware configuration.
+    if legs & REQUIRED != REQUIRED
         || legs & !ENGINE_MASK != 0
-        || legs & (LEG_AES | LEG_ECC) == (LEG_AES | LEG_ECC)
         || !(MIN_WINDOW..=MAX_WINDOW).contains(&window)
     {
         fail(0xc0);
@@ -423,27 +427,51 @@ pub extern "C" fn rom_entry() -> ! {
         aes_last: [0; 4],
         counts: [0; 4],
         pending: 0,
+        slot: 0,
     };
+    let keep = LEG_SHA | LEG_DMA;
     engines.prepare();
     if external {
         mark(PHASE_ARMED);
         await_ack(ACK_START);
     }
-    engines.launch();
-    mark(PHASE_CAPTURE);
-    let start = rdmcycle();
-    let mut slot = 0;
-    while rdmcycle().wrapping_sub(start) < window {
+
+    // Phase A: AES + SHA (+ DMA) for the cycle budget.
+    engines.launch_a();
+    mark(PHASE_A_CAPTURE);
+    let a_start = rdmcycle();
+    while rdmcycle().wrapping_sub(a_start) < window {
         check_fatal();
-        engines.step(slot, true);
-        slot = (slot + 1) & 3;
+        engines.step(keep | LEG_AES);
     }
-    let end = rdmcycle();
-    mark(PHASE_DRAIN); // SAIF ends immediately; drain/check/ACK are outside.
+    let a_end = rdmcycle();
+    mark(PHASE_A_END); // SAIF A ends immediately.
+
+    // Handoff: finish AES without reissuing it; SHA/DMA keep running. ECC
+    // starts only once AES reports idle, so aes/ecc busy never coincide.
+    let handoff = rdmcycle();
+    while engines.pending & LEG_AES != 0 {
+        engines.step(keep);
+        deadline(handoff, 0x81);
+    }
+    while !engines.aes.regs().status().read().idle() {
+        deadline(handoff, 0xa5);
+    }
+
+    // Phase B: one complete ECC verify + SHA (+ DMA).
+    engines.start_ecc();
+    mark(PHASE_B_CAPTURE);
+    let b_start = rdmcycle();
+    while engines.pending & LEG_ECC != 0 {
+        engines.step(keep);
+        deadline_for(b_start, ECC_WAIT_CYCLES, 0x90);
+    }
+    let b_end = rdmcycle();
+    mark(PHASE_B_END); // SAIF B ends immediately; drain/check/ACK are outside.
+
     let drain_start = rdmcycle();
     while engines.pending != 0 {
-        engines.step(slot, false);
-        slot = (slot + 1) & 3;
+        engines.step(0);
         deadline(drain_start, 0x80 | engines.pending);
     }
     let flags = engines.check();
@@ -451,12 +479,13 @@ pub extern "C" fn rom_entry() -> ! {
         mbox.regs_mut().unlock().write(|w| w.unlock(true));
     }
     let pass = flags == 15;
+    let counts = engines.counts.map(saturate);
     shared_write(1, legs | (flags << 16) | ((pass as u32) << 20));
-    shared_write(2, start);
-    shared_write(3, end);
-    shared_write(4, engines.counts[0] | (engines.counts[1] << 16));
-    shared_write(5, engines.counts[2] | (engines.counts[3] << 16));
-    shared_write(6, window);
+    shared_write(2, a_start);
+    shared_write(3, a_end);
+    shared_write(4, counts[0] | (counts[1] << 16));
+    shared_write(5, counts[2] | (counts[3] << 16));
+    shared_write(6, b_end.wrapping_sub(b_start));
     shared_write(0, RES_MAGIC);
     if external {
         await_ack(ACK_END);
