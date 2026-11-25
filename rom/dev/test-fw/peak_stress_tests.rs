@@ -53,7 +53,7 @@ const WAIT_CYCLES: u32 = 2_000_000;
 const ECC_WAIT_CYCLES: u32 = 8_000_000;
 const ACK_START: u32 = 0x53544152;
 const ACK_END: u32 = 0x454e4421;
-const DMA_SOURCE: u32 = 0x8050_0000;
+const DMA_SOURCE: u32 = 0x8450_0000;
 const DMA_WORDS: usize = 1024;
 const MBOX_SRAM: *const u32 = 0x3004_0000 as *const u32;
 

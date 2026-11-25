@@ -14,8 +14,12 @@
 //! session, scrub local secrets, and reset/quiesce DMA before reclaiming external
 //! output buffers. A timeout does not cancel outstanding AXI writes.
 
-const DRAM_START: u64 = 0x8000_0000;
-const DRAM_END: u64 = 0x1_8000_0000;
+// The SoC's uncacheable host window, the only DRAM Caliptra's DMA may reach: it
+// joins the memory bus after the coherence hub, behind a filter that denies any
+// other address (chipyard CaliptraHostWindow, caliptra-wrapper CaliptraDmaWindow).
+// Rocket keeps 0x8000_0000-0x8400_0000 for itself.
+pub const DRAM_START: u64 = 0x8400_0000;
+pub const DRAM_END: u64 = 0x1_8000_0000;
 const MAX_BYTES: u64 = 256 * 1024;
 const CHUNK_WORDS: usize = 64;
 const FIFO_WORDS: usize = 128;

@@ -291,7 +291,7 @@ const JOB: u32 = 0x424f4a46;
 const IDS: [u32; 8] = [
     0x46484b47, 0x4648494e, 0x46484547, 0x4d4c4943, 0x46485343, 0x46485246, 0x46485254, 0x4648524c,
 ];
-const SRC: u64 = 0x8000_0000;
+const SRC: u64 = 0x8400_0000;
 /// External output buffer, past the largest P-16 input.
 const OUT: usize = 0x40000;
 const DST: u64 = SRC + OUT as u64;
@@ -582,10 +582,10 @@ fn validation(fwid: &'static FwId<'static>, open: Open) {
     }
     reject(&mut m, IDS[2], &h, &blob);
     let mut bad = h.clone();
-    bad[20..24].copy_from_slice(&0x80000000u32.to_le_bytes()); // src in mailbox mode
+    bad[20..24].copy_from_slice(&(SRC as u32).to_le_bytes()); // src in mailbox mode
     u.reject(&mut m, 2, &bad, &blob);
     // Pointer ranges: out of window, overlapping; controls never use pointers.
-    for (offset, value) in [(20, 0x7fff_f000u32), (28, 0x8000_0400), (24, 1)] {
+    for (offset, value) in [(20, 0x7fff_f000u32), (28, 0x8400_0400), (24, 1)] {
         let mut bad = command(u.id, 2, true, 0);
         bad[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         u.reject(&mut m, 2, &bad, &[]);
@@ -644,7 +644,7 @@ fn failed_write_and_poison(fwid: &'static FwId<'static>, open: Open) {
     assert!(ps_close(&u.decrypt(&mut m, &ct, false)));
     let end = m.soc_dram_mut().unwrap().len();
     let mut h = command(u.id, 3, true, 0);
-    h[28..32].copy_from_slice(&(0x80000000u32 + end as u32 - 16).to_le_bytes());
+    h[28..32].copy_from_slice(&(SRC as u32 + end as u32 - 16).to_le_bytes());
     m.soc_dram_mut().unwrap()[..2048].copy_from_slice(&limb0(&params::PS, &ct));
     m.soc_dram_mut().unwrap()[end - 16..].fill(0xa5);
     u.reject(&mut m, 3, &h, &[]);
@@ -668,7 +668,7 @@ fn read_poison(fwid: &'static FwId<'static>, open: Open) {
     u.call(&mut m, 1, &[], false);
     let end = m.soc_dram_mut().unwrap().len();
     let mut h = command(u.id, 2, true, 0);
-    h[20..24].copy_from_slice(&(0x80000000u32 + end as u32 - 4).to_le_bytes());
+    h[20..24].copy_from_slice(&(SRC as u32 + end as u32 - 4).to_le_bytes());
     m.soc_dram_mut().unwrap()[OUT..OUT + 0x1000].fill(0x5a);
     u.reject(&mut m, 2, &h, &[]);
     assert!(m.soc_dram_mut().unwrap()[OUT..OUT + 0x1000]

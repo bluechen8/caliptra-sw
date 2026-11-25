@@ -154,7 +154,7 @@ fn run(
                 .axi
                 .write(
                     RvSize::Word,
-                    0x8050_0000 + u64::from(i) * 4,
+                    0x8450_0000 + u64::from(i) * 4,
                     i.wrapping_mul(0x9e3779b9).wrapping_add(0x12345678)
                         ^ u32::from(bad_engine == 4),
                 )

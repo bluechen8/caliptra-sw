@@ -47,7 +47,7 @@ fn start_driver_test(test_rom: &'static FwId) -> Result<DefaultHwModel, Box<dyn 
 
 /// DMA smoke test against plain SoC DRAM (FHE offload plan §6/WP2).
 ///
-/// The emulator's AXI root bus models the DRAM window at 0x8000_0000 as plain
+/// The emulator's AXI root bus models the DRAM window at 0x8400_0000 as plain
 /// memory, so this exercises the same `Dma::write_dword` / `Dma::read_buffer`
 /// AHB-FIFO route that pointer-mode mailbox commands will use.
 #[test]

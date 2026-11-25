@@ -114,9 +114,11 @@ impl AxiRootBus {
     pub const EXTERNAL_TEST_SRAM_END: AxiAddr =
         Self::EXTERNAL_TEST_SRAM_OFFSET + EXTERNAL_TEST_SRAM_SIZE as u64;
 
-    /// Base of the plain-RAM DRAM window; same base as the external test SRAM,
-    /// matching the SoC memory map Caliptra sees in the Chipyard integration.
-    pub const DRAM_OFFSET: AxiAddr = 0x00000000_80000000;
+    /// Base of the plain-RAM DRAM window: the start of the Chipyard SoC's
+    /// uncacheable host window, the only DRAM Caliptra's DMA reaches there
+    /// (Rocket keeps 0x8000_0000-0x8400_0000). The external test SRAM below it
+    /// stays reachable at 0x8000_0000.
+    pub const DRAM_OFFSET: AxiAddr = 0x00000000_84000000;
     /// Last byte of the DRAM window.
     pub const DRAM_END: AxiAddr = Self::DRAM_OFFSET + DRAM_SIZE as u64 - 1;
 

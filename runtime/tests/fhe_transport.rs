@@ -4,7 +4,7 @@
 mod transport;
 
 use std::collections::VecDeque;
-use transport::{Error, Fifo, Status, Transport};
+use transport::{Error, Fifo, Status, Transport, DRAM_END, DRAM_START};
 
 #[derive(Default)]
 struct Model {
@@ -79,25 +79,28 @@ impl Fifo for &mut Model {
 #[test]
 fn range_boundaries_and_high_bit_aliases() {
     for (addr, bytes) in [
-        (0x8000_0000, 4),
+        (DRAM_START, 4),
         (0x1_7fff_fffc, 4),
         (0xffff_fffc, 8),
-        (0x8000_0000, 262144),
+        (DRAM_START, 262144),
     ] {
         assert_eq!(transport::validate_range(addr, bytes), Ok(()));
     }
     for (addr, bytes) in [
         (0x7fff_fffc, 4),
-        (0x1_8000_0000, 4),
+        (0x8000_0000, 4),   // Rocket's cacheable DRAM, below the host window
+        (DRAM_START - 4, 8), // straddles the window's base
+        (DRAM_START, DRAM_END - DRAM_START + 4),
+        (DRAM_END, 4),
         (0x1_7fff_fffc, 8),
         (0x2_8000_0000, 4),
         (0x1_0000_8000_0000, 4),
         (u64::MAX - 3, 8),
-        (0x8000_0000, u64::MAX),
-        (0x8000_0000, 0),
-        (0x8000_0001, 4),
-        (0x8000_0000, 3),
-        (0x8000_0000, 262148),
+        (DRAM_START, u64::MAX),
+        (DRAM_START, 0),
+        (DRAM_START + 1, 4),
+        (DRAM_START, 3),
+        (DRAM_START, 262148),
     ] {
         assert_eq!(
             transport::validate_range(addr, bytes),
@@ -156,9 +159,9 @@ fn partial_read_fault_scrubs_and_poison_prevents_restart() {
     };
     let mut out = [9; 256];
     let mut t = Transport::new(&mut m, 8);
-    assert_eq!(t.read(0x8000_0000, &mut out), Err(Error::Hardware));
+    assert_eq!(t.read(DRAM_START, &mut out), Err(Error::Hardware));
     assert_eq!(out, [0; 256]);
-    assert_eq!(t.write(0x8000_1000, &[1]), Err(Error::Poisoned));
+    assert_eq!(t.write(DRAM_START + 0x1000, &[1]), Err(Error::Poisoned));
     assert_eq!(m.starts, 1);
 }
 
@@ -172,12 +175,12 @@ fn stalled_read_and_full_write_fifo_have_bounded_waits() {
         let mut t = Transport::new(&mut m, 5);
         let mut data = [42; 256];
         let result = if write {
-            t.write(0x8000_0000, &data)
+            t.write(DRAM_START, &data)
         } else {
-            t.read(0x8000_0000, &mut data)
+            t.read(DRAM_START, &mut data)
         };
         assert_eq!(result, Err(Error::Timeout));
-        assert_eq!(t.write(0x8000_1000, &[1]), Err(Error::Poisoned));
+        assert_eq!(t.write(DRAM_START + 0x1000, &[1]), Err(Error::Poisoned));
         assert!(m.polls <= 8);
         assert_eq!(m.starts, 1);
     }
@@ -194,9 +197,9 @@ fn completion_errors_override_apparent_success() {
         let mut t = Transport::new(&mut m, 8);
         let mut data = [42; 64];
         let result = if write {
-            t.write(0x8000_0000, &data)
+            t.write(DRAM_START, &data)
         } else {
-            t.read(0x8000_0000, &mut data)
+            t.read(DRAM_START, &mut data)
         };
         assert_eq!(result, Err(Error::Hardware));
         if !write {
@@ -213,7 +216,7 @@ fn refuses_preexisting_busy_or_dirty_engine() {
         ..Model::default()
     };
     assert_eq!(
-        Transport::new(&mut m, 8).write(0x8000_0000, &[1]),
+        Transport::new(&mut m, 8).write(DRAM_START, &[1]),
         Err(Error::Busy)
     );
     assert_eq!(m.starts, 0);
@@ -222,7 +225,7 @@ fn refuses_preexisting_busy_or_dirty_engine() {
         ..Model::default()
     };
     assert_eq!(
-        Transport::new(&mut m, 8).write(0x8000_0000, &[1]),
+        Transport::new(&mut m, 8).write(DRAM_START, &[1]),
         Err(Error::Hardware)
     );
     assert_eq!(m.starts, 0);
@@ -237,7 +240,7 @@ fn waits_for_go_clear_after_last_word() {
     };
     let mut out = [9; 64];
     assert_eq!(
-        Transport::new(&mut m, 5).read(0x8000_0000, &mut out),
+        Transport::new(&mut m, 5).read(DRAM_START, &mut out),
         Err(Error::Timeout)
     );
     assert_eq!(out, [0; 64]);
@@ -254,7 +257,7 @@ fn session_poison_survives_register_driver_reborrowing() {
     };
     let mut out = [9; 64];
     assert_eq!(
-        session.with_fifo(&mut stalled, |t| t.read(0x8000_0000, &mut out)),
+        session.with_fifo(&mut stalled, |t| t.read(DRAM_START, &mut out)),
         Err(Error::Timeout)
     );
     assert!(session.is_poisoned());
@@ -262,7 +265,7 @@ fn session_poison_survives_register_driver_reborrowing() {
     // Even an apparently recovered, clean device cannot clear session poison.
     let mut clean = Model::default();
     assert_eq!(
-        session.with_fifo(&mut clean, |t| t.write(0x8000_1000, &[1])),
+        session.with_fifo(&mut clean, |t| t.write(DRAM_START + 0x1000, &[1])),
         Err(Error::Poisoned)
     );
     assert_eq!(clean.polls, 0);
