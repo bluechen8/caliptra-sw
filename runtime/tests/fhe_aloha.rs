@@ -9,7 +9,7 @@ use super::*;
 
 /// Aloha's prime catalog (caliptra-rtl src/fhe/aloha/vendor/Scripts/fhe_profiles.py);
 /// a build installs the first L_max, and keys use the top one as P.
-const PRIMES: [u64; 8] = [
+const PRIMES: [u64; 15] = [
     0x3ffff7000001,
     0x7fffff000001,
     0xffffd8000001,
@@ -18,6 +18,13 @@ const PRIMES: [u64; 8] = [
     0x7fffff9000001,
     0xffffff3000001,
     0x1ffffff6000001,
+    0x1ffffff2000001,
+    0x1fffffe1000001,
+    0x1fffffde000001,
+    0x1fffffdd000001,
+    0x1fffffcc000001,
+    0x1fffffc9000001,
+    0x1fffffc2000001,
 ];
 use caliptra_api::error::CaliptraError;
 
@@ -38,6 +45,7 @@ pub(super) fn aloha_wire() -> Wire {
         (256, 3) => "aps",
         (1024, 8) => "alr",
         (256, 8) => "alrs",
+        (16384, 13) => "a16",
         _ => "aloha",
     };
     Wire {
@@ -357,6 +365,14 @@ fn aloha_evalkey_host_demo() {
 #[ignore = "requires FHE_ALOHA_RTL, FHE_ALOHA_RTL_CWD and FHE_CROM for N = 256, L_max = 3"]
 fn aloha_packed_host_demo() {
     run_host_demo(&firmware::APP_FHE_ALOHA, "packed_demo.py", false);
+}
+/// The protected demo (scalar evaluation, REFRESH, clear logits) in pointer
+/// transport, the only one Aloha serves (FHE_DEMO_TRANSPORT=pointer); at
+/// A-16 (N = 16384, L_max 13) it reproduces the tape-out geometry's SoC run.
+#[test]
+#[ignore = "requires FHE_ALOHA_RTL, FHE_ALOHA_RTL_CWD, FHE_CROM and FHE_DEMO_TRANSPORT=pointer"]
+fn aloha_protected_host_demo() {
+    run_host_demo(&firmware::APP_FHE_ALOHA, "protected_demo.py", false);
 }
 /// Encrypted logistic-regression training at A-LR (N = 1024, L_max 8), with a
 /// REFRESH between steps; FHE_LR_STEPS sets the number of steps (default 4).
